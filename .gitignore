@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!main.py
+
+# And not directories (so we can recurse into them if needed)
+!*/
