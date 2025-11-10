@@ -1,4 +1,4 @@
-# 🎛️ Sistema de Control y Análisis - Motores L206
+# 🎛️ Sistema de Control y Análisis - Plataforma Microscópica L206
 
 ![Version](https://img.shields.io/badge/version-2.2-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8+-green.svg)
