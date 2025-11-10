@@ -46,17 +46,96 @@ pg.setConfigOption('foreground', '#CCCCCC')
 import pandas as pd
 import numpy as np
 
+# =========================================================================
+# --- Buffer Circular Optimizado para Señales en Tiempo Real ---
+# =========================================================================
+class OptimizedSignalBuffer:
+    """Buffer circular optimizado con NumPy para señales analógicas en tiempo real."""
+    
+    def __init__(self, buffer_size=200, num_signals=4):
+        self.buffer_size = buffer_size
+        self.num_signals = num_signals
+        self.write_index = 0
+        self.is_full = False
+        
+        # Buffer principal - matriz 2D: [señales, muestras]
+        self.data = np.zeros((num_signals, buffer_size), dtype=np.float32)
+        
+        # Arrays de vista para cada señal (sin copiar datos)
+        self.signal_views = {
+            'power_a': self.data[0],
+            'power_b': self.data[1], 
+            'sensor_1': self.data[2],
+            'sensor_2': self.data[3]
+        }
+        
+        # Buffer temporal para rendering (evita copias)
+        self._render_buffer = np.zeros(buffer_size, dtype=np.float32)
+        
+        logger.info(f"Buffer optimizado inicializado: {buffer_size} muestras, {num_signals} señales")
+    
+    def append_data(self, power_a, power_b, sensor_1, sensor_2):
+        """Agrega nuevos datos al buffer circular."""
+        # Escribir datos directamente en la matriz
+        self.data[0, self.write_index] = abs(power_a)
+        self.data[1, self.write_index] = abs(power_b)
+        self.data[2, self.write_index] = sensor_1
+        self.data[3, self.write_index] = sensor_2
+        
+        # Avanzar índice circular
+        self.write_index = (self.write_index + 1) % self.buffer_size
+        if self.write_index == 0:
+            self.is_full = True
+    
+    def get_signal_data(self, signal_name):
+        """Obtiene datos de una señal específica ordenados cronológicamente."""
+        if not self.is_full:
+            # Buffer no lleno: devolver desde el inicio hasta write_index
+            return self.signal_views[signal_name][:self.write_index]
+        else:
+            # Buffer lleno: reorganizar datos cronológicamente
+            signal_data = self.signal_views[signal_name]
+            np.concatenate((signal_data[self.write_index:], 
+                          signal_data[:self.write_index]), 
+                         out=self._render_buffer)
+            return self._render_buffer
+    
+    def get_all_signals(self):
+        """Obtiene todas las señales como diccionario de arrays NumPy."""
+        return {
+            name: self.get_signal_data(name) 
+            for name in self.signal_views.keys()
+        }
+    
+    def clear(self):
+        """Limpia el buffer."""
+        self.data.fill(0)
+        self.write_index = 0
+        self.is_full = False
+        logger.debug("Buffer circular limpiado")
+    
+    def get_memory_usage(self):
+        """Retorna el uso de memoria en bytes."""
+        return self.data.nbytes + self._render_buffer.nbytes
+
 # --- Importaciones para diseño de controlador H∞ ---
 import control as ct
 
 # --- Importaciones para cámara Thorlabs ---
 try:
+    import pylablib as pll
+    # Configurar la ruta del SDK de Thorlabs
+    pll.par["devices/dlls/thorlabs_tlcam"] = r"C:\Program Files\Thorlabs\ThorImageCAM\Bin"
     from pylablib.devices import Thorlabs
     THORLABS_AVAILABLE = True
 except ImportError:
     THORLABS_AVAILABLE = False
     logger_temp = logging.getLogger(__name__)
     logger_temp.warning("pylablib no está instalado. Funcionalidad de cámara deshabilitada.")
+except Exception as e:
+    THORLABS_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning(f"Error al configurar Thorlabs SDK: {e}")
 
 # =========================================================================
 # --- SISTEMA DE LOGGING (IEEE Software Engineering Standards) ---
@@ -82,7 +161,7 @@ logger = logging.getLogger('MotorControl_L206')
 
 # --- CONFIGURACIÓN ---
 # Ajusta el puerto a tu configuración
-SERIAL_PORT = 'COM3' 
+SERIAL_PORT = 'COM5' 
 BAUD_RATE = 115200
 PLOT_LENGTH = 200
 
@@ -168,7 +247,14 @@ class SerialReaderThread(QThread):
                         if decoded_line:
                             self.data_received.emit(decoded_line)
                     except UnicodeDecodeError as e:
-                        logger.warning(f"Error de decodificación UTF-8: {e}")
+                        # Intentar con latin-1 como fallback
+                        try:
+                            decoded_line = line.decode('latin-1', errors='ignore').strip()
+                            if decoded_line:
+                                self.data_received.emit(decoded_line)
+                                logger.debug(f"Línea decodificada con latin-1: {decoded_line[:50]}...")
+                        except Exception as e2:
+                            logger.warning(f"No se pudo decodificar línea. UTF-8: {e}, Latin-1: {e2}")
 
             if self.ser and self.ser.is_open:
                 self.ser.close()
@@ -183,10 +269,10 @@ class SerialReaderThread(QThread):
         """Detiene el thread de lectura serial."""
         logger.debug("Deteniendo SerialReaderThread")
         self.running = False
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            logger.info("Puerto serial cerrado en stop()")
-        self.wait()
+        # No cerrar aquí, se cierra en el run() al terminar el loop
+        # Esto previene el error AttributeError: 'NoneType' object has no attribute 'hEvent'
+        self.wait()  # Esperar a que el thread termine naturalmente
+        logger.info("Thread serial detenido correctamente")
 
 # =========================================================================
 # --- Ventana para Gráficos de Matplotlib ---
@@ -363,7 +449,10 @@ class CameraWorker(QThread):
         self.cam = None
         self.running = False
         self.exposure = 0.01
+        self.fps = 60
+        self.buffer_size = 1  # Reducido a 1
         self.current_frame = None  # Para captura de imagen
+        self.frame_count = 0  # Contador para limpieza periódica
     
     def run(self):
         """Método run del thread - inicia la vista en vivo."""
@@ -391,6 +480,15 @@ class CameraWorker(QThread):
             
             self.status_update.emit(f"✅ Conexión exitosa: {camera_info}")
             logger.info(f"Cámara conectada: {camera_info}")
+            
+            # Ejecutar test de captura simple para verificar funcionalidad
+            logger.info("Ejecutando test de captura simple...")
+            test_result = self.test_single_capture()
+            if test_result:
+                self.status_update.emit("✅ Test de captura: OK - Cámara funcional")
+            else:
+                self.status_update.emit("⚠️ Test de captura: FALLO - Revisar logs")
+            
             self.connection_success.emit(True, camera_info)
             
         except Exception as e:
@@ -409,73 +507,252 @@ class CameraWorker(QThread):
             self.status_update.emit("▶️ Iniciando vista en vivo...")
             logger.info("Iniciando adquisición de cámara")
             
+            # Configurar cámara
+            logger.info(f"Configurando exposición: {self.exposure}s")
             self.cam.set_exposure(self.exposure)
+            actual_exposure = self.cam.get_exposure()
+            logger.info(f"Exposición actual: {actual_exposure}s")
+            
+            # Configurar trigger mode
+            logger.info("Configurando trigger mode: 'int' (interno)")
             self.cam.set_trigger_mode("int")
+            
+            # Configurar frame rate usando frame period
+            frame_period = 1.0 / self.fps  # Período en segundos
+            logger.info(f"Configurando frame period: {frame_period:.6f}s ({self.fps} FPS)")
+            self.cam.set_frame_period(frame_period)
+            
+            # Verificar el período configurado
+            actual_period = self.cam.get_frame_period()
+            actual_fps = 1.0 / actual_period if actual_period > 0 else 0
+            logger.info(f"Frame period actual: {actual_period:.6f}s ({actual_fps:.2f} FPS)")
+            
+            # Setup acquisition con buffer configurable
+            logger.info(f"Configurando adquisición con buffer de {self.buffer_size} frames")
+            self.cam.setup_acquisition(nframes=self.buffer_size)
+            
+            # Iniciar adquisición
+            logger.info("Llamando a start_acquisition()...")
             self.cam.start_acquisition()
+            logger.info("start_acquisition() completado")
+            
+            # Verificar estado
+            is_setup = self.cam.is_acquisition_setup()
+            logger.info(f"is_acquisition_setup(): {is_setup}")
+            
             self.running = True
+            logger.info(f"Loop running activado: {self.running}")
             
             # Esperar un poco más para el primer frame
             first_frame = True
             timeout_count = 0
             max_timeouts = 10  # Máximo 10 timeouts consecutivos antes de abortar
             
+            logger.debug(f"Entrando en loop de adquisición. running={self.running}")
             while self.running:
                 # Usar timeout más largo para el primer frame
                 timeout = 3.0 if first_frame else 0.5
+                
+                logger.debug(f"Esperando frame... first_frame={first_frame}, timeout={timeout}, timeout_count={timeout_count}")
                 
                 # wait_for_frame() retorna True/False/None
                 # True: frame disponible
                 # False: adquisición detenida
                 # None: timeout (no hay frame aún, pero sigue activo)
-                frame_available = self.cam.wait_for_frame(timeout=timeout)
+                try:
+                    frame_available = self.cam.wait_for_frame(timeout=timeout)
+                    logger.debug(f"wait_for_frame retornó: {frame_available}")
+                except Exception as timeout_error:
+                    # Capturar TimeoutError específico de Thorlabs
+                    logger.debug(f"Excepción capturada: {type(timeout_error).__name__}: {timeout_error}")
+                    if "Timeout" in type(timeout_error).__name__:
+                        timeout_count += 1
+                        logger.warning(f"Timeout #{timeout_count} de {max_timeouts}")
+                        
+                        # En el primer timeout, hacer diagnóstico adicional
+                        if timeout_count == 1:
+                            try:
+                                logger.info("=== DIAGNÓSTICO PRIMER TIMEOUT ===")
+                                logger.info(f"Cámara abierta: {self.cam.is_opened()}")
+                                logger.info(f"Adquisición configurada: {self.cam.is_acquisition_setup()}")
+                                
+                                # Intentar obtener info de frames disponibles
+                                if hasattr(self.cam, 'get_frames_status'):
+                                    status = self.cam.get_frames_status()
+                                    logger.info(f"Estado de frames: {status}")
+                                
+                                if hasattr(self.cam, 'get_new_images_range'):
+                                    img_range = self.cam.get_new_images_range()
+                                    logger.info(f"Rango de imágenes nuevas: {img_range}")
+                                
+                                # Listar algunos métodos disponibles relacionados con frames
+                                frame_methods = [m for m in dir(self.cam) if 'frame' in m.lower() or 'image' in m.lower() or 'buffer' in m.lower()]
+                                logger.info(f"Métodos disponibles con 'frame/image/buffer': {frame_methods}")
+                                
+                            except Exception as diag_error:
+                                logger.warning(f"Error en diagnóstico: {diag_error}")
+                        
+                        if timeout_count >= max_timeouts:
+                            self.status_update.emit(f"❌ Demasiados timeouts ({max_timeouts}). Verificar cámara.")
+                            logger.warning(f"Máximo de timeouts alcanzado ({max_timeouts}), deteniendo live view")
+                            break
+                        # Continuar esperando
+                        logger.debug("Continuando después de timeout...")
+                        continue
+                    else:
+                        # Otro tipo de error, re-lanzar
+                        logger.error(f"Error no-timeout en wait_for_frame: {timeout_error}")
+                        raise
                 
                 if frame_available:
                     # Frame disponible
+                    logger.debug("Frame disponible, leyendo imagen...")
                     timeout_count = 0  # Resetear contador de timeouts
                     first_frame = False
+                    
+                    # Leer frame más antiguo para evitar acumulación en buffer
                     frame = self.cam.read_oldest_image()
+                    logger.debug(f"Imagen leída: shape={frame.shape if frame is not None else None}")
                     
                     if frame is not None:
-                        # CORRECCIÓN CRÍTICA: Hacer copia explícita del frame
-                        # para evitar que el driver lo sobrescriba
-                        frame_copy = frame.copy()
+                        self.frame_count += 1
                         
-                        # GUARDAR EL FRAME ORIGINAL (sin normalizar) para captura
-                        self.current_frame = frame_copy.copy()
+                        # GESTIÓN DE MEMORIA: Limpiar buffer cada 30 frames
+                        if self.frame_count % 30 == 0:
+                            try:
+                                # Limpiar frames sin leer del buffer
+                                status = self.cam.get_frames_status()
+                                if status.unread > 5:
+                                    logger.warning(f"Buffer acumulado: {status.unread} frames sin leer. Limpiando...")
+                                    # Leer y descartar frames antiguos
+                                    for _ in range(min(status.unread - 1, 10)):
+                                        self.cam.read_oldest_image()
+                                    logger.info("Buffer limpiado")
+                                
+                                # Forzar garbage collection cada 30 frames
+                                import gc
+                                gc.collect()
+                                logger.debug(f"Frame #{self.frame_count}: GC ejecutado")
+                            except Exception as e:
+                                logger.debug(f"Error en limpieza de memoria: {e}")
                         
-                        # Normalizar a uint8 SOLO para visualización
-                        frame_display = frame_copy
-                        if frame_display.dtype != np.uint8:
-                            frame_display = (frame_display / frame_display.max() * 255).astype(np.uint8)
+                        # GUARDAR frame para captura (una sola copia)
+                        self.current_frame = frame.copy()
                         
-                        h, w = frame_display.shape
+                        # Normalizar a uint8 para visualización (reutilizar el frame original)
+                        if frame.dtype != np.uint8:
+                            frame = (frame / frame.max() * 255).astype(np.uint8)
+                        
+                        h, w = frame.shape
                         bytes_per_line = w
                         
                         # Crear QImage (PyQt5 usa Format_Grayscale8 sin .Format)
                         from PyQt5.QtGui import QImage
-                        q_image = QImage(frame_display.data, w, h, bytes_per_line, QImage.Format_Grayscale8).copy()
+                        q_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_Grayscale8).copy()
                         
                         self.new_frame_ready.emit(q_image)
                         
+                        # Liberar referencia al frame original
+                        del frame
+                        
                 elif frame_available is False:
                     # Adquisición detenida
+                    logger.warning("frame_available es False - adquisición detenida")
                     self.status_update.emit("⚠️ La adquisición se detuvo inesperadamente.")
                     break
-                    
-                # Si frame_available es None (timeout), simplemente continuar el loop
+                elif frame_available is None:
+                    # Timeout sin excepción - continuar esperando
+                    logger.debug("frame_available es None (timeout silencioso), continuando...")
+                    timeout_count += 1
+                    if timeout_count >= max_timeouts:
+                        self.status_update.emit(f"❌ Demasiados timeouts silenciosos ({max_timeouts}). Verificar cámara.")
+                        logger.warning(f"Máximo de timeouts silenciosos alcanzado, deteniendo live view")
+                        break
+                else:
+                    logger.warning(f"frame_available tiene valor inesperado: {frame_available}")
                     
         except Exception as e:
             self.status_update.emit(f"❌ Error en vista en vivo: {str(e)}")
             logger.error(f"Error en live view: {e}\n{traceback.format_exc()}")
         finally:
-            if self.cam and self.cam.is_opened() and self.cam.is_acquisition_setup():
-                self.cam.stop_acquisition()
+            # Limpiar memoria al detener
+            try:
+                if self.cam and self.cam.is_opened() and self.cam.is_acquisition_setup():
+                    logger.info("Deteniendo adquisición y limpiando buffer...")
+                    self.cam.stop_acquisition()
+                    
+                    # Limpiar buffer completamente
+                    if hasattr(self.cam, 'clear_acquisition'):
+                        self.cam.clear_acquisition()
+                        logger.info("Buffer de cámara limpiado")
+                    
+                    # Forzar garbage collection
+                    import gc
+                    gc.collect()
+                    logger.info("Garbage collection ejecutado")
+            except Exception as e:
+                logger.error(f"Error al limpiar recursos: {e}")
+            
+            self.frame_count = 0
             self.status_update.emit("⏹️ Vista en vivo detenida.")
             logger.info("Vista en vivo detenida")
     
     def stop_live_view(self):
         """Detiene la adquisición de video."""
         self.running = False
+    
+    def test_single_capture(self):
+        """Prueba de captura simplificada para diagnóstico."""
+        if not self.cam or not self.cam.is_opened():
+            logger.error("test_single_capture: cámara no conectada")
+            return False
+        
+        try:
+            logger.info("=== TEST DE CAPTURA SIMPLE ===")
+            
+            # Configuración
+            logger.info(f"Configurando: exposure={self.exposure}s, fps={self.fps}")
+            self.cam.set_exposure(self.exposure)
+            self.cam.set_trigger_mode("int")
+            
+            # Configurar frame rate usando frame period
+            frame_period = 1.0 / self.fps
+            self.cam.set_frame_period(frame_period)
+            logger.info(f"Frame period configurado: {frame_period:.6f}s ({self.fps} FPS)")
+            
+            # Setup acquisition con buffer configurable
+            logger.info(f"Llamando setup_acquisition(nframes={self.buffer_size})")
+            self.cam.setup_acquisition(nframes=self.buffer_size)
+            
+            # Iniciar
+            logger.info("Iniciando adquisición...")
+            self.cam.start_acquisition()
+            
+            # Esperar
+            wait_time = 0.5
+            logger.info(f"Esperando {wait_time} segundos...")
+            time.sleep(wait_time)
+            
+            # Leer frame
+            logger.info("Intentando read_oldest_image()...")
+            frame = self.cam.read_oldest_image()
+            
+            if frame is not None:
+                logger.info(f"✅ ÉXITO: Frame capturado! Shape: {frame.shape}, dtype: {frame.dtype}")
+                self.cam.stop_acquisition()
+                return True
+            else:
+                logger.error("❌ read_oldest_image() retornó None")
+                self.cam.stop_acquisition()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error en test_single_capture: {e}\n{traceback.format_exc()}")
+            try:
+                self.cam.stop_acquisition()
+            except:
+                pass
+            return False
     
     def change_exposure(self, exposure_value):
         """Cambia la exposición de la cámara en tiempo real."""
@@ -491,12 +768,59 @@ class CameraWorker(QThread):
             self.status_update.emit(f"❌ Error al cambiar exposición: {str(e)}")
             logger.error(f"Error cambio exposición: {e}")
     
+    def change_fps(self, fps_value):
+        """Cambia el frame rate de la cámara usando frame period."""
+        try:
+            if self.cam and self.cam.is_opened():
+                self.fps = fps_value
+                frame_period = 1.0 / fps_value
+                self.cam.set_frame_period(frame_period)
+                self.status_update.emit(f"✅ Frame rate cambiado a {fps_value} FPS (period={frame_period:.6f}s)")
+                logger.info(f"Frame rate cambiado: {fps_value} FPS (period={frame_period:.6f}s)")
+            else:
+                self.status_update.emit("❌ Error: Cámara no conectada")
+        except Exception as e:
+            self.status_update.emit(f"❌ Error al cambiar FPS: {str(e)}")
+            logger.error(f"Error cambio FPS: {e}")
+    
+    def change_buffer_size(self, buffer_value):
+        """Cambia el tamaño del buffer de frames."""
+        try:
+            if self.cam and self.cam.is_opened():
+                self.buffer_size = buffer_value
+                self.status_update.emit(f"✅ Buffer configurado: {buffer_value} frames (aplicará en próxima adquisición)")
+                logger.info(f"Buffer size guardado: {buffer_value} frames")
+            else:
+                self.status_update.emit("❌ Error: Cámara no conectada")
+        except Exception as e:
+            self.status_update.emit(f"❌ Error al cambiar buffer: {str(e)}")
+            logger.error(f"Error cambio buffer: {e}")
+    
     def disconnect_camera(self):
-        """Desconecta la cámara."""
+        """Desconecta la cámara y libera memoria."""
         if self.cam and self.cam.is_opened():
             self.stop_live_view()
-            self.status_update.emit("Cerrando conexión...")
+            self.status_update.emit("Cerrando conexión y liberando memoria...")
+            
+            # Limpiar buffer antes de cerrar
+            try:
+                if self.cam.is_acquisition_setup():
+                    self.cam.stop_acquisition()
+                if hasattr(self.cam, 'clear_acquisition'):
+                    self.cam.clear_acquisition()
+                    logger.info("Buffer limpiado antes de desconectar")
+            except Exception as e:
+                logger.debug(f"Error al limpiar buffer: {e}")
+            
             self.cam.close()
+            self.current_frame = None
+            self.frame_count = 0
+            
+            # Forzar garbage collection
+            import gc
+            gc.collect()
+            logger.info("Memoria liberada")
+            
             self.status_update.emit("✅ Cámara cerrada.")
             logger.info("Cámara desconectada")
 
@@ -3815,6 +4139,32 @@ class ArduinoGUI(QMainWindow):
         self.apply_exposure_btn.clicked.connect(self.apply_camera_exposure)
         config_layout.addWidget(self.apply_exposure_btn, 0, 2)
         
+        # FPS (Frame Rate)
+        config_layout.addWidget(QLabel("FPS (Frame Rate):"), 1, 0)
+        self.fps_input = QLineEdit("60")
+        self.fps_input.setFixedWidth(100)
+        self.fps_input.setToolTip("Frames por segundo (1-120)")
+        config_layout.addWidget(self.fps_input, 1, 1)
+        
+        self.apply_fps_btn = QPushButton("✓ Aplicar")
+        self.apply_fps_btn.setEnabled(False)
+        self.apply_fps_btn.setFixedWidth(80)
+        self.apply_fps_btn.clicked.connect(self.apply_camera_fps)
+        config_layout.addWidget(self.apply_fps_btn, 1, 2)
+        
+        # Buffer de frames
+        config_layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
+        self.buffer_size_input = QLineEdit("50")
+        self.buffer_size_input.setFixedWidth(100)
+        self.buffer_size_input.setToolTip("Número de frames en buffer (10-200). Valor bajo evita fugas de memoria")
+        config_layout.addWidget(self.buffer_size_input, 2, 1)
+        
+        self.apply_buffer_btn = QPushButton("✓ Aplicar")
+        self.apply_buffer_btn.setEnabled(False)
+        self.apply_buffer_btn.setFixedWidth(80)
+        self.apply_buffer_btn.clicked.connect(self.apply_camera_buffer)
+        config_layout.addWidget(self.apply_buffer_btn, 2, 2)
+        
         config_layout.setColumnStretch(3, 1)
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
@@ -4154,6 +4504,8 @@ class ArduinoGUI(QMainWindow):
             self.open_camera_view_btn.setEnabled(True)
             self.start_live_btn.setEnabled(True)
             self.apply_exposure_btn.setEnabled(True)
+            self.apply_fps_btn.setEnabled(True)
+            self.apply_buffer_btn.setEnabled(True)
             logger.info(f"Cámara conectada exitosamente: {camera_info}")
         else:
             self.camera_info_label.setText("Estado: Error de conexión")
@@ -4178,6 +4530,8 @@ class ArduinoGUI(QMainWindow):
         self.start_live_btn.setEnabled(False)
         self.stop_live_btn.setEnabled(False)
         self.apply_exposure_btn.setEnabled(False)
+        self.apply_fps_btn.setEnabled(False)
+        self.apply_buffer_btn.setEnabled(False)
         self.capture_image_btn.setEnabled(False)
     
     def open_camera_view(self):
@@ -4202,8 +4556,33 @@ class ArduinoGUI(QMainWindow):
         self.stop_live_btn.setEnabled(True)
         self.capture_image_btn.setEnabled(True)
         
-        # Iniciar en el thread del worker
+        # CRÍTICO: QThread solo puede iniciarse UNA VEZ
+        # Si el thread ya terminó, necesitamos recrearlo
+        if self.camera_worker.isFinished() or self.camera_worker.isRunning():
+            if self.camera_worker.isRunning():
+                logger.warning("Thread de cámara ya está corriendo")
+                self.log_camera_message("WARNING", "La vista en vivo ya está activa")
+                return
+            
+            # Thread ya terminó, necesitamos recrear el worker
+            logger.info("Recreando worker de cámara (thread anterior terminó)")
+            old_cam = self.camera_worker.cam  # Guardar referencia a la cámara
+            
+            # Crear nuevo worker
+            self.camera_worker = CameraWorker()
+            self.camera_worker.cam = old_cam  # Reutilizar la conexión de cámara
+            self.camera_worker.exposure = float(self.exposure_input.text())
+            self.camera_worker.fps = int(self.fps_input.text())
+            self.camera_worker.buffer_size = int(self.buffer_size_input.text())
+            
+            # Reconectar señales
+            self.camera_worker.status_update.connect(self.log_camera_message_simple)
+            self.camera_worker.connection_success.connect(self.on_camera_connected)
+            self.camera_worker.new_frame_ready.connect(self.on_camera_frame)
+            
+        # Iniciar el thread
         self.camera_worker.start()
+        logger.info("Thread de cámara iniciado")
     
     def stop_camera_live_view(self):
         """Detiene la vista en vivo de la cámara."""
@@ -4234,6 +4613,36 @@ class ArduinoGUI(QMainWindow):
                 self.log_camera_message("ERROR", "Cámara no conectada")
         except ValueError:
             self.log_camera_message("ERROR", "Valor de exposición inválido")
+    
+    def apply_camera_fps(self):
+        """Aplica el nuevo valor de FPS a la cámara."""
+        try:
+            fps_value = int(self.fps_input.text())
+            if fps_value <= 0 or fps_value > 120:
+                self.log_camera_message("ERROR", "FPS debe estar entre 1 y 120")
+                return
+            
+            if self.camera_worker:
+                self.camera_worker.change_fps(fps_value)
+            else:
+                self.log_camera_message("ERROR", "Cámara no conectada")
+        except ValueError:
+            self.log_camera_message("ERROR", "Valor de FPS inválido (debe ser entero)")
+    
+    def apply_camera_buffer(self):
+        """Aplica el nuevo tamaño de buffer a la cámara."""
+        try:
+            buffer_value = int(self.buffer_size_input.text())
+            if buffer_value <= 0 or buffer_value > 500:
+                self.log_camera_message("ERROR", "Buffer debe estar entre 10 y 500 frames")
+                return
+            
+            if self.camera_worker:
+                self.camera_worker.change_buffer_size(buffer_value)
+            else:
+                self.log_camera_message("ERROR", "Cámara no conectada")
+        except ValueError:
+            self.log_camera_message("ERROR", "Valor de buffer inválido (debe ser entero)")
     
     def browse_save_folder(self):
         """Abre diálogo para seleccionar carpeta de guardado."""
