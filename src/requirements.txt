@@ -1,0 +1,49 @@
+# =========================================================================
+# Sistema de Control y Análisis - Motores L206
+# Requirements File - Python Dependencies
+# =========================================================================
+
+# Core GUI Framework
+PyQt5>=5.15.0
+
+# Real-time Plotting
+pyqtgraph>=0.12.0
+
+# Numerical Computing
+numpy>=1.20.0
+scipy>=1.7.0
+
+# Data Analysis
+pandas>=1.3.0
+
+# Control Systems
+control>=0.9.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Serial Communication
+pyserial>=3.5
+
+# Thorlabs Camera (Optional)
+# Uncomment if using Thorlabs camera
+# pylablib>=1.4.0
+
+# =========================================================================
+# Installation Instructions:
+# -------------------------
+# 1. Create virtual environment (recommended):
+#    python -m venv venv
+#
+# 2. Activate virtual environment:
+#    Windows: venv\Scripts\activate
+#    Linux/Mac: source venv/bin/activate
+#
+# 3. Install dependencies:
+#    pip install -r requirements.txt
+#
+# 4. For Thorlabs camera support:
+#    - Install Thorlabs SDK from thorlabs.com
+#    - Uncomment pylablib line above
+#    - pip install pylablib
+# =========================================================================
