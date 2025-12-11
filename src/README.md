@@ -111,6 +111,21 @@ Este sistema proporciona una solución completa para el control y análisis de m
 - **Vista flotante redimensionable**
 - **Reconocimiento de imagen**
 
+### 🔬 Autofoco Multi-Objeto con U2-Net (Planificado)
+- **Detección de objetos salientes:**
+  - U2-Net para segmentación sin calibración previa
+  - Detección de múltiples objetos por frame
+  - Filtrado por área mínima y probabilidad
+- **Autofoco individual por objeto:**
+  - Pre-detección antes de captura
+  - Búsqueda de Z óptimo por cada objeto (Golden Section Search)
+  - Score de enfoque basado en Varianza del Laplaciano (ROI)
+- **Generación eficiente de BBDD:**
+  - N imágenes por punto (una por objeto detectado)
+  - Cada imagen enfocada en su objeto específico
+  - Metadata JSON con coordenadas Z, scores y bounding boxes
+- **Documentación:** Ver `docs/AUTOFOCUS_INTEGRATION_PLAN.md`
+
 ---
 
 ## 🏗️ Arquitectura del Sistema
@@ -300,6 +315,33 @@ Ejecutar simulación/control real
 Analizar resultados
 ```
 
+#### 5️⃣ Microscopía con Autofoco Multi-Objeto (Planificado)
+
+```
+Pestaña "ImgRec" → Sección Microscopía
+  ↓
+Configurar trayectoria XY (desde TestTab)
+  ↓
+Habilitar "Autofoco Multi-Objeto"
+  ↓
+Configurar parámetros:
+  - Rango Z: 100 µm
+  - Tolerancia: 1 µm
+  - Área mínima objeto: 100 px²
+  ↓
+Clic "Iniciar Microscopía"
+  ↓
+Para cada punto XY:
+  1. Pre-detectar objetos con U2-Net
+  2. Para cada objeto detectado:
+     - Buscar Z óptimo (Golden Section)
+     - Capturar imagen enfocada
+  3. Generar: Clase_XXXXX_objYY.png
+  ↓
+Resultado: BBDD con N×M imágenes
+(N puntos × M objetos/punto)
+```
+
 ---
 
 ## 🧩 Módulos y Componentes
@@ -349,6 +391,36 @@ Thread para manejo de cámara Thorlabs sin bloqueo.
 - Conexión/desconexión automática
 - Captura de frames en tiempo real
 - Control de parámetros (exposición, FPS, buffer)
+
+#### `SmartFocusScorer`
+Evaluador de enfoque usando U2-Net para Salient Object Detection.
+
+**Ubicación:** `src/img_analysis/smart_focus_scorer.py`
+
+**Pipeline:**
+1. Segmentación del objeto saliente usando U2-Net (deep learning)
+2. Binarización de la máscara de probabilidad
+3. Extracción de bounding box y centroide de **TODOS** los objetos
+4. Cálculo de enfoque (Laplaciano) **por cada objeto individual**
+
+**Métodos principales:**
+- `assess_image(image)`: Evalúa imagen, retorna `FocusResult` con lista de objetos
+- `_find_all_objects()`: Detecta todos los objetos válidos con sus scores
+- `_calculate_masked_focus()`: Calcula enfoque solo en ROI del objeto
+
+**Dataclasses:**
+- `ObjectInfo`: Información de un objeto (bbox, centroid, area, focus_score)
+- `FocusResult`: Resultado con status, score principal y lista de `objects`
+
+#### `MultiObjectAutofocusController` (Planificado)
+Controlador de autofoco multi-objeto para microscopía automatizada.
+
+**Ubicación:** `src/core/autofocus/multi_object_autofocus.py`
+
+**Flujo:**
+1. `predetect_objects()`: Pre-detecta objetos usando SmartFocusScorer
+2. `focus_single_object()`: Busca Z óptimo para un objeto específico
+3. `capture_all_objects()`: Enfoca y captura cada objeto individualmente
 
 ---
 

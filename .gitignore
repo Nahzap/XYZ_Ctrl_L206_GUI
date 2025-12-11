@@ -1,9 +1,46 @@
-# Ignore everything
-*
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
-# But not these files...
-!.gitignore
-!main.py
+# Virtual environments
+CTRL_ENV/
+venv/
+env/
+ENV/
 
-# And not directories (so we can recurse into them if needed)
-!*/
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and data
+*.log
+*.csv
+motor_control_*.log
+
+# Images (except documentation)
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+!docs/**/*.jpg
+
+# Backup files
+src/BKPs/
+*.bak
+*.backup
+*~
+
+# Model weights and large files
+*.pth
+*.pt
+*.h5
+*.onnx
+
+# OS files
+Thumbs.db
+.DS_Store

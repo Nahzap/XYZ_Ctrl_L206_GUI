@@ -1,0 +1,35 @@
+# Dependencias principales del proyecto XYZ_Ctrl_L206_GUI
+
+# Interface gráfica
+PyQt5==5.15.11
+pyqtgraph>=0.13.7
+
+# Visualización y análisis
+matplotlib>=3.10.0
+numpy>=2.2.0
+pandas>=2.3.0
+scipy>=1.16.0
+
+# Control de sistemas
+control>=0.10.0
+slycot>=0.6.0
+
+# Comunicación serial
+pyserial>=3.5
+
+# Procesamiento de imágenes
+opencv-python>=4.12.0
+
+# Cámara Thorlabs (funcionalidad de cámara)
+pylablib>=1.4.4
+pyusb>=1.3.0
+PyVISA>=1.15.0
+
+# Computación numérica
+numba>=0.62.0
+llvmlite>=0.45.0
+
+# Utilidades
+toml>=0.10.0
+python-dateutil>=2.9.0
+pytz>=2025.0
