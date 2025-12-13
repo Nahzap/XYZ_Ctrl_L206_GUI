@@ -455,10 +455,29 @@ class HInfTab(QWidget):
             logger.info(f"Tiempo de simulación: {t_final:.3f} s (5×τ_max)")
             
             # Simular respuesta al escalón
-            t_sim, y = ct.step_response(T, T=np.linspace(0, t_final, 1000))
+            logger.debug("Simulando respuesta al escalón...")
+            t_eval = np.linspace(0, t_final, 1000)
+            response = ct.step_response(T, T=t_eval)
+            
+            # Manejar diferentes formatos de salida de step_response
+            # Versiones recientes devuelven TimeResponseData, versiones antiguas devuelven tupla
+            if hasattr(response, 't') and hasattr(response, 'y'):
+                # Formato nuevo: TimeResponseData
+                t_sim = response.t
+                y = response.y
+            else:
+                # Formato antiguo: tupla (t, y)
+                t_sim, y = response
+            
+            # Aplanar si es array multidimensional
+            if hasattr(y, 'ndim') and y.ndim > 1:
+                y = y.flatten()
+            
             t_ms = t_sim * 1000
+            logger.debug(f"Simulación completada: {len(t_sim)} puntos")
             
             # Crear gráfico
+            logger.debug("Creando figura matplotlib...")
             fig = Figure(figsize=(12, 8), facecolor='#2E2E2E')
             ax = fig.add_subplot(111)
             
@@ -477,10 +496,16 @@ class HInfTab(QWidget):
                 ax.spines[spine].set_color('#505050')
             
             fig.tight_layout()
+            logger.debug("Figura creada exitosamente")
             
             # Mostrar ventana
+            logger.debug("Creando ventana matplotlib...")
             if self.step_response_window is not None:
-                self.step_response_window.close()
+                try:
+                    self.step_response_window.close()
+                except Exception:
+                    pass
+                self.step_response_window = None
             
             self.step_response_window = MatplotlibWindow(fig, "Respuesta al Escalón - Controlador H∞", self.parent_gui)
             self.step_response_window.show()
@@ -511,14 +536,24 @@ class HInfTab(QWidget):
             fig = Figure(figsize=(12, 10), facecolor='#2E2E2E')
             
             # Calcular respuesta en frecuencia
-            omega = np.logspace(-2, 3, 500)  # De 0.01 a 1000 rad/s
-            mag, phase, omega = ct.frequency_response(L, omega)
+            omega_eval = np.logspace(-2, 3, 500)  # De 0.01 a 1000 rad/s
+            response = ct.frequency_response(L, omega_eval)
+            
+            # Manejar diferentes formatos de salida
+            if hasattr(response, 'omega') and hasattr(response, 'magnitude'):
+                # Formato nuevo: FrequencyResponseData
+                omega = response.omega
+                mag = response.magnitude
+                phase = response.phase
+            else:
+                # Formato antiguo: tupla (mag, phase, omega)
+                mag, phase, omega = response
             
             # Extraer primera fila si es array 2D
-            if mag.ndim > 1:
-                mag = mag[0, :]
-            if phase.ndim > 1:
-                phase = phase[0, :]
+            if hasattr(mag, 'ndim') and mag.ndim > 1:
+                mag = mag[0, 0, :] if mag.ndim == 3 else mag[0, :]
+            if hasattr(phase, 'ndim') and phase.ndim > 1:
+                phase = phase[0, 0, :] if phase.ndim == 3 else phase[0, :]
             
             # Magnitud
             ax1 = fig.add_subplot(211)
@@ -546,8 +581,13 @@ class HInfTab(QWidget):
             fig.tight_layout()
             
             # Mostrar ventana
+            logger.debug("Creando ventana Bode...")
             if self.bode_window is not None:
-                self.bode_window.close()
+                try:
+                    self.bode_window.close()
+                except Exception:
+                    pass
+                self.bode_window = None
             
             self.bode_window = MatplotlibWindow(fig, "Diagrama de Bode - Controlador H∞", self.parent_gui)
             self.bode_window.show()

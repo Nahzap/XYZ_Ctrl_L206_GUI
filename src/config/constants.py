@@ -2,10 +2,10 @@
 
 # --- CONFIGURACIÓN ---
 # Ajusta el puerto a tu configuración
-SERIAL_PORT = 'COM3' 
+SERIAL_PORT = 'COM5' 
 BAUD_RATE = 1000000
 # Buffer reducido para máxima velocidad (100 puntos = ~1 segundo @ 100Hz)
-PLOT_LENGTH = 50
+PLOT_LENGTH = 100
 
 # --- Constantes del Sistema Físico ---
 ADC_MAX = 1023.0

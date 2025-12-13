@@ -1,3 +1,9 @@
+# CRITICAL: Set OpenMP environment variable BEFORE any imports
+# This fixes the conflict between PyTorch (libiomp5md.dll) and SciPy (libomp.dll)
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
+
 """
 Sistema de Control y Análisis - Motores L206
 ============================================
@@ -82,6 +88,12 @@ from core.trajectory import TrajectoryGenerator
 from gui.tabs import (ControlTab, RecordingTab, AnalysisTab, 
                       CameraTab, TestTab, HInfTab, ImgAnalysisTab)
 
+# Fase 11: Detección U2-Net (Singleton - carga única)
+from core.detection import U2NetDetector
+
+# Fase 12: Servicios Asíncronos
+from core.services import DetectionService, AutofocusService
+
 # =========================================================================
 # --- INICIALIZAR SISTEMA DE LOGGING ---
 # =========================================================================
@@ -161,6 +173,14 @@ class ArduinoGUI(QMainWindow):
         self.signal_window = None
         self.data_window = None
         self.analysis_window = None
+        
+        # Inicializar detector U2-Net (Singleton - carga única al inicio)
+        logger.info("Inicializando detector U2-Net...")
+        self.u2net_detector = U2NetDetector.get_instance()
+        
+        # Inicializar servicios de detección y autofoco
+        self.detection_service = DetectionService()
+        self.autofocus_service = AutofocusService()
         
         # Iniciar comunicación serial ANTES de crear tabs (necesario para ControlTab)
         self.serial_thread = SerialHandler(SERIAL_PORT, BAUD_RATE)
@@ -259,6 +279,9 @@ class ArduinoGUI(QMainWindow):
         self.camera_tab.set_test_tab_reference(self.test_tab)
         self.tabs.addTab(self.camera_tab, "🎥 ImgRec")
         
+        # Conectar servicios de detección con CameraTab
+        self._setup_detection_services()
+        
         # Conectar señales de microscopia
         self.camera_tab.microscopy_start_requested.connect(self._start_microscopy)
         self.camera_tab.microscopy_stop_requested.connect(self._stop_microscopy)
@@ -268,14 +291,16 @@ class ArduinoGUI(QMainWindow):
         self.microscopy_current_point = 0
         self.microscopy_config = None
         
-        # Variables de autofoco C-Focus
+        # Variables de C-Focus (autofoco usa AutofocusService)
         self.cfocus_controller = None
-        self.autofocus_controller = None
         self.cfocus_enabled = False
         
         # Pestaña 7: Análisis de Imagen (ImgAnalysisTab - Índice de Nitidez)
         self.img_analysis_tab = ImgAnalysisTab(parent=self)
         self.tabs.addTab(self.img_analysis_tab, "🔬 Img Analysis")
+        
+        # Exponer SmartFocusScorer para CameraViewWindow (usa el mismo que ImgAnalysisTab)
+        self.smart_focus_scorer = self.img_analysis_tab.scorer
         
         main_layout.addWidget(self.tabs)
 
@@ -617,8 +642,8 @@ class ArduinoGUI(QMainWindow):
         if not self.microscopy_active:
             return
         
-        # Si autofoco está habilitado, usar método con autofoco
-        if self.microscopy_config.get('autofocus_enabled', False) and self.autofocus_controller:
+        # Si autofoco está habilitado, usar servicio de autofoco
+        if self.microscopy_config.get('autofocus_enabled', False) and self.cfocus_enabled:
             self._microscopy_capture_with_autofocus()
             return
         
@@ -678,6 +703,94 @@ class ArduinoGUI(QMainWindow):
     
     # --- Control H∞ en Tiempo Real ---
     
+    # --- Servicios de Detección U2-Net ---
+    
+    def _setup_detection_services(self):
+        """Configura los servicios de detección y autofoco."""
+        # Conectar señales del servicio de detección
+        self.detection_service.detection_ready.connect(self._on_detection_ready)
+        self.detection_service.status_changed.connect(self._on_detection_status)
+        
+        # Conectar señales del servicio de autofoco
+        self.autofocus_service.scan_started.connect(self._on_autofocus_started)
+        self.autofocus_service.z_changed.connect(self._on_autofocus_z_changed)
+        self.autofocus_service.object_focused.connect(self._on_object_focused)
+        self.autofocus_service.scan_complete.connect(self._on_autofocus_complete)
+        
+        logger.info("Servicios de detección configurados")
+    
+    def _on_detection_ready(self, saliency_map, objects):
+        """Callback cuando hay nuevos resultados de detección."""
+        # Actualizar visualización en CameraTab si tiene el widget
+        if hasattr(self.camera_tab, 'saliency_widget') and self.camera_tab.saliency_widget:
+            self.camera_tab.saliency_widget.update_detection(saliency_map, objects)
+    
+    def _on_detection_status(self, status):
+        """Callback cuando cambia el estado del servicio de detección."""
+        self.camera_tab.log_message(f"🔍 {status}")
+    
+    def _on_autofocus_started(self, obj_index, total):
+        """Callback cuando inicia autofoco de un objeto."""
+        self.camera_tab.log_message(f"🎯 Enfocando objeto {obj_index + 1}/{total}...")
+    
+    def _on_autofocus_z_changed(self, z, score, roi_frame):
+        """Callback en cada posición Z evaluada."""
+        # Actualizar visualización si está disponible
+        if hasattr(self.camera_tab, 'saliency_widget') and self.camera_tab.saliency_widget:
+            self.camera_tab.saliency_widget.update_autofocus_state(z, score, 0)
+    
+    def _on_object_focused(self, obj_index, z_optimal, score):
+        """Callback cuando se encuentra el foco óptimo de un objeto."""
+        self.camera_tab.log_message(f"  ✓ Obj{obj_index}: Z={z_optimal:.1f}µm, S={score:.1f}")
+    
+    def _on_autofocus_complete(self, results):
+        """Callback cuando termina todo el proceso de autofoco."""
+        n_results = len(results)
+        
+        # Mostrar resultados de cada objeto
+        for r in results:
+            self.camera_tab.log_message(f"   Obj{r.object_index}: Z={r.z_optimal:.1f}µm, Score={r.focus_score:.1f}")
+        
+        # Verificar posición Z actual del piezo
+        if self.cfocus_enabled and self.cfocus_controller:
+            current_z = self.cfocus_controller.read_z()
+            if current_z is not None:
+                self.camera_tab.log_message(f"📍 Posición Z actual: {current_z:.1f}µm (BPoF)")
+        
+        self.camera_tab.log_message(f"✅ Autofoco completado: {n_results} objetos enfocados")
+        
+        # Limpiar estado de autofoco en visualización
+        if hasattr(self.camera_tab, 'saliency_widget') and self.camera_tab.saliency_widget:
+            self.camera_tab.saliency_widget.clear_autofocus_state()
+        
+        # Si hay captura pendiente (desde botón "Capturar Imagen"), ejecutarla
+        if hasattr(self.camera_tab, '_pending_capture') and self.camera_tab._pending_capture:
+            self.camera_tab._pending_capture = False
+            self.camera_tab.log_message("📸 Capturando imagen con mejor foco...")
+            self.camera_tab._do_capture_image()
+            return
+        
+        # Si estamos en microscopía, capturar imagen y avanzar al siguiente punto
+        if self.microscopy_active:
+            # Capturar imagen con el mejor foco usando método manual
+            self.camera_tab.log_message(f"📸 Capturando imagen con BPoF...")
+            self.camera_tab._do_capture_image()
+            logger.info(f"Microscopia: imagen {self.microscopy_current_point + 1} capturada con autofoco")
+            
+            self._advance_microscopy_point()
+    
+    def start_realtime_detection(self):
+        """Inicia detección en tiempo real."""
+        if not self.camera_tab.camera_worker:
+            self.camera_tab.log_message("⚠️ Conecta la cámara primero")
+            return
+        
+        self.detection_service.start_detection()
+    
+    def stop_realtime_detection(self):
+        """Detiene detección en tiempo real."""
+        self.detection_service.stop_detection()
+    
     # --- Métodos de Autofoco C-Focus ---
     
     def connect_cfocus(self):
@@ -709,7 +822,7 @@ class ArduinoGUI(QMainWindow):
             logger.info("C-Focus desconectado")
     
     def initialize_autofocus(self):
-        """Inicializa el controlador de autofoco multi-objeto."""
+        """Inicializa el servicio de autofoco con C-Focus y cámara."""
         if not self.cfocus_enabled:
             self.camera_tab.log_message("⚠️ C-Focus no conectado")
             return False
@@ -718,80 +831,75 @@ class ArduinoGUI(QMainWindow):
             self.camera_tab.log_message("⚠️ Cámara no conectada")
             return False
         
-        try:
-            from core.autofocus.smart_focus_scorer import SmartFocusScorer
-            from core.autofocus.multi_object_autofocus import MultiObjectAutofocusController
-            
-            if not hasattr(self, 'focus_scorer'):
-                self.focus_scorer = SmartFocusScorer()
-            
-            self.autofocus_controller = MultiObjectAutofocusController(
-                scorer=self.focus_scorer,
-                cfocus_controller=self.cfocus_controller,
-                get_frame_callback=lambda: self.camera_tab.camera_worker.current_frame
-            )
-            
-            self.camera_tab.log_message("✅ Autofoco multi-objeto inicializado")
-            logger.info("Autofoco multi-objeto inicializado")
-            return True
-            
-        except Exception as e:
-            self.camera_tab.log_message(f"❌ Error inicializando autofoco: {e}")
-            logger.error(f"Error inicializando autofoco: {e}")
-            return False
+        # Configurar AutofocusService con hardware
+        self.autofocus_service.configure(
+            cfocus_controller=self.cfocus_controller,
+            get_frame_callback=lambda: self.camera_tab.camera_worker.current_frame
+        )
+        
+        self.camera_tab.log_message("✅ Autofoco configurado (U2-Net + C-Focus)")
+        logger.info("AutofocusService configurado con C-Focus y cámara")
+        return True
     
     def _microscopy_capture_with_autofocus(self):
         """
-        Captura con pre-detección y autofoco multi-objeto.
-        Reemplaza a _microscopy_capture() cuando autofoco está habilitado.
+        Captura con pre-detección U2-Net y autofoco asíncrono.
+        Usa SmartFocusScorer para detección y AutofocusService para enfoque.
         """
         if not self.microscopy_active:
             return
         
-        config = self.microscopy_config
         point_idx = self.microscopy_current_point
         
-        if self.autofocus_controller is None:
-            self.camera_tab.log_message("⚠️ Autofoco no inicializado, usando captura normal")
-            self._microscopy_capture()
+        # Obtener frame actual
+        frame = self.camera_tab.camera_worker.current_frame
+        if frame is None:
+            self.camera_tab.log_message("⚠️ Sin frame disponible")
+            self._advance_microscopy_point()
             return
         
-        self.camera_tab.log_message(f"🔍 Pre-detectando objetos...")
-        objects = self.autofocus_controller.predetect_objects()
+        # Convertir frame uint16 -> uint8 para detección
+        if frame.dtype == np.uint16:
+            frame_max = frame.max()
+            if frame_max > 0:
+                frame_uint8 = (frame / frame_max * 255).astype(np.uint8)
+            else:
+                frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
+        else:
+            frame_uint8 = frame.astype(np.uint8)
+        
+        if len(frame_uint8.shape) == 2:
+            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
+        else:
+            frame_bgr = frame_uint8
+        
+        # Detectar objetos con SmartFocusScorer (usa ObjectInfo compatible)
+        self.camera_tab.log_message(f"🔍 Detectando objetos...")
+        result = self.smart_focus_scorer.assess_image(frame_bgr)
+        all_objects = result.objects if result.objects else []
+        
+        # Filtrar por rango de área configurado en CameraTab
+        min_area = self.camera_tab.min_pixels_spin.value()
+        max_area = self.camera_tab.max_pixels_spin.value()
+        objects = [obj for obj in all_objects if min_area <= obj.area <= max_area]
+        
         n_objects = len(objects)
         
         if n_objects == 0:
-            self.camera_tab.log_message(f"  ⚠️ Sin objetos válidos - saltando punto")
-            logger.info(f"Punto {point_idx}: sin objetos detectados")
-            
-            self.microscopy_current_point += 1
-            
-            if self.microscopy_current_point < len(self.microscopy_trajectory):
-                QTimer.singleShot(self._delay_after_ms, self._microscopy_move_to_point)
-            else:
-                self._finish_microscopy()
+            self.camera_tab.log_message(f"  ⚠️ Sin objetos en rango [{min_area}-{max_area}] px - saltando punto")
+            logger.info(f"Punto {point_idx}: sin objetos en rango (detectados: {len(all_objects)})")
+            self._advance_microscopy_point()
             return
         
-        self.camera_tab.log_message(f"  ✓ {n_objects} objeto(s) detectado(s)")
+        self.camera_tab.log_message(f"  ✓ {n_objects} objeto(s) en rango (de {len(all_objects)} detectados)")
         logger.info(f"Punto {point_idx}: {n_objects} objetos válidos")
         
-        # Obtener modo de Z-scanning desde UI
-        use_full_scan = self.camera_tab.full_scan_cb.isChecked()
-        
-        captures = self.autofocus_controller.capture_all_objects(
-            objects=objects,
-            save_folder=config.get('save_folder', '.'),
-            class_name=config.get('class_name', 'Imagen'),
-            point_index=point_idx,
-            config=config,
-            use_full_scan=use_full_scan
-        )
-        
-        for cap in captures:
-            self.camera_tab.log_message(
-                f"  📸 Obj{cap.object_index}: Z={cap.z_optimal:.1f}µm, S={cap.focus_score:.1f}"
-            )
-        
+        # Iniciar autofoco asíncrono (hill-climbing rápido)
+        self.autofocus_service.start_autofocus(objects)
+        # El callback _on_autofocus_complete manejará la captura y avance
+    
+    def _advance_microscopy_point(self):
+        """Avanza al siguiente punto de microscopía."""
         self.camera_tab.set_microscopy_progress(
             self.microscopy_current_point + 1,
             len(self.microscopy_trajectory)
@@ -800,7 +908,6 @@ class ArduinoGUI(QMainWindow):
         self.microscopy_current_point += 1
         
         if self.microscopy_current_point < len(self.microscopy_trajectory):
-            self.camera_tab.log_message(f"  Pausa post-captura: {self._delay_after_ms}ms")
             QTimer.singleShot(self._delay_after_ms, self._microscopy_move_to_point)
         else:
             self._finish_microscopy()

@@ -13,11 +13,11 @@ import logging
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QLabel, QPushButton, QFileDialog, QListWidget, QListWidgetItem,
-    QSplitter, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QDoubleSpinBox, QCheckBox, QProgressBar, QTabWidget, QMessageBox,
-    QComboBox, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+    QGroupBox, QFileDialog, QProgressBar, QListWidget, QListWidgetItem,
+    QSplitter, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider, QComboBox,
+    QSizePolicy, QScrollArea, QRadioButton, QTableWidget, QTableWidgetItem,
+    QStackedWidget, QTabWidget, QMessageBox, QFrame
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -29,7 +29,7 @@ from img_analysis.sharpness_detector import (
     SharpnessDetector, SharpnessResult, create_debug_composite
 )
 from img_analysis.smart_focus_scorer import (
-    SmartFocusScorer, FocusResult
+    SmartFocusScorer, FocusResult, ObjectInfo
 )
 
 logger = logging.getLogger('MotorControl_L206')
@@ -56,6 +56,421 @@ class CalibrationWorker(QThread):
             progress_callback
         )
         self.finished.emit(success, message)
+
+
+class ZoomableLabel(QLabel):
+    """QLabel con zoom real (recorta región) y pan con arrastre."""
+    
+    zoom_changed = pyqtSignal(float, float, float)  # zoom, center_x_ratio, center_y_ratio
+    
+    def __init__(self, title: str = ""):
+        super().__init__()
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3c3c3c;")
+        self._title = title
+        self._zoom = 1.0
+        self._center_x = 0.5  # Centro de vista (0-1)
+        self._center_y = 0.5
+        self._full_image = None
+        self._dragging = False
+        self._last_pos = None
+        self.setMouseTracking(True)
+    
+    def set_image(self, img_bgr: np.ndarray, title: str = None):
+        """Establece la imagen a mostrar."""
+        if title:
+            self._title = title
+        self._full_image = img_bgr.copy()
+        self._update_display()
+    
+    def set_zoom(self, zoom: float, cx: float = None, cy: float = None):
+        """Establece el nivel de zoom y centro."""
+        self._zoom = max(1.0, min(10.0, zoom))
+        if cx is not None:
+            self._center_x = max(0.0, min(1.0, cx))
+        if cy is not None:
+            self._center_y = max(0.0, min(1.0, cy))
+        self._update_display()
+    
+    def reset_view(self):
+        """Resetea zoom y pan."""
+        self._zoom = 1.0
+        self._center_x = 0.5
+        self._center_y = 0.5
+        self._update_display()
+    
+    def _update_display(self):
+        """Actualiza la visualización con zoom real (recorte de región)."""
+        if self._full_image is None:
+            return
+        
+        img = self._full_image
+        h, w = img.shape[:2]
+        
+        # Calcular región visible según zoom
+        view_w = int(w / self._zoom)
+        view_h = int(h / self._zoom)
+        
+        # Centro de la vista
+        cx = int(self._center_x * w)
+        cy = int(self._center_y * h)
+        
+        # Límites de la región
+        x1 = max(0, cx - view_w // 2)
+        y1 = max(0, cy - view_h // 2)
+        x2 = min(w, x1 + view_w)
+        y2 = min(h, y1 + view_h)
+        
+        # Ajustar si toca bordes
+        if x2 - x1 < view_w:
+            x1 = max(0, x2 - view_w)
+        if y2 - y1 < view_h:
+            y1 = max(0, y2 - view_h)
+        
+        # Recortar región
+        cropped = img[y1:y2, x1:x2].copy()
+        
+        # Dibujar título en la esquina
+        cv2.putText(cropped, self._title, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 
+                   0.45, (0, 0, 0), 2)
+        cv2.putText(cropped, self._title, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 
+                   0.45, (255, 255, 255), 1)
+        
+        # Indicador de zoom
+        if self._zoom > 1.0:
+            zoom_text = f"x{self._zoom:.1f}"
+            cv2.putText(cropped, zoom_text, (cropped.shape[1] - 45, 16), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        
+        # Convertir a QPixmap
+        if len(cropped.shape) == 2:
+            img_rgb = cv2.cvtColor(cropped, cv2.COLOR_GRAY2RGB)
+        else:
+            img_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+        
+        img_rgb = np.ascontiguousarray(img_rgb)
+        qimg = QImage(img_rgb.data, img_rgb.shape[1], img_rgb.shape[0], 
+                     img_rgb.shape[1] * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        
+        # Escalar al tamaño del widget
+        self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    
+    def wheelEvent(self, event):
+        """Zoom con rueda del mouse centrado en cursor."""
+        if self._full_image is None:
+            return
+        
+        # Calcular posición relativa del cursor
+        widget_w, widget_h = self.width(), self.height()
+        mouse_x = event.x() / widget_w
+        mouse_y = event.y() / widget_h
+        
+        # Zoom
+        delta = event.angleDelta().y()
+        factor = 1.2 if delta > 0 else 0.83
+        old_zoom = self._zoom
+        self._zoom = max(1.0, min(10.0, self._zoom * factor))
+        
+        # Ajustar centro hacia el cursor al hacer zoom in
+        if self._zoom > old_zoom:
+            self._center_x += (mouse_x - 0.5) * 0.1
+            self._center_y += (mouse_y - 0.5) * 0.1
+            self._center_x = max(0.0, min(1.0, self._center_x))
+            self._center_y = max(0.0, min(1.0, self._center_y))
+        
+        self._update_display()
+        self.zoom_changed.emit(self._zoom, self._center_x, self._center_y)
+    
+    def mousePressEvent(self, event):
+        """Inicia arrastre para pan."""
+        if event.button() == Qt.LeftButton and self._zoom > 1.0:
+            self._dragging = True
+            self._last_pos = event.pos()
+    
+    def mouseMoveEvent(self, event):
+        """Pan con arrastre."""
+        if self._dragging and self._last_pos:
+            dx = event.x() - self._last_pos.x()
+            dy = event.y() - self._last_pos.y()
+            
+            # Mover centro (invertido para sensación natural)
+            sensitivity = 0.002 / self._zoom
+            self._center_x -= dx * sensitivity * 2
+            self._center_y -= dy * sensitivity * 2
+            self._center_x = max(0.0, min(1.0, self._center_x))
+            self._center_y = max(0.0, min(1.0, self._center_y))
+            
+            self._last_pos = event.pos()
+            self._update_display()
+            self.zoom_changed.emit(self._zoom, self._center_x, self._center_y)
+    
+    def mouseReleaseEvent(self, event):
+        """Termina arrastre."""
+        if event.button() == Qt.LeftButton:
+            self._dragging = False
+            self._last_pos = None
+    
+    def resizeEvent(self, event):
+        """Actualiza al redimensionar."""
+        super().resizeEvent(event)
+        self._update_display()
+
+
+class SingleViewWithOverlays(QWidget):
+    """Vista única con overlays seleccionables y lista de objetos detectados."""
+    
+    def __init__(self):
+        super().__init__()
+        self._setup_ui()
+        self._focus_result = None
+        self._image = None
+        self._layers = {}  # Capas pre-calculadas
+    
+    def _setup_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(4)
+        
+        # === Panel izquierdo: Visor con zoom ===
+        viewer_panel = QVBoxLayout()
+        
+        # Controles de overlay
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(QLabel("Capas:"))
+        
+        self.cb_prob = QCheckBox("Prob")
+        self.cb_prob.setToolTip("Mapa de probabilidad U2-Net")
+        self.cb_prob.stateChanged.connect(self._refresh_composite)
+        overlay_row.addWidget(self.cb_prob)
+        
+        self.cb_mask = QCheckBox("Mask")
+        self.cb_mask.setToolTip("Contornos de máscara binaria")
+        self.cb_mask.stateChanged.connect(self._refresh_composite)
+        overlay_row.addWidget(self.cb_mask)
+        
+        self.cb_focus = QCheckBox("Focus")
+        self.cb_focus.setToolTip("Mapa de enfoque (Laplaciano)")
+        self.cb_focus.stateChanged.connect(self._refresh_composite)
+        overlay_row.addWidget(self.cb_focus)
+        
+        self.cb_boxes = QCheckBox("Boxes")
+        self.cb_boxes.setChecked(True)
+        self.cb_boxes.setToolTip("Bounding boxes y scores")
+        self.cb_boxes.stateChanged.connect(self._refresh_composite)
+        overlay_row.addWidget(self.cb_boxes)
+        
+        overlay_row.addWidget(QLabel("|"))
+        
+        self.cb_lock = QCheckBox("🔒 Lock")
+        self.cb_lock.setToolTip("Bloquear capas al cambiar de imagen")
+        overlay_row.addWidget(self.cb_lock)
+        
+        overlay_row.addStretch()
+        
+        self.btn_reset_zoom = QPushButton("🔍 Reset")
+        self.btn_reset_zoom.setFixedWidth(60)
+        self.btn_reset_zoom.clicked.connect(self._reset_zoom)
+        overlay_row.addWidget(self.btn_reset_zoom)
+        
+        viewer_panel.addLayout(overlay_row)
+        
+        # Visor principal
+        self.main_view = ZoomableLabel("Vista Principal")
+        self.main_view.setMinimumSize(400, 300)
+        viewer_panel.addWidget(self.main_view, stretch=1)
+        
+        main_layout.addLayout(viewer_panel, stretch=3)
+        
+        # === Panel derecho: Lista de objetos ===
+        objects_panel = QVBoxLayout()
+        objects_panel.addWidget(QLabel("📋 Objetos Detectados"))
+        
+        self.objects_table = QTableWidget()
+        self.objects_table.setColumnCount(4)
+        self.objects_table.setHorizontalHeaderLabels(["#", "Score", "Estado", "Área"])
+        self.objects_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.objects_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.objects_table.setMinimumWidth(200)
+        self.objects_table.setMaximumWidth(250)
+        self.objects_table.horizontalHeader().setStretchLastSection(True)
+        self.objects_table.setStyleSheet("""
+            QTableWidget { background-color: #1e1e1e; color: #fff; font-size: 11px; }
+            QTableWidget::item:selected { background-color: #0078d4; }
+            QHeaderView::section { background-color: #2d2d2d; color: #fff; padding: 4px; }
+        """)
+        self.objects_table.itemSelectionChanged.connect(self._on_object_selected)
+        objects_panel.addWidget(self.objects_table)
+        
+        # Resumen
+        self.label_summary = QLabel("Total: 0 | Focused: 0")
+        self.label_summary.setStyleSheet("color: #3498DB; font-weight: bold;")
+        objects_panel.addWidget(self.label_summary)
+        
+        main_layout.addLayout(objects_panel, stretch=1)
+    
+    def _reset_zoom(self):
+        self.main_view.reset_view()
+    
+    def reset_zoom(self):
+        self.main_view.reset_view()
+    
+    def display_result(self, img_gray: np.ndarray, focus_result: FocusResult):
+        """Muestra imagen con overlays según checkboxes."""
+        self._image = img_gray
+        self._focus_result = focus_result
+        
+        # Pre-calcular capas
+        self._calculate_layers()
+        
+        # Actualizar tabla de objetos
+        self._update_objects_table()
+        
+        # Refrescar vista compuesta
+        self._refresh_composite()
+    
+    def _calculate_layers(self):
+        """Pre-calcula todas las capas de overlay."""
+        if self._image is None or self._focus_result is None:
+            return
+        
+        img = self._image
+        fr = self._focus_result
+        h, w = img.shape[:2]
+        
+        # Capa base (original en BGR)
+        self._layers['base'] = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        
+        # Capa de probabilidad (heatmap semi-transparente)
+        if fr.probability_map is not None:
+            prob_uint8 = (fr.probability_map * 255).astype(np.uint8)
+            self._layers['prob'] = cv2.applyColorMap(prob_uint8, cv2.COLORMAP_JET)
+        else:
+            self._layers['prob'] = None
+        
+        # Capa de máscara (contornos)
+        self._layers['mask'] = fr.binary_mask if fr.binary_mask is not None else None
+        
+        # Capa de focus (Laplaciano)
+        laplacian = cv2.Laplacian(img, cv2.CV_64F)
+        lap_abs = np.abs(laplacian)
+        lap_max = lap_abs.max()
+        if lap_max > 0:
+            lap_norm = (lap_abs / lap_max * 255).astype(np.uint8)
+        else:
+            lap_norm = np.zeros_like(img, dtype=np.uint8)
+        
+        if fr.binary_mask is not None:
+            lap_norm = cv2.bitwise_and(lap_norm, fr.binary_mask)
+        
+        self._layers['focus'] = cv2.applyColorMap(lap_norm, cv2.COLORMAP_HOT)
+    
+    def _refresh_composite(self):
+        """Compone la imagen final según checkboxes activos."""
+        if self._image is None or 'base' not in self._layers:
+            return
+        
+        # Empezar con imagen base
+        composite = self._layers['base'].copy()
+        h, w = composite.shape[:2]
+        
+        # Superponer probabilidad
+        if self.cb_prob.isChecked() and self._layers.get('prob') is not None:
+            composite = cv2.addWeighted(composite, 0.5, self._layers['prob'], 0.5, 0)
+        
+        # Superponer focus map
+        if self.cb_focus.isChecked() and self._layers.get('focus') is not None:
+            # Solo donde hay focus (no negro)
+            focus_gray = cv2.cvtColor(self._layers['focus'], cv2.COLOR_BGR2GRAY)
+            mask = focus_gray > 10
+            composite[mask] = cv2.addWeighted(
+                composite, 0.4, self._layers['focus'], 0.6, 0
+            )[mask]
+        
+        # Dibujar contornos de máscara
+        if self.cb_mask.isChecked() and self._layers.get('mask') is not None:
+            contours, _ = cv2.findContours(
+                self._layers['mask'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(composite, contours, -1, (255, 0, 255), 1)
+        
+        # Dibujar boxes y scores
+        if self.cb_boxes.isChecked() and self._focus_result:
+            for i, obj in enumerate(self._focus_result.objects):
+                color = (0, 255, 0) if obj.is_focused else (0, 0, 255)
+                x, y, bw, bh = obj.bounding_box
+                
+                # Bounding box
+                cv2.rectangle(composite, (x, y), (x + bw, y + bh), color, 2)
+                
+                # Score arriba a la derecha del bbox
+                score_text = f"#{i+1}: {obj.focus_score:.1f}"
+                text_x = x + bw - 5
+                text_y = y - 8 if y > 25 else y + bh + 15
+                (tw, th), _ = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(composite, (text_x - tw - 4, text_y - th - 4), 
+                             (text_x + 4, text_y + 4), (0, 0, 0), -1)
+                cv2.putText(composite, score_text, (text_x - tw, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        
+        self.main_view.set_image(composite)
+    
+    def _update_objects_table(self):
+        """Actualiza la tabla de objetos detectados."""
+        if self._focus_result is None:
+            self.objects_table.setRowCount(0)
+            self.label_summary.setText("Total: 0 | Focused: 0")
+            return
+        
+        objects = self._focus_result.objects
+        self.objects_table.setRowCount(len(objects))
+        
+        n_focused = 0
+        for i, obj in enumerate(objects):
+            # Número
+            item_num = QTableWidgetItem(f"{i+1}")
+            item_num.setTextAlignment(Qt.AlignCenter)
+            self.objects_table.setItem(i, 0, item_num)
+            
+            # Score
+            item_score = QTableWidgetItem(f"{obj.focus_score:.1f}")
+            item_score.setTextAlignment(Qt.AlignCenter)
+            if obj.is_focused:
+                item_score.setForeground(Qt.green)
+                n_focused += 1
+            else:
+                item_score.setForeground(Qt.red)
+            self.objects_table.setItem(i, 1, item_score)
+            
+            # Estado
+            status = "✓" if obj.is_focused else "✗"
+            item_status = QTableWidgetItem(status)
+            item_status.setTextAlignment(Qt.AlignCenter)
+            self.objects_table.setItem(i, 2, item_status)
+            
+            # Área
+            item_area = QTableWidgetItem(f"{int(obj.area)}")
+            item_area.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.objects_table.setItem(i, 3, item_area)
+        
+        self.objects_table.resizeColumnsToContents()
+        self.label_summary.setText(f"Total: {len(objects)} | Focused: {n_focused}")
+        
+        if n_focused > 0:
+            self.label_summary.setStyleSheet("color: #2ECC71; font-weight: bold;")
+        elif len(objects) > 0:
+            self.label_summary.setStyleSheet("color: #E67E22; font-weight: bold;")
+        else:
+            self.label_summary.setStyleSheet("color: #95A5A6; font-weight: bold;")
+    
+    def _on_object_selected(self):
+        """Resalta el objeto seleccionado en la vista."""
+        # Por ahora solo refresca, podría hacer zoom al objeto
+        pass
+    
+    def is_locked(self) -> bool:
+        """Retorna si las capas están bloqueadas."""
+        return self.cb_lock.isChecked()
 
 
 class RobustImageViewer(QLabel):
@@ -93,18 +508,29 @@ class RobustImageViewer(QLabel):
         img = self.current_image
         result = self.current_result
         
-        if self._display_mode == "debug" and result and result.z_score_map is not None:
-            # Modo debug: visualización compuesta con Multi-Otsu info
-            img_display = create_debug_composite(
-                img, result.z_score_map, result.mask, result.sharpness,
-                optimal_threshold=result.optimal_z_threshold,
-                bias=result.bias_correction,
-                hysteresis_low=result.hysteresis_low
-            )
+        if self._display_mode == "debug" and result:
+            # Modo debug: usar laplacian_map si es imagen BGR de debug (Smart)
+            if result.laplacian_map is not None and len(result.laplacian_map.shape) == 3:
+                # Es la visualización de debug del SmartFocusScorer (BGR)
+                img_display = result.laplacian_map.copy()
+                self._draw_score_overlay(img_display, result)
+            elif result.z_score_map is not None:
+                # Modo legacy: visualización compuesta con Multi-Otsu info
+                img_display = create_debug_composite(
+                    img, result.z_score_map, result.mask, result.sharpness,
+                    optimal_threshold=result.optimal_z_threshold,
+                    bias=result.bias_correction,
+                    hysteresis_low=result.hysteresis_low
+                )
+            else:
+                # Fallback
+                img_display = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                if result:
+                    self._draw_score_overlay(img_display, result)
         elif self._display_mode == "zscore" and result and result.z_score_map is not None:
-            # Solo Z-Score map
-            z_clipped = np.clip(result.z_score_map, 0, 10)
-            z_norm = (z_clipped / 10 * 255).astype(np.uint8)
+            # Solo Z-Score map / edges
+            z_clipped = np.clip(result.z_score_map, 0, 255)
+            z_norm = z_clipped.astype(np.uint8)
             img_display = cv2.applyColorMap(z_norm, cv2.COLORMAP_JET)
         elif self._display_mode == "mask" and result and result.mask is not None:
             # Solo máscara
@@ -222,11 +648,14 @@ class ImgAnalysisTab(QWidget):
         # Detector de sharpness robusto (legacy)
         self.sharpness_detector = SharpnessDetector()
         
-        # Smart Focus Scorer (nuevo - sin calibración)
+        # Smart Focus Scorer (U2-Net Salient Object Detection)
         self.smart_scorer = SmartFocusScorer(
-            entropy_threshold=4.0,
-            min_entropy=2.0,
-            use_sqrt_normalization=True
+            model_type='u2netp',   # Modelo pequeño/rápido
+            threshold=0.5,         # Umbral de binarización de saliencia
+            min_area=500,          # Área mínima para considerar objeto (filtra ruido)
+            min_prob=0.3,          # Probabilidad mínima para considerar objeto real
+            focus_threshold=20.0,  # Threshold para clasificar como enfocado
+            use_laplacian=True
         )
         
         self.calibration_worker = None
@@ -299,6 +728,110 @@ class ImgAnalysisTab(QWidget):
         
         method_group.setLayout(method_layout)
         scroll_layout.addWidget(method_group)
+        
+        # === Sección SMART: Parámetros U2-Net ===
+        self.smart_params_group = QGroupBox("🧠 Parámetros SMART (U2-Net AI)")
+        smart_main_layout = QVBoxLayout()
+        
+        # --- Fila 1: Parámetros principales ---
+        params_row = QHBoxLayout()
+        
+        params_row.addWidget(QLabel("Saliencia:"))
+        self.spin_saliency_thresh = QDoubleSpinBox()
+        self.spin_saliency_thresh.setRange(0.1, 0.9)
+        self.spin_saliency_thresh.setValue(0.5)
+        self.spin_saliency_thresh.setSingleStep(0.05)
+        self.spin_saliency_thresh.setToolTip("Umbral para binarizar la máscara.\nMenor = detecta más, Mayor = más estricto.")
+        self.spin_saliency_thresh.valueChanged.connect(self._on_smart_params_changed)
+        params_row.addWidget(self.spin_saliency_thresh)
+        
+        params_row.addWidget(QLabel("Prob Mín:"))
+        self.spin_min_prob = QDoubleSpinBox()
+        self.spin_min_prob.setRange(0.1, 0.9)
+        self.spin_min_prob.setValue(0.3)
+        self.spin_min_prob.setSingleStep(0.05)
+        self.spin_min_prob.setToolTip("Probabilidad mínima promedio para considerar objeto REAL.\nFiltra ruido de fondo que tiene baja probabilidad.")
+        self.spin_min_prob.valueChanged.connect(self._on_smart_params_changed)
+        params_row.addWidget(self.spin_min_prob)
+        
+        params_row.addWidget(QLabel("Área Mín:"))
+        self.spin_min_area = QSpinBox()
+        self.spin_min_area.setRange(100, 50000)
+        self.spin_min_area.setValue(500)
+        self.spin_min_area.setSingleStep(100)
+        self.spin_min_area.setToolTip("Área mínima en px² para considerar objeto válido.\nFiltra objetos pequeños (ruido).")
+        self.spin_min_area.valueChanged.connect(self._on_smart_params_changed)
+        params_row.addWidget(self.spin_min_area)
+        
+        params_row.addWidget(QLabel("Focus:"))
+        self.spin_focus_thresh = QDoubleSpinBox()
+        self.spin_focus_thresh.setRange(1.0, 500.0)
+        self.spin_focus_thresh.setValue(20.0)
+        self.spin_focus_thresh.setSingleStep(5.0)
+        self.spin_focus_thresh.setToolTip("Score mínimo para clasificar como ENFOCADO.")
+        self.spin_focus_thresh.valueChanged.connect(self._on_smart_params_changed)
+        params_row.addWidget(self.spin_focus_thresh)
+        
+        self.cb_use_laplacian = QCheckBox("Lap")
+        self.cb_use_laplacian.setChecked(True)
+        self.cb_use_laplacian.setToolTip("Laplaciano vs Brenner")
+        self.cb_use_laplacian.stateChanged.connect(self._on_smart_params_changed)
+        params_row.addWidget(self.cb_use_laplacian)
+        
+        smart_main_layout.addLayout(params_row)
+        
+        # --- Fila 2: Estado y Reset ---
+        status_row = QHBoxLayout()
+        
+        # Estado del modelo
+        status_row.addWidget(QLabel("Modelo:"))
+        self.label_model_status_smart = QLabel("⏳ No cargado")
+        self.label_model_status_smart.setStyleSheet("color: #E67E22; font-weight: bold;")
+        status_row.addWidget(self.label_model_status_smart)
+        
+        status_row.addStretch()
+        
+        self.btn_reset_smart = QPushButton("🔄 Reset")
+        self.btn_reset_smart.setStyleSheet(self._button_style("#E67E22"))
+        self.btn_reset_smart.setFixedWidth(70)
+        self.btn_reset_smart.clicked.connect(self._reset_smart_parameters)
+        status_row.addWidget(self.btn_reset_smart)
+        
+        smart_main_layout.addLayout(status_row)
+        
+        # --- Fila 3: Estadísticas en tiempo real ---
+        stats_row = QHBoxLayout()
+        
+        stats_row.addWidget(QLabel("📊"))
+        self.label_smart_prob_stats = QLabel("Prob: --")
+        self.label_smart_prob_stats.setStyleSheet("color: #3498DB;")
+        self.label_smart_prob_stats.setToolTip("Probabilidad media/max en el objeto")
+        stats_row.addWidget(self.label_smart_prob_stats)
+        
+        self.label_smart_area_stats = QLabel("Área: --")
+        self.label_smart_area_stats.setStyleSheet("color: #9B59B6;")
+        self.label_smart_area_stats.setToolTip("Área del objeto detectado")
+        stats_row.addWidget(self.label_smart_area_stats)
+        
+        self.label_smart_focus_stats = QLabel("Focus: --")
+        self.label_smart_focus_stats.setStyleSheet("color: #E67E22;")
+        self.label_smart_focus_stats.setToolTip("Score de enfoque (raw / normalizado)")
+        stats_row.addWidget(self.label_smart_focus_stats)
+        
+        self.label_smart_centroid = QLabel("Centro: --")
+        self.label_smart_centroid.setStyleSheet("color: #1ABC9C;")
+        self.label_smart_centroid.setToolTip("Centroide del objeto")
+        stats_row.addWidget(self.label_smart_centroid)
+        
+        stats_row.addStretch()
+        
+        smart_main_layout.addLayout(stats_row)
+        
+        self.smart_params_group.setLayout(smart_main_layout)
+        scroll_layout.addWidget(self.smart_params_group)
+        
+        # Variable para modo de visualización SMART
+        self._smart_view_mode = "overlay"
         
         # === Sección 1: Calibración (Solo para método Legacy) ===
         self.calib_group = QGroupBox("🎯 Calibración - Modelo de Fondo (Solo para método Legacy)")
@@ -619,12 +1152,42 @@ class ImgAnalysisTab(QWidget):
         self.list_images.setMinimumWidth(200)
         splitter.addWidget(self.list_images)
         
-        # Visor robusto
+        # Container para visores (single o grid)
+        viewer_container = QWidget()
+        viewer_layout = QVBoxLayout(viewer_container)
+        viewer_layout.setContentsMargins(0, 0, 0, 0)
+        viewer_layout.setSpacing(2)
+        
+        # Toggle para cambiar entre Legacy y SMART view
+        view_toggle = QHBoxLayout()
+        self.rb_legacy_view = QRadioButton("Legacy")
+        self.rb_smart_view = QRadioButton("SMART")
+        self.rb_smart_view.setChecked(True)  # Default: SMART
+        self.rb_legacy_view.toggled.connect(self._toggle_view_mode)
+        view_toggle.addWidget(self.rb_legacy_view)
+        view_toggle.addWidget(self.rb_smart_view)
+        view_toggle.addStretch()
+        viewer_layout.addLayout(view_toggle)
+        
+        # Stack para alternar entre visores
+        self.viewer_stack = QStackedWidget()
+        
+        # Visor único legacy (para método Legacy)
         self.image_viewer = RobustImageViewer()
         self.image_viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        splitter.addWidget(self.image_viewer)
+        self.viewer_stack.addWidget(self.image_viewer)
         
-        splitter.setSizes([250, 500])
+        # Vista única con overlays (para método SMART)
+        self.single_view = SingleViewWithOverlays()
+        self.viewer_stack.addWidget(self.single_view)
+        
+        # Default: mostrar vista SMART
+        self.viewer_stack.setCurrentIndex(1)
+        
+        viewer_layout.addWidget(self.viewer_stack)
+        splitter.addWidget(viewer_container)
+        
+        splitter.setSizes([200, 600])
         splitter.setMinimumHeight(350)
         analysis_layout.addWidget(splitter)
         
@@ -762,6 +1325,21 @@ class ImgAnalysisTab(QWidget):
             
             self.calibration_completed.emit(False, message)
     
+    # === Visor Grid/Single ===
+    
+    def _toggle_view_mode(self, single_checked: bool):
+        """Alterna entre vista única y grid."""
+        if single_checked:
+            self.viewer_stack.setCurrentIndex(0)  # Single view
+        else:
+            self.viewer_stack.setCurrentIndex(1)  # SMART view
+            # Refrescar vista si hay resultado
+            if hasattr(self, '_last_focus_result') and self._last_focus_result:
+                self.single_view.display_result(
+                    self.image_viewer.current_image, 
+                    self._last_focus_result
+                )
+    
     # === Método de Análisis ===
     
     def _on_method_changed(self, index):
@@ -770,14 +1348,16 @@ class ImgAnalysisTab(QWidget):
         
         if self.analysis_method == "smart":
             # Método Smart: Sin calibración necesaria
+            self.smart_params_group.setVisible(True)
             self.calib_group.setVisible(False)
-            self.params_group.setVisible(False)  # Ocultar parámetros legacy
+            self.params_group.setVisible(False)
             self.label_method_info.setText("✅ Listo para analizar (sin calibración)")
             self.label_method_info.setStyleSheet("color: #2ECC71; font-weight: bold;")
             self.btn_load_test.setEnabled(True)
-            logger.info("[ImgAnalysisTab] Método cambiado a SMART (Entropía + Brenner)")
+            logger.info("[ImgAnalysisTab] Método cambiado a SMART (ROI-Based)")
         else:
             # Método Legacy: Requiere calibración
+            self.smart_params_group.setVisible(False)
             self.calib_group.setVisible(True)
             self.params_group.setVisible(True)
             if self.sharpness_detector.is_ready:
@@ -796,7 +1376,112 @@ class ImgAnalysisTab(QWidget):
         if current:
             self._analyze_current_image(current)
     
-    # === Parámetros - Callbacks de Sliders/Spins ===
+    def _on_smart_params_changed(self):
+        """Actualiza parámetros del SmartFocusScorer cuando cambian en la UI."""
+        self.smart_scorer.set_parameters(
+            threshold=self.spin_saliency_thresh.value(),
+            min_prob=self.spin_min_prob.value(),
+            min_area=self.spin_min_area.value(),
+            focus_threshold=self.spin_focus_thresh.value(),
+            use_laplacian=self.cb_use_laplacian.isChecked()
+        )
+        
+        # Actualizar estado del modelo
+        if self.smart_scorer.is_model_loaded():
+            self.label_model_status_smart.setText("✅ U2-Net")
+            self.label_model_status_smart.setStyleSheet("color: #2ECC71; font-weight: bold;")
+        else:
+            error = self.smart_scorer.get_load_error()
+            if error:
+                self.label_model_status_smart.setText(f"❌ {error[:20]}...")
+                self.label_model_status_smart.setStyleSheet("color: #E74C3C;")
+            else:
+                self.label_model_status_smart.setText("⏳ Cargando...")
+                self.label_model_status_smart.setStyleSheet("color: #E67E22;")
+        
+        # Re-analizar imagen actual si hay una
+        self.results_cache.clear()
+        current = self.list_images.currentItem()
+        if current and self.analysis_method == "smart":
+            self._analyze_current_image(current)
+    
+    def _update_smart_stats(self, focus_result: FocusResult):
+        """Actualiza las estadísticas del panel SMART."""
+        num_objects = focus_result.num_objects
+        objects = focus_result.objects
+        
+        # Contar enfocados/desenfocados
+        focused_count = sum(1 for o in objects if o.is_focused)
+        blurry_count = num_objects - focused_count
+        
+        # Probabilidad del objeto principal
+        if focus_result.mean_probability > 0:
+            self.label_smart_prob_stats.setText(f"Prob: {focus_result.mean_probability:.2f}")
+            if focus_result.mean_probability >= self.smart_scorer.min_prob:
+                self.label_smart_prob_stats.setStyleSheet("color: #2ECC71;")
+            else:
+                self.label_smart_prob_stats.setStyleSheet("color: #E74C3C;")
+        else:
+            self.label_smart_prob_stats.setText("Prob: --")
+            self.label_smart_prob_stats.setStyleSheet("color: #95A5A6;")
+        
+        # Objetos: total (enfocados/desenfocados)
+        if num_objects > 0:
+            obj_str = f"Obj: {num_objects} ({focused_count}✓/{blurry_count}✗)"
+            self.label_smart_area_stats.setText(obj_str)
+            if focused_count > 0:
+                self.label_smart_area_stats.setStyleSheet("color: #2ECC71;")
+            else:
+                self.label_smart_area_stats.setStyleSheet("color: #E67E22;")
+        else:
+            self.label_smart_area_stats.setText("Obj: 0")
+            self.label_smart_area_stats.setStyleSheet("color: #95A5A6;")
+        
+        # Focus score del principal
+        if focus_result.focus_score > 0:
+            self.label_smart_focus_stats.setText(f"Main: {focus_result.focus_score:.1f}")
+            if focus_result.status in ["FOCUSED_OBJECT", "MULTIPLE_OBJECTS"] and focused_count > 0:
+                self.label_smart_focus_stats.setStyleSheet("color: #2ECC71; font-weight: bold;")
+            else:
+                self.label_smart_focus_stats.setStyleSheet("color: #E67E22;")
+        else:
+            self.label_smart_focus_stats.setText("Main: 0")
+            self.label_smart_focus_stats.setStyleSheet("color: #95A5A6;")
+        
+        # Área total
+        total_area = sum(o.area for o in objects)
+        if total_area > 0:
+            self.label_smart_centroid.setText(f"Área: {int(total_area)} px²")
+            self.label_smart_centroid.setStyleSheet("color: #1ABC9C;")
+        else:
+            self.label_smart_centroid.setText("Área: --")
+            self.label_smart_centroid.setStyleSheet("color: #95A5A6;")
+    
+    def _reset_smart_parameters(self):
+        """Resetea parámetros SMART a valores por defecto."""
+        self.spin_saliency_thresh.blockSignals(True)
+        self.spin_min_prob.blockSignals(True)
+        self.spin_min_area.blockSignals(True)
+        self.spin_focus_thresh.blockSignals(True)
+        self.cb_use_laplacian.blockSignals(True)
+        
+        self.spin_saliency_thresh.setValue(0.5)
+        self.spin_min_prob.setValue(0.3)
+        self.spin_min_area.setValue(500)
+        self.spin_focus_thresh.setValue(20.0)
+        self.cb_use_laplacian.setChecked(True)
+        
+        self.spin_saliency_thresh.blockSignals(False)
+        self.spin_min_prob.blockSignals(False)
+        self.spin_min_area.blockSignals(False)
+        self.spin_focus_thresh.blockSignals(False)
+        self.cb_use_laplacian.blockSignals(False)
+        
+        self._on_smart_params_changed()
+        self.label_status.setText("Parámetros SMART reseteados")
+        self.label_status.setStyleSheet("color: #3498DB;")
+    
+    # === Parámetros Legacy - Callbacks de Sliders/Spins ===
     
     def _on_auto_threshold_changed(self, state):
         """Cambia entre modo automático y manual de umbral Z."""
@@ -1096,8 +1781,19 @@ class ImgAnalysisTab(QWidget):
             return
         
         if self.analysis_method == "smart":
-            # === MÉTODO SMART (Entropía + Brenner) ===
+            # === MÉTODO SMART (U2-Net Salient Object Detection) ===
             focus_result = self.smart_scorer.assess_image(img)
+            
+            # Guardar FocusResult original para visualización
+            self._last_focus_result = focus_result
+            
+            # Actualizar estadísticas SMART
+            self._update_smart_stats(focus_result)
+            
+            # Actualizar estado del modelo
+            if self.smart_scorer.is_model_loaded():
+                self.label_model_status_smart.setText("✅ U2-Net")
+                self.label_model_status_smart.setStyleSheet("color: #2ECC71; font-weight: bold;")
             
             # Convertir FocusResult a formato compatible con el visor
             result = self._convert_focus_result(focus_result, img)
@@ -1119,8 +1815,12 @@ class ImgAnalysisTab(QWidget):
         # Guardar en cache
         self.results_cache[filename] = result
         
-        # Actualizar visor
+        # Actualizar visor único
         self.image_viewer.display_result(img, result)
+        
+        # Actualizar vista SMART si está visible
+        if self.analysis_method == "smart" and self.viewer_stack.currentIndex() == 1:
+            self.single_view.display_result(img, focus_result)
         
         # Actualizar lista
         self._update_list_item(item, filename, result)
@@ -1133,35 +1833,51 @@ class ImgAnalysisTab(QWidget):
         self.analysis_completed.emit(filename, score)
     
     def _convert_focus_result(self, focus_result: FocusResult, img: np.ndarray) -> SharpnessResult:
-        """Convierte FocusResult (Smart) a SharpnessResult para compatibilidad."""
-        # Mapear estados
+        """Convierte FocusResult (Smart ROI-Based) a SharpnessResult para compatibilidad."""
+        # Mapear estados ROI-Based
         state_map = {
-            "FOCUSED": "Enfocada",
-            "BACKGROUND": "Sin Objeto",
-            "REJECTED": "Sin Objeto",
+            "FOCUSED_OBJECT": "Muy Enfocada",
+            "BLURRY_OBJECT": "Desenfocada",
+            "EMPTY": "Sin Objeto",
             "ERROR": "Sin Objeto"
         }
         focus_state = state_map.get(focus_result.status, "Sin Objeto")
-        is_focused = focus_result.status == "FOCUSED"
+        is_focused = focus_result.status == "FOCUSED_OBJECT"
         
-        # Crear máscara simple basada en entropía local (opcional)
-        # Para Smart, no usamos máscara compleja
-        mask = np.ones(img.shape, dtype=np.uint8) * 255 if is_focused else np.zeros(img.shape, dtype=np.uint8)
+        # Crear máscara binaria con bounding box si hay objeto
+        mask = np.zeros(img.shape, dtype=np.uint8)
+        if focus_result.bounding_box is not None:
+            x, y, w, h = focus_result.bounding_box
+            mask[y:y+h, x:x+w] = 255
+        
+        # Calcular ratio de objeto
+        object_pixels = int(focus_result.contour_area) if focus_result.contour_area else 0
+        object_ratio = object_pixels / img.size if img.size > 0 else 0.0
+        
+        # Usar debug_mask como z_score_map para visualización
+        # La debug_mask ya es BGR con bordes, contorno y bbox dibujados
+        z_score_map = None
+        if focus_result.debug_mask is not None:
+            # Convertir BGR a grayscale para compatibilidad con el visor
+            if len(focus_result.debug_mask.shape) == 3:
+                z_score_map = cv2.cvtColor(focus_result.debug_mask, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            else:
+                z_score_map = focus_result.debug_mask.astype(np.float32)
         
         return SharpnessResult(
             sharpness=focus_result.focus_score,
             is_focused=is_focused,
             focus_state=focus_state,
-            object_pixels=img.size if is_focused else 0,
-            object_ratio=1.0 if is_focused else 0.0,
-            z_score_max=focus_result.entropy,  # Usamos entropía como proxy
-            z_score_mean_object=focus_result.entropy,
+            object_pixels=object_pixels,
+            object_ratio=object_ratio,
+            z_score_max=focus_result.focus_score,
+            z_score_mean_object=focus_result.raw_score,
             bias_correction=0.0,
-            optimal_z_threshold=focus_result.raw_brenner,  # Brenner raw
-            hysteresis_low=self.smart_scorer.entropy_threshold,
-            z_score_map=None,
+            optimal_z_threshold=focus_result.raw_score,
+            hysteresis_low=self.smart_scorer.focus_threshold,
+            z_score_map=z_score_map,
             mask=mask,
-            laplacian_map=None
+            laplacian_map=focus_result.debug_mask  # Guardar la imagen de debug BGR aquí
         )
     
     def _update_list_item(self, item, filename, result: SharpnessResult):
@@ -1197,9 +1913,9 @@ class ImgAnalysisTab(QWidget):
         
         # Mostrar info según método
         if self.analysis_method == "smart":
-            self.label_zscore.setText(f"H={result.z_score_max:.2f}")  # Entropía
-            self.label_thresholds.setText(f"B={result.optimal_z_threshold:.1f}")  # Brenner
-            self.label_bias.setText("N/A")
+            self.label_zscore.setText(f"Score={result.z_score_max:.1f}")
+            self.label_thresholds.setText(f"Raw={result.optimal_z_threshold:.1f}")
+            self.label_bias.setText(f"Thresh={result.hysteresis_low:.0f}")
         else:
             self.label_zscore.setText(f"{result.z_score_max:.2f}")
             self.label_thresholds.setText(f"{result.optimal_z_threshold:.2f} / {result.hysteresis_low:.2f}")

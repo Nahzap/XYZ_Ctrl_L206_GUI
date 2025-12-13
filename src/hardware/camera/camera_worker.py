@@ -30,7 +30,7 @@ class CameraWorker(QThread):
     """Worker para manejar la camara Thorlabs en un thread separado."""
     status_update = pyqtSignal(str)
     connection_success = pyqtSignal(bool, str)  # success, camera_info
-    new_frame_ready = pyqtSignal(object)  # QImage
+    new_frame_ready = pyqtSignal(object, object)  # QImage, raw_frame (uint16)
     
     def __init__(self):
         super().__init__()
@@ -209,19 +209,21 @@ class CameraWorker(QThread):
                                 pass  # Ignorar errores de limpieza
                         
                         # GUARDAR frame para captura (una sola copia)
-                        self.current_frame = frame.copy()
+                        raw_frame = frame.copy()
+                        self.current_frame = raw_frame
                         
-                        # Normalizar a uint8 para visualizacion (reutilizar el frame original)
+                        # Normalizar a uint8 para visualizacion
                         if frame.dtype != np.uint8:
                             frame = (frame / frame.max() * 255).astype(np.uint8)
                         
                         h, w = frame.shape
                         bytes_per_line = w
                         
-                        # Crear QImage (PyQt5 usa Format_Grayscale8 sin .Format)
+                        # Crear QImage
                         q_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_Grayscale8).copy()
                         
-                        self.new_frame_ready.emit(q_image)
+                        # Emitir AMBOS: q_image para display, raw_frame para detección
+                        self.new_frame_ready.emit(q_image, raw_frame)
                         
                         # Liberar referencia al frame original
                         del frame

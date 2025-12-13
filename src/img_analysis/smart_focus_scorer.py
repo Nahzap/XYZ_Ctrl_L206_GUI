@@ -96,7 +96,8 @@ class SmartFocusScorer:
         self,
         model_type: str = 'u2netp',
         threshold: float = 0.5,
-        min_area: int = 100,
+        min_area: int = 28000,
+        max_area: int = 35000,
         min_prob: float = 0.3,
         focus_threshold: float = 50.0,
         use_laplacian: bool = True,
@@ -109,6 +110,7 @@ class SmartFocusScorer:
             model_type: 'u2netp' (rápido, ~4MB) o 'u2net' (preciso, ~176MB)
             threshold: Umbral de binarización para la máscara de saliencia
             min_area: Área mínima para considerar objeto válido (px²)
+            max_area: Área máxima para considerar objeto válido (px²)
             min_prob: Probabilidad mínima promedio para considerar objeto real
             focus_threshold: Umbral para clasificar como enfocado vs desenfocado
             use_laplacian: Si True usa varianza de Laplaciano, si False usa Brenner
@@ -117,7 +119,8 @@ class SmartFocusScorer:
         self.model_type = model_type
         self.threshold = threshold
         self.min_area = min_area
-        self.min_prob = min_prob  # Nuevo: probabilidad mínima para considerar objeto real
+        self.max_area = max_area
+        self.min_prob = min_prob
         self.focus_threshold = focus_threshold
         self.use_laplacian = use_laplacian
         self.device = device
@@ -131,7 +134,7 @@ class SmartFocusScorer:
         self.entropy_threshold = 4.0
         
         logger.info(f"[SmartFocusScorer] U2-Net: model={model_type}, "
-                   f"threshold={threshold}, min_area={min_area}, min_prob={min_prob}")
+                   f"threshold={threshold}, min_area={min_area}, max_area={max_area}, min_prob={min_prob}")
     
     def _ensure_model_loaded(self) -> bool:
         """
@@ -204,7 +207,8 @@ class SmartFocusScorer:
         objects = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < self.min_area:
+            # Filtrar por área mínima Y máxima
+            if area < self.min_area or area > self.max_area:
                 continue
             
             # Crear máscara para este contorno
@@ -513,6 +517,7 @@ class SmartFocusScorer:
         self,
         threshold: Optional[float] = None,
         min_area: Optional[int] = None,
+        max_area: Optional[int] = None,
         min_prob: Optional[float] = None,
         focus_threshold: Optional[float] = None,
         use_laplacian: Optional[bool] = None,
@@ -523,6 +528,8 @@ class SmartFocusScorer:
             self.threshold = threshold
         if min_area is not None:
             self.min_area = min_area
+        if max_area is not None:
+            self.max_area = max_area
         if min_prob is not None:
             self.min_prob = min_prob
         if focus_threshold is not None:
@@ -532,6 +539,7 @@ class SmartFocusScorer:
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+        logger.debug(f"[SmartFocusScorer] Params: min_area={self.min_area}, max_area={self.max_area}")
     
     def is_model_loaded(self) -> bool:
         """Verifica si el modelo U2-Net está cargado."""

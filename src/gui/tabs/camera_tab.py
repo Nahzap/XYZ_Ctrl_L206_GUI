@@ -200,7 +200,7 @@ class CameraTab(QWidget):
         
         # Exposición
         config_layout.addWidget(QLabel("Exposición (s):"), 0, 0)
-        self.exposure_input = QLineEdit("0.01")
+        self.exposure_input = QLineEdit("0.015")
         self.exposure_input.setFixedWidth(100)
         config_layout.addWidget(self.exposure_input, 0, 1)
         
@@ -212,7 +212,7 @@ class CameraTab(QWidget):
         
         # FPS
         config_layout.addWidget(QLabel("FPS:"), 1, 0)
-        self.fps_input = QLineEdit("60")
+        self.fps_input = QLineEdit("30")
         self.fps_input.setFixedWidth(100)
         config_layout.addWidget(self.fps_input, 1, 1)
         
@@ -224,7 +224,7 @@ class CameraTab(QWidget):
         
         # Buffer de imágenes
         config_layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
-        self.buffer_input = QLineEdit("2")  # Predeterminado: 2 frames
+        self.buffer_input = QLineEdit("1")  # Predeterminado: 1 frame
         self.buffer_input.setFixedWidth(100)
         self.buffer_input.setToolTip("Número de frames en buffer (1-10). Usar 2 para estabilidad.")
         config_layout.addWidget(self.buffer_input, 2, 1)
@@ -279,6 +279,18 @@ class CameraTab(QWidget):
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self.capture_single_image)
         capture_btn_layout.addWidget(self.capture_btn)
+        
+        # Botón para enfocar objetos sin capturar
+        self.focus_btn = QPushButton("🎯 Enfocar Objs")
+        self.focus_btn.setStyleSheet("""
+            QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #9B59B6; }
+            QPushButton:hover { background-color: #8E44AD; }
+            QPushButton:disabled { background-color: #505050; color: #808080; }
+        """)
+        self.focus_btn.setEnabled(False)
+        self.focus_btn.clicked.connect(self._focus_objects_only)
+        capture_btn_layout.addWidget(self.focus_btn)
+        
         capture_btn_layout.addStretch()
         capture_layout.addLayout(capture_btn_layout)
         
@@ -486,6 +498,7 @@ class CameraTab(QWidget):
         self.min_pixels_spin.setSuffix(" px")
         self.min_pixels_spin.setToolTip("Área mínima del objeto en píxeles")
         self.min_pixels_spin.setFixedWidth(100)
+        self.min_pixels_spin.valueChanged.connect(self._update_detection_params)
         detection_form.addWidget(self.min_pixels_spin, 0, 1)
         
         detection_form.addWidget(QLabel("Área máxima:"), 0, 2)
@@ -495,6 +508,7 @@ class CameraTab(QWidget):
         self.max_pixels_spin.setSuffix(" px")
         self.max_pixels_spin.setToolTip("Área máxima del objeto en píxeles")
         self.max_pixels_spin.setFixedWidth(100)
+        self.max_pixels_spin.valueChanged.connect(self._update_detection_params)
         detection_form.addWidget(self.max_pixels_spin, 0, 3)
         
         # Parámetros de búsqueda Z
@@ -777,6 +791,7 @@ class CameraTab(QWidget):
             self.apply_fps_btn.setEnabled(True)
             self.apply_buffer_btn.setEnabled(True)
             self.capture_btn.setEnabled(True)
+            self.focus_btn.setEnabled(True)
             self.log_message(f"✅ Cámara conectada: {info}")
         else:
             self.camera_info_label.setText("Estado: Desconectada")
@@ -790,6 +805,7 @@ class CameraTab(QWidget):
             self.apply_fps_btn.setEnabled(False)
             self.apply_buffer_btn.setEnabled(False)
             self.capture_btn.setEnabled(False)
+            self.focus_btn.setEnabled(False)
             self.log_message("🔌 Cámara desconectada")
     
     def set_trajectory_status(self, has_trajectory: bool, n_points: int = 0):
@@ -930,12 +946,28 @@ class CameraTab(QWidget):
         
         if self.camera_view_window is None:
             self.camera_view_window = CameraViewWindow(self.parent_gui)
+            
+            # Configurar SmartFocusScorer (mismo que ImgAnalysisTab)
+            if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
+                self.camera_view_window.set_scorer(self.parent_gui.smart_focus_scorer)
+                self.log_message("🔍 SmartFocusScorer configurado (mismo que ImgAnalysisTab)")
+        
+        # Actualizar parámetros de detección desde UI
+        self._update_detection_params()
         
         self.camera_view_window.show()
         self.camera_view_window.raise_()
         self.camera_view_window.activateWindow()
         self.log_message("📹 Ventana de cámara abierta")
         logger.info("Ventana de cámara abierta")
+    
+    def _update_detection_params(self):
+        """Actualiza parámetros de detección en la ventana de cámara."""
+        if self.camera_view_window:
+            min_area = self.min_pixels_spin.value()
+            max_area = self.max_pixels_spin.value()
+            self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
+            self.log_message(f"📐 Params: área [{min_area}-{max_area}] px")
     
     def start_camera_live_view(self):
         """Inicia vista en vivo."""
@@ -969,6 +1001,7 @@ class CameraTab(QWidget):
         self.start_live_btn.setEnabled(False)
         self.stop_live_btn.setEnabled(True)
         self.capture_btn.setEnabled(True)
+        self.focus_btn.setEnabled(True)
         
         logger.info(f"Vista en vivo iniciada: {exposure_s}s, {fps}fps, buffer={buffer_size}")
     
@@ -982,22 +1015,114 @@ class CameraTab(QWidget):
         self.start_live_btn.setEnabled(True)
         self.stop_live_btn.setEnabled(False)
         self.capture_btn.setEnabled(False)
+        self.focus_btn.setEnabled(False)
         
         self.log_message("⏹️ Vista en vivo detenida")
         logger.info("Vista en vivo detenida")
     
-    def on_camera_frame(self, q_image):
+    def on_camera_frame(self, q_image, raw_frame=None):
         """Callback cuando llega un frame de cámara."""
         if self.camera_view_window and self.camera_view_window.isVisible():
-            self.camera_view_window.update_frame(q_image)
+            # raw_frame viene directamente del signal (sincronizado con q_image)
+            self.camera_view_window.update_frame(q_image, raw_frame)
     
     def capture_single_image(self):
-        """Captura una imagen única en el formato seleccionado."""
+        """Captura una imagen única. Si autofoco está habilitado, ejecuta Z-scan primero."""
         if not self.camera_worker:
             self.log_message("❌ Error: Cámara no conectada")
             QMessageBox.warning(self.parent_gui, "Error", "Cámara no conectada")
             return
         
+        # Si autofoco está habilitado y C-Focus conectado, ejecutar autofoco primero
+        if self.autofocus_enabled_cb.isChecked() and self.parent_gui and self.parent_gui.cfocus_enabled:
+            self.log_message("🎯 Autofoco habilitado - ejecutando Z-scan antes de captura...")
+            self._run_autofocus(capture_after=True)
+            return
+        
+        # Captura normal sin autofoco
+        self._do_capture_image()
+    
+    def _focus_objects_only(self):
+        """Ejecuta rutina de enfoque sin capturar imagen."""
+        if not self.camera_worker:
+            self.log_message("❌ Error: Cámara no conectada")
+            return
+        
+        if not self.parent_gui or not self.parent_gui.cfocus_enabled:
+            self.log_message("❌ Error: C-Focus no conectado")
+            QMessageBox.warning(self.parent_gui, "Error", "Conecta C-Focus primero")
+            return
+        
+        self.log_message("🎯 Iniciando rutina de enfoque (sin captura)...")
+        self._run_autofocus(capture_after=False)
+    
+    def _run_autofocus(self, capture_after=False):
+        """Ejecuta detección + autofoco. Opcionalmente captura después."""
+        if self.camera_worker.current_frame is None:
+            self.log_message("❌ No hay frame disponible")
+            return
+        
+        # Actualizar parámetros de detección
+        self._update_detection_params()
+        min_area = self.min_pixels_spin.value()
+        max_area = self.max_pixels_spin.value()
+        self.log_message(f"🔍 Detectando objetos (área: {min_area}-{max_area} px)...")
+        
+        # Usar el scorer directamente para detección síncrona
+        if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
+            scorer = self.parent_gui.smart_focus_scorer
+            frame = self.camera_worker.current_frame.copy()
+            
+            # Convertir frame uint16 -> uint8
+            if frame.dtype == np.uint16:
+                frame_max = frame.max()
+                if frame_max > 0:
+                    frame_uint8 = (frame / frame_max * 255).astype(np.uint8)
+                else:
+                    frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
+            else:
+                frame_uint8 = frame.astype(np.uint8)
+            
+            if len(frame_uint8.shape) == 2:
+                frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
+            else:
+                frame_bgr = frame_uint8
+            
+            # Detectar objetos (scorer usa min_area=100 para detectar todos)
+            result = scorer.assess_image(frame_bgr)
+            all_objects = result.objects if result.objects else []
+            
+            # Filtrar por rango de área del usuario
+            objects = [obj for obj in all_objects if min_area <= obj.area <= max_area]
+            
+            if not objects:
+                self.log_message(f"⚠️ No hay objetos en rango [{min_area}-{max_area}] px")
+                self.log_message(f"   (Detectados {len(all_objects)} objetos totales)")
+                if capture_after:
+                    self.log_message("   Capturando sin autofoco...")
+                    self._do_capture_image()
+                return
+            
+            self.log_message(f"✅ {len(objects)} objeto(s) en rango (de {len(all_objects)} detectados)")
+            for i, obj in enumerate(objects):
+                self.log_message(f"   #{i+1}: área={obj.area:.0f}px, score={obj.focus_score:.1f}")
+            
+            # Iniciar autofoco asíncrono
+            if hasattr(self.parent_gui, 'autofocus_service') and self.parent_gui.autofocus_service:
+                self.log_message("🎯 Iniciando Z-scan autofoco...")
+                self.parent_gui.autofocus_service.start_autofocus(objects)
+                self._pending_capture = capture_after  # Solo capturar si se pidió
+            else:
+                self.log_message("⚠️ AutofocusService no disponible")
+                if capture_after:
+                    self._do_capture_image()
+        else:
+            self.log_message("⚠️ Scorer no disponible")
+            if capture_after:
+                self._do_capture_image()
+    
+    def _do_capture_image(self):
+        """Realiza la captura de imagen (sin autofoco)."""
         # Usar carpeta configurada
         folder = self.save_folder_input.text()
         if not folder:
@@ -1169,42 +1294,25 @@ class CameraTab(QWidget):
     # === Métodos de Autofoco C-Focus ===
     
     def _test_detection(self):
-        """Muestra visualización de detección de objetos en tiempo real."""
-        if not self.camera_worker or self.camera_worker.current_frame is None:
-            self.log_message("⚠️ No hay frame disponible. Inicia vista en vivo primero.")
+        """Ejecuta detección U2-Net UNA SOLA VEZ (test manual)."""
+        # Verificar que la ventana de cámara esté abierta
+        if self.camera_view_window is None or not self.camera_view_window.isVisible():
+            self.log_message("⚠️ Abre la ventana de cámara primero (botón 'Ver')")
+            QMessageBox.information(
+                self.parent_gui, 
+                "Ventana de Cámara",
+                "Abre la ventana de cámara primero.\n\n"
+                "1. Conecta la cámara\n"
+                "2. Presiona 'Ver' para abrir la ventana\n"
+                "3. Inicia la vista en vivo\n"
+                "4. Presiona 'Test Detección'"
+            )
             return
         
-        if not self.parent_gui or not hasattr(self.parent_gui, 'focus_scorer'):
-            self.log_message("⚠️ SmartFocusScorer no inicializado")
-            return
-        
-        try:
-            # Obtener frame actual
-            frame = self.camera_worker.current_frame.copy()
-            
-            # Actualizar parámetros del scorer
-            scorer = self.parent_gui.focus_scorer
-            scorer.min_object_area = self.min_pixels_spin.value()
-            scorer.min_probability = 0.3
-            
-            # Detectar objetos con visualización
-            objects, vis_image = scorer.detect_objects_with_visualization(frame)
-            
-            # Mostrar en ventana separada
-            cv2.imshow("Deteccion de Objetos - Debug", vis_image)
-            cv2.waitKey(1)
-            
-            # Log resultados
-            self.log_message(f"🔍 Test Detección: {len(objects)} objetos detectados")
-            for i, obj in enumerate(objects[:3]):
-                self.log_message(f"  Obj{i}: {obj['area']}px, prob={obj['probability']:.2f}")
-            
-            if len(objects) == 0:
-                self.log_message("⚠️ Sin objetos detectados. Ajusta 'Área mínima' o mejora iluminación/contraste")
-            
-        except Exception as e:
-            self.log_message(f"❌ Error en test detección: {e}")
-            logger.error(f"Error test detección: {e}", exc_info=True)
+        # Actualizar parámetros desde CameraTab y ejecutar UNA detección
+        self._update_detection_params()
+        self.camera_view_window.trigger_detection()
+        self.log_message(f"🔍 TEST Detección - Área: [{self.min_pixels_spin.value()}-{self.max_pixels_spin.value()}] px")
     
     def _connect_cfocus(self):
         """Conecta el piezo C-Focus."""
