@@ -22,6 +22,7 @@ class DetectedObject:
     centroid: Tuple[int, int]
     area: float
     initial_score: float
+    circularity: float = 0.0  # Métrica de forma: 1.0 = círculo perfecto
 
 
 @dataclass
@@ -70,9 +71,15 @@ class MultiObjectAutofocusController:
         self.max_area_pixels = 50000
         self.min_probability = 0.3
         
+        # Usar parámetros del SmartFocusScorer (configurables desde UI)
+        self.min_circularity = scorer.min_circularity if hasattr(scorer, 'min_circularity') else 0.45
+        self.min_aspect_ratio = scorer.min_aspect_ratio if hasattr(scorer, 'min_aspect_ratio') else 0.4
+        
         logger.info(f"MultiObjectAutofocus inicializado: "
                    f"rango={self.z_search_range}µm, "
-                   f"área=[{self.min_area_pixels}, {self.max_area_pixels}] px")
+                   f"área=[{self.min_area_pixels}, {self.max_area_pixels}] px, "
+                   f"circularidad_min={self.min_circularity:.2f}, "
+                   f"aspect_min={self.min_aspect_ratio:.2f}")
     
     def set_pixel_threshold(self, min_pixels: int, max_pixels: int):
         """
@@ -100,6 +107,12 @@ class MultiObjectAutofocusController:
             logger.error("No hay frame disponible para pre-detección")
             return []
         
+        # Actualizar parámetros de morfología desde SmartFocusScorer (configurables desde UI)
+        if hasattr(self.scorer, 'min_circularity'):
+            self.min_circularity = self.scorer.min_circularity
+        if hasattr(self.scorer, 'min_aspect_ratio'):
+            self.min_aspect_ratio = self.scorer.min_aspect_ratio
+        
         # Usar SmartFocusScorer.detect_objects()
         raw_objects = self.scorer.detect_objects(frame)
         
@@ -117,6 +130,28 @@ class MultiObjectAutofocusController:
                 x, y, w, h = bbox
                 centroid = (x + w // 2, y + h // 2)
                 
+                # MEJORA: Usar circularidad del objeto si está disponible (calculada con contorno real)
+                if 'circularity' in obj_dict and obj_dict['circularity'] > 0:
+                    circularity = obj_dict['circularity']
+                else:
+                    # Fallback: calcular con bbox
+                    perimeter = 2 * (w + h)
+                    circularity = (4 * np.pi * area_px) / (perimeter ** 2) if perimeter > 0 else 0
+                
+                # Filtrar por circularidad mínima (rechazar manchas irregulares)
+                if circularity < self.min_circularity:
+                    logger.info(f"  Objeto {i} RECHAZADO: circularidad={circularity:.2f} < {self.min_circularity:.2f} (mancha irregular)")
+                    continue
+                
+                # MEJORA: Filtrar por aspect ratio (rechazar manchas muy alargadas)
+                aspect_ratio = float(w) / float(h) if h > 0 else 1.0
+                if aspect_ratio > 1.0:
+                    aspect_ratio = 1.0 / aspect_ratio
+                
+                if aspect_ratio < self.min_aspect_ratio:
+                    logger.info(f"  Objeto {i} RECHAZADO: aspect_ratio={aspect_ratio:.2f} < {self.min_aspect_ratio:.2f} (muy alargado)")
+                    continue
+                
                 # Calcular score inicial en el ROI
                 initial_score = self.scorer.calculate_sharpness(frame, roi=bbox)
                 
@@ -125,9 +160,10 @@ class MultiObjectAutofocusController:
                     bounding_box=bbox,
                     centroid=centroid,
                     area=area_px,
-                    initial_score=initial_score
+                    initial_score=initial_score,
+                    circularity=circularity
                 ))
-                logger.debug(f"  Objeto {i}: área={area_px:.0f}px, bbox={bbox}, score={initial_score:.1f}")
+                logger.debug(f"  Objeto {i}: área={area_px:.0f}px, circ={circularity:.2f}, aspect={aspect_ratio:.2f}, score={initial_score:.1f}")
             else:
                 logger.debug(f"  Objeto {i} RECHAZADO: área={area_px:.0f}px fuera de rango")
         

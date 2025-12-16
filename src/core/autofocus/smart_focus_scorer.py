@@ -33,7 +33,9 @@ class SmartFocusScorer:
                  model_name: str = 'u2netp',
                  detection_threshold: float = 0.5,
                  min_object_area: int = 500,
-                 min_probability: float = 0.3):
+                 min_probability: float = 0.3,
+                 min_circularity: float = 0.45,
+                 min_aspect_ratio: float = 0.4):
         """
         Inicializa el evaluador de enfoque.
         
@@ -42,11 +44,15 @@ class SmartFocusScorer:
             detection_threshold: Umbral de probabilidad para detección
             min_object_area: Área mínima del objeto en píxeles
             min_probability: Probabilidad mínima para considerar objeto válido
+            min_circularity: Circularidad mínima (0-1, 1=círculo perfecto)
+            min_aspect_ratio: Aspect ratio mínimo (0-1, rechaza objetos muy alargados)
         """
         self.model_name = model_name
         self.detection_threshold = detection_threshold
         self.min_object_area = min_object_area
         self.min_probability = min_probability
+        self.min_circularity = min_circularity
+        self.min_aspect_ratio = min_aspect_ratio
         
         # Cargar modelo U2-Net
         self.model = None
@@ -55,8 +61,25 @@ class SmartFocusScorer:
         logger.info(
             f"[SmartFocusScorer] U2-Net: model={model_name}, "
             f"threshold={detection_threshold}, min_area={min_object_area}, "
-            f"min_prob={min_probability}"
+            f"min_prob={min_probability}, min_circ={min_circularity:.2f}, "
+            f"min_aspect={min_aspect_ratio:.2f}"
         )
+    
+    def set_morphology_params(self, min_circularity: float = None, min_aspect_ratio: float = None):
+        """
+        Actualiza parámetros de morfología para filtrado de objetos.
+        
+        Args:
+            min_circularity: Circularidad mínima (0-1). None = no cambiar
+            min_aspect_ratio: Aspect ratio mínimo (0-1). None = no cambiar
+        """
+        if min_circularity is not None:
+            self.min_circularity = min_circularity
+            logger.info(f"[SmartFocusScorer] Circularidad mínima actualizada: {min_circularity:.2f}")
+        
+        if min_aspect_ratio is not None:
+            self.min_aspect_ratio = min_aspect_ratio
+            logger.info(f"[SmartFocusScorer] Aspect ratio mínimo actualizado: {min_aspect_ratio:.2f}")
     
     def load_model(self):
         """Carga el modelo U2-Net (lazy loading)."""
@@ -233,22 +256,39 @@ class SmartFocusScorer:
             # Obtener bounding box
             x, y, w, h = cv2.boundingRect(cnt)
             
-            # Calcular probabilidad basada en compacidad
+            # MEJORA: Calcular circularidad usando perímetro REAL del contorno
             perimeter = cv2.arcLength(cnt, True)
             if perimeter > 0:
-                compactness = (4 * np.pi * area) / (perimeter ** 2)
-                probability = min(1.0, compactness)
+                circularity = (4 * np.pi * area) / (perimeter ** 2)
+                probability = min(1.0, circularity)
             else:
                 probability = 0.5
+                circularity = 0.0
             
-            # Filtrar por probabilidad mínima
+            # MEJORA: Filtrar por aspect ratio (rechazar manchas muy alargadas)
+            aspect_ratio = float(w) / float(h) if h > 0 else 1.0
+            if aspect_ratio > 1.0:
+                aspect_ratio = 1.0 / aspect_ratio  # Normalizar a [0, 1]
+            
+            # Rechazar objetos muy alargados (configurable)
+            if aspect_ratio < self.min_aspect_ratio:
+                continue
+            
+            # Filtrar por circularidad mínima (configurable)
+            if circularity < self.min_circularity:
+                continue
+            
+            # Filtrar por probabilidad mínima (legacy, ahora usa circularidad)
             if probability < self.min_probability:
                 continue
             
             objects.append({
                 'bbox': (x, y, w, h),
                 'area': int(area),
-                'probability': float(probability)
+                'probability': float(probability),
+                'circularity': float(circularity),
+                'aspect_ratio': float(aspect_ratio),
+                'contour': cnt  # Guardar contorno real para análisis posterior
             })
         
         # Ordenar por área (mayor primero)
@@ -393,3 +433,81 @@ class SmartFocusScorer:
         score = self.calculate_sharpness(image, roi)
         logger.debug(f"[SmartFocusScorer] Z={z_position:.2f}µm → Score={score:.2f}")
         return score
+
+    def get_smart_score(self, image: np.ndarray) -> Tuple[float, np.ndarray]:
+        """Calcula un "Smart Score" usando una máscara morfológica.
+
+        Flujo (alineado con tu especificación de MorphologyFocus):
+        1. Genera una máscara binaria del espécimen (0=fondo, 255=muestra) usando
+           el mismo pipeline morfológico que la detección simple (U2-Net fallback).
+        2. Calcula Laplacian Variance SOLO sobre los píxeles donde mask > 0.
+        3. Devuelve (score, mask) para depuración.
+
+        Si no se detecta morfología (máscara vacía), cae a calcular nitidez global.
+        """
+        # Convertir a grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+
+        # Normalizar uint16 → uint8 si es necesario
+        if gray.dtype == np.uint16:
+            gray = (gray / 256).astype(np.uint8)
+
+        # --- Paso 1: construir máscara morfológica (fallback cuando U2-Net no está) ---
+        # Este pipeline replica la lógica de umbralización + morfología usada
+        # en _detect_objects_simple()/detect_objects_with_visualization.
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+
+        # Umbralización combinada (Otsu + Adaptativa)
+        _, binary_otsu = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+        binary_adaptive = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            21,
+            5,
+        )
+        mask = cv2.bitwise_or(binary_otsu, binary_adaptive)
+
+        # Operaciones morfológicas para limpiar la máscara
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
+        mask = cv2.dilate(mask, kernel_small, iterations=1)
+
+        # Si la máscara queda vacía, caer a nitidez global
+        if np.count_nonzero(mask) == 0:
+            score = self.calculate_sharpness(gray)
+            logger.debug(
+                "[SmartFocusScorer] Máscara vacía en get_smart_score → usando score global: %.2f",
+                score,
+            )
+            return float(score), mask
+
+        # --- Paso 2: Laplacian Variance solo sobre píxeles de la máscara ---
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
+        masked_values = laplacian[mask > 0]
+
+        if masked_values.size == 0:
+            return 0.0, mask
+
+        variance = masked_values.var()
+        smart_score = float(variance * 10.0)  # mismo escalado que calculate_sharpness
+
+        logger.debug(
+            "[SmartFocusScorer] SmartScore (morfología): score=%.2f, pixeles=%d",
+            smart_score,
+            masked_values.size,
+        )
+
+        return smart_score, mask

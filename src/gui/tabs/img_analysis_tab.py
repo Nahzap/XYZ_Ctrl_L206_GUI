@@ -131,7 +131,9 @@ class ImgAnalysisTab(QWidget):
             threshold=0.5,
             min_area=500,
             min_prob=0.3,
-            focus_threshold=20.0
+            focus_threshold=20.0,
+            min_circularity=0.45,
+            min_aspect_ratio=0.4
         )
         
         self._current_result = None

@@ -96,6 +96,10 @@ class DetectionWorker(QThread):
 class CameraViewWindow(QWidget):
     """Ventana de cámara con overlay de saliencia."""
     
+    # Señales para comunicación con MicroscopyService
+    skip_roi_requested = pyqtSignal()
+    pause_toggled = pyqtSignal(bool)
+    
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
         self.setWindowTitle('🎥 Vista de Cámara - Tiempo Real')
@@ -126,6 +130,49 @@ class CameraViewWindow(QWidget):
         ctrl_row.addWidget(self.status_label)
         ctrl_row.addStretch()
         layout.addLayout(ctrl_row)
+        
+        # MEJORA 4: Botones de control de microscopía
+        from PyQt5.QtWidgets import QPushButton
+        microscopy_ctrl_row = QHBoxLayout()
+        
+        self.skip_roi_btn = QPushButton("⏭️ No registrar ROI")
+        self.skip_roi_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E67E22;
+                color: white;
+                font-weight: bold;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #D35400; }
+            QPushButton:disabled { background-color: #555; color: #888; }
+        """)
+        self.skip_roi_btn.setEnabled(False)
+        self.skip_roi_btn.clicked.connect(self._on_skip_roi)
+        microscopy_ctrl_row.addWidget(self.skip_roi_btn)
+        
+        self.pause_btn = QPushButton("⏸️ Pausar")
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498DB;
+                color: white;
+                font-weight: bold;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #2980B9; }
+            QPushButton:disabled { background-color: #555; color: #888; }
+        """)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._on_pause_toggle)
+        microscopy_ctrl_row.addWidget(self.pause_btn)
+        
+        self.learning_label = QLabel("📚 Modo: Normal")
+        self.learning_label.setStyleSheet("color: #95A5A6; font-weight: bold;")
+        microscopy_ctrl_row.addWidget(self.learning_label)
+        
+        microscopy_ctrl_row.addStretch()
+        layout.addLayout(microscopy_ctrl_row)
         
         # Splitter: Video + Lista de objetos
         splitter = QSplitter(Qt.Horizontal)
@@ -175,6 +222,11 @@ class CameraViewWindow(QWidget):
         self.worker.detection_done.connect(self._on_detection_done, Qt.QueuedConnection)
         
         self.scorer = None
+        
+        # Estado de control de microscopía
+        self.is_paused = False
+        self.microscopy_active = False
+        self.current_point_number = 0
     
     def _on_detection_done(self, prob_map, objects, time_ms, frame_bgr):
         """Guarda resultado de detección - PRE-CALCULA contornos para overlay liviano."""
@@ -395,6 +447,92 @@ class CameraViewWindow(QWidget):
         """Limpia resultado de detección."""
         self.detection_result = None
         self.status_label.setText("Limpiado")
+    
+    def _on_skip_roi(self):
+        """Handler para botón 'No registrar ROI'."""
+        logger.info("[CameraWindow] Usuario solicitó saltar ROI actual")
+        self.skip_roi_requested.emit()
+    
+    def _on_pause_toggle(self):
+        """Handler para botón 'Pausa/Continuar'."""
+        self.is_paused = not self.is_paused
+        
+        if self.is_paused:
+            self.pause_btn.setText("▶️ Continuar")
+            self.pause_btn.setStyleSheet("""
+                QPushButton { 
+                    background-color: #27AE60; 
+                    font-size: 12px; 
+                    font-weight: bold; 
+                    padding: 8px; 
+                }
+                QPushButton:hover { background-color: #2ECC71; }
+            """)
+            logger.info("[CameraWindow] Microscopía PAUSADA por usuario")
+        else:
+            self.pause_btn.setText("⏸️ Pausar")
+            self.pause_btn.setStyleSheet("""
+                QPushButton { 
+                    background-color: #E67E22; 
+                    font-size: 12px; 
+                    font-weight: bold; 
+                    padding: 8px; 
+                }
+                QPushButton:hover { background-color: #F39C12; }
+            """)
+            logger.info("[CameraWindow] Microscopía REANUDADA por usuario")
+        
+        self.pause_toggled.emit(self.is_paused)
+    
+    def show_autofocus_masks(self, objects_data):
+        """
+        Muestra máscaras/ROIs durante el autofoco en tiempo real.
+        
+        Args:
+            objects_data: Lista de objetos con bbox, area, circularity, etc.
+        """
+        if not objects_data:
+            return
+        
+        # Convertir a formato compatible con detection_result
+        boxes = []
+        for i, obj in enumerate(objects_data):
+            boxes.append({
+                'bbox': obj.get('bbox', obj.get('bounding_box', (0, 0, 0, 0))),
+                'area': obj.get('area', 0),
+                'score': obj.get('score', 0),
+                'is_focused': obj.get('is_focused', False),
+                'in_filter_range': True  # Durante autofoco, todos son válidos
+            })
+        
+        # Actualizar detection_result para mostrar overlay
+        self.detection_result = {
+            'contours': [],
+            'boxes': boxes,
+            'frame_size': (640, 480),  # Placeholder
+            'n_objects': len(boxes),
+            'n_in_range': len(boxes),
+            'filter_range': (0, 999999)
+        }
+        
+        # Forzar actualización visual
+        logger.info(f"[CameraWindow] Mostrando {len(boxes)} máscaras de autofoco")
+    
+    def clear_autofocus_masks(self):
+        """Limpia las máscaras de autofoco después de completar el proceso."""
+        self.detection_result = None
+        logger.info("[CameraWindow] Máscaras de autofoco limpiadas")
+    
+    def set_microscopy_active(self, active: bool, point_number: int = 0):
+        """Habilita/deshabilita botones según estado de microscopía."""
+        self.microscopy_active = active
+        self.current_point_number = point_number
+        self.skip_roi_btn.setEnabled(active)
+        self.pause_btn.setEnabled(active)
+        
+        if not active:
+            self.is_paused = False
+            self.pause_btn.setText("⏸️ Pausar")
     
     def closeEvent(self, event):
         super().closeEvent(event)

@@ -27,7 +27,6 @@ try:
 except:
     THORLABS_AVAILABLE = False
 
-from hardware.camera.camera_worker import CameraWorker
 from gui.windows.camera_window import CameraViewWindow
 
 logger = logging.getLogger('MotorControl_L206')
@@ -61,7 +60,7 @@ class CameraTab(QWidget):
     microscopy_start_requested = pyqtSignal(dict)  # config dict
     microscopy_stop_requested = pyqtSignal()
     
-    def __init__(self, thorlabs_available=False, parent=None):
+    def __init__(self, thorlabs_available=False, parent=None, camera_service=None):
         """
         Inicializa la pestaña de cámara.
         
@@ -70,11 +69,21 @@ class CameraTab(QWidget):
             parent: Widget padre (ArduinoGUI)
         """
         super().__init__(parent)
-        self.thorlabs_available = THORLABS_AVAILABLE  # Usar detección automática
+        # Usar el flag pasado por main.py como fuente de verdad para disponibilidad del SDK
+        self.thorlabs_available = thorlabs_available
         self.parent_gui = parent
+        self.camera_service = camera_service
+
+        # Propagar disponibilidad del SDK al servicio de cámara si existe
+        if self.camera_service is not None:
+            try:
+                self.camera_service.set_thorlabs_available(self.thorlabs_available)
+            except Exception:
+                # Fallback silencioso en caso de versiones anteriores sin este método
+                pass
         
         # Variables de cámara
-        self.camera_worker = None
+        self.camera_worker = None  # Alias local al worker del servicio
         self.camera_view_window = None
         self.camera_log = []
         
@@ -511,17 +520,41 @@ class CameraTab(QWidget):
         self.max_pixels_spin.valueChanged.connect(self._update_detection_params)
         detection_form.addWidget(self.max_pixels_spin, 0, 3)
         
+        # NUEVO: Circularidad mínima (CONFIGURABLE)
+        detection_form.addWidget(QLabel("Circularidad mín:"), 1, 0)
+        self.circularity_spin = QDoubleSpinBox()
+        self.circularity_spin.setRange(0.0, 1.0)
+        self.circularity_spin.setSingleStep(0.05)
+        self.circularity_spin.setValue(0.35)
+        self.circularity_spin.setDecimals(2)
+        self.circularity_spin.setToolTip("Circularidad mínima (0-1). 1=círculo perfecto. REDUCIR para muestras borrosas.")
+        self.circularity_spin.setFixedWidth(100)
+        self.circularity_spin.valueChanged.connect(self._update_detection_params)
+        detection_form.addWidget(self.circularity_spin, 1, 1)
+        
+        # NUEVO: Aspect ratio mínimo (CONFIGURABLE)
+        detection_form.addWidget(QLabel("Aspect ratio mín:"), 1, 2)
+        self.aspect_ratio_spin = QDoubleSpinBox()
+        self.aspect_ratio_spin.setRange(0.0, 1.0)
+        self.aspect_ratio_spin.setSingleStep(0.05)
+        self.aspect_ratio_spin.setValue(0.40)
+        self.aspect_ratio_spin.setDecimals(2)
+        self.aspect_ratio_spin.setToolTip("Aspect ratio mínimo (0-1). Rechaza objetos muy alargados. REDUCIR para formas irregulares.")
+        self.aspect_ratio_spin.setFixedWidth(100)
+        self.aspect_ratio_spin.valueChanged.connect(self._update_detection_params)
+        detection_form.addWidget(self.aspect_ratio_spin, 1, 3)
+        
         # Parámetros de búsqueda Z
-        detection_form.addWidget(QLabel("Rango Z:"), 1, 0)
+        detection_form.addWidget(QLabel("Rango Z:"), 2, 0)
         self.z_range_spin = QDoubleSpinBox()
         self.z_range_spin.setRange(5.0, 200.0)
         self.z_range_spin.setValue(50.0)
         self.z_range_spin.setSuffix(" µm")
         self.z_range_spin.setToolTip("Rango total de búsqueda de foco")
         self.z_range_spin.setFixedWidth(100)
-        detection_form.addWidget(self.z_range_spin, 1, 1)
+        detection_form.addWidget(self.z_range_spin, 2, 1)
         
-        detection_form.addWidget(QLabel("Tolerancia:"), 1, 2)
+        detection_form.addWidget(QLabel("Tolerancia:"), 2, 2)
         self.z_tolerance_spin = QDoubleSpinBox()
         self.z_tolerance_spin.setRange(0.1, 5.0)
         self.z_tolerance_spin.setValue(0.5)
@@ -529,7 +562,7 @@ class CameraTab(QWidget):
         self.z_tolerance_spin.setDecimals(2)
         self.z_tolerance_spin.setToolTip("Tolerancia de convergencia")
         self.z_tolerance_spin.setFixedWidth(100)
-        detection_form.addWidget(self.z_tolerance_spin, 1, 3)
+        detection_form.addWidget(self.z_tolerance_spin, 2, 3)
         
         autofocus_layout.addLayout(detection_form)
         
@@ -601,7 +634,16 @@ class CameraTab(QWidget):
         try:
             fps = int(self.fps_input.text())
             self.fps_changed.emit(fps)
-            self.log_message(f"FPS configurado: {fps}")
+
+            # Aplicar directamente al worker si existe (cambia frame_period en la cámara)
+            if self.camera_worker:
+                try:
+                    self.camera_worker.change_fps(fps)
+                except Exception as e:
+                    logger.error(f"Error aplicando FPS en CameraWorker: {e}")
+                    self.log_message(f"❌ Error al aplicar FPS en cámara: {e}")
+            
+            self.log_message(f"✅ FPS configurado: {fps}")
         except ValueError:
             self.log_message("❌ Error: Valor de FPS inválido")
             logger.error("Valor de FPS inválido")
@@ -746,15 +788,6 @@ class CameraTab(QWidget):
             self.log_message(f"   🔍 Autofoco: HABILITADO")
             self.log_message(f"      Área: [{config['min_pixels']}, {config['max_pixels']}] px")
             self.log_message(f"      Rango Z: {config['z_range']} µm, Tol: {config['z_tolerance']} µm")
-            
-            # Actualizar parámetros en autofocus controller
-            if self.parent_gui and self.parent_gui.autofocus_controller:
-                self.parent_gui.autofocus_controller.set_pixel_threshold(
-                    config['min_pixels'],
-                    config['max_pixels']
-                )
-                self.parent_gui.autofocus_controller.z_search_range = config['z_range']
-                self.parent_gui.autofocus_controller.z_tolerance = config['z_tolerance']
         else:
             self.log_message(f"   📸 Autofoco: DESHABILITADO (captura normal)")
         
@@ -812,15 +845,17 @@ class CameraTab(QWidget):
         """Actualiza estado de trayectoria."""
         self._trajectory_n_points = n_points if has_trajectory else 0
         
-        if has_trajectory:
+        if has_trajectory and n_points > 0:
             self.trajectory_status.setText(f"✅ Trayectoria lista: {n_points} puntos")
             self.trajectory_status.setStyleSheet("color: #27AE60; font-weight: bold;")
             self.microscopy_start_btn.setEnabled(True)
-            self.log_message(f"📍 Trayectoria cargada: {n_points} puntos")
+            self.log_message(f"✅ Trayectoria actualizada: {n_points} puntos disponibles")
         else:
             self.trajectory_status.setText("⚪ Sin trayectoria")
             self.trajectory_status.setStyleSheet("color: #95A5A6; font-weight: bold;")
             self.microscopy_start_btn.setEnabled(False)
+            if not has_trajectory:
+                self.log_message("⚠️ No hay trayectoria. Ve a TestTab y presiona 'Generar Trayectoria'")
         
         # Actualizar estimación de almacenamiento
         self._update_storage_estimate()
@@ -836,6 +871,33 @@ class CameraTab(QWidget):
             self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #F39C12;")
         else:
             self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #27AE60;")
+    
+    # ============================================================
+    # CALLBACKS DE DETECCIÓN Y AUTOFOCO (conectados desde main)
+    # ============================================================
+
+    def on_detection_ready(self, saliency_map, objects):
+        """Callback cuando hay nuevos resultados de detección."""
+        if hasattr(self, 'saliency_widget') and self.saliency_widget:
+            self.saliency_widget.update_detection(saliency_map, objects)
+
+    def on_detection_status(self, status: str):
+        """Callback cuando cambia el estado del servicio de detección."""
+        self.log_message(f"🔍 {status}")
+
+    def on_autofocus_started(self, obj_index: int, total: int):
+        """Callback cuando inicia autofoco de un objeto."""
+        self.log_message(f"🎯 Enfocando objeto {obj_index + 1}/{total}...")
+
+    def on_autofocus_z_changed(self, z: float, score: float, roi_frame):
+        """Callback en cada posición Z evaluada."""
+        if hasattr(self, 'saliency_widget') and self.saliency_widget:
+            # El tercer parámetro era '0' en la implementación original
+            self.saliency_widget.update_autofocus_state(z, score, 0)
+
+    def on_object_focused(self, obj_index: int, z_optimal: float, score: float):
+        """Callback cuando se encuentra el foco óptimo de un objeto."""
+        self.log_message(f"  ✓ Obj{obj_index}: Z={z_optimal:.1f}µm, S={score:.1f}")
     
     # ============================================================
     # MÉTODOS DE LÓGICA DE CÁMARA
@@ -888,31 +950,47 @@ class CameraTab(QWidget):
             self.log_message("❌ Error: pylablib no está disponible")
             QMessageBox.warning(self.parent_gui, "Error", "pylablib no está disponible")
             return
-        
+
+        # Leer buffer deseado desde la UI
+        try:
+            buffer_size = int(self.buffer_input.text())
+        except Exception:
+            buffer_size = 2
+
         self.log_message("🔌 Conectando cámara Thorlabs...")
-        logger.info("=== CONECTANDO CÁMARA THORLABS ===")
-        
-        # Crear worker si no existe
-        if self.camera_worker is None:
-            self.camera_worker = CameraWorker()
-            self.camera_worker.connection_success.connect(self._on_camera_connected)
-            self.camera_worker.new_frame_ready.connect(self.on_camera_frame)
-            self.camera_worker.status_update.connect(self.log_message)  # Conectar status a log
-            
-            # Configurar buffer inicial
-            try:
-                buffer_size = int(self.buffer_input.text())
+        logger.info("=== CONECTANDO CÁMARA THORLABS (via CameraService) ===")
+
+        # Usar CameraService si está disponible
+        if self.camera_service:
+            self.camera_service.connect_camera(
+                thorlabs_available=self.thorlabs_available,
+                buffer_size=buffer_size,
+            )
+        elif self.parent_gui and hasattr(self.parent_gui, 'camera_service'):
+            # Fallback: acceder al servicio desde el padre
+            self.parent_gui.camera_service.connect_camera(
+                thorlabs_available=self.thorlabs_available,
+                buffer_size=buffer_size,
+            )
+        else:
+            # Fallback legacy: comportamiento antiguo (creación local del worker)
+            from hardware.camera.camera_worker import CameraWorker  # import local para evitar dependencia fuerte
+            if self.camera_worker is None:
+                self.camera_worker = CameraWorker()
+                self.camera_worker.connection_success.connect(self._on_camera_connected)
+                self.camera_worker.new_frame_ready.connect(self.on_camera_frame)
+                self.camera_worker.status_update.connect(self.log_message)
                 self.camera_worker.buffer_size = buffer_size
-                self.log_message(f"   Buffer inicial: {buffer_size} frames")
-            except:
-                self.camera_worker.buffer_size = 2
-        
-        # Conectar
-        self.camera_worker.connect_camera()
+            self.camera_worker.connect_camera()
     
     def _on_camera_connected(self, success: bool, info: str):
         """Callback cuando la cámara se conecta."""
         if success:
+            # Sincronizar alias local con el worker del servicio
+            if self.camera_service and hasattr(self.camera_service, 'worker'):
+                self.camera_worker = self.camera_service.worker
+            elif self.parent_gui and hasattr(self.parent_gui, 'camera_service'):
+                self.camera_worker = self.parent_gui.camera_service.worker
             self.set_connected(True, info)
             logger.info(f"Cámara conectada: {info}")
         else:
@@ -926,7 +1004,12 @@ class CameraTab(QWidget):
         self.log_message("🔌 Desconectando cámara...")
         logger.info("=== DESCONECTANDO CÁMARA ===")
         
-        if self.camera_worker:
+        # Usar CameraService si está disponible
+        if self.camera_service:
+            self.camera_service.disconnect_camera()
+            self.camera_worker = None
+        elif self.camera_worker:
+            # Fallback legacy
             self.camera_worker.disconnect_camera()
             self.camera_worker = None
         
@@ -951,6 +1034,16 @@ class CameraTab(QWidget):
             if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
                 self.camera_view_window.set_scorer(self.parent_gui.smart_focus_scorer)
                 self.log_message("🔍 SmartFocusScorer configurado (mismo que ImgAnalysisTab)")
+            
+            # Conectar señales de botones con MicroscopyService
+            if self.parent_gui and hasattr(self.parent_gui, 'microscopy_service'):
+                self.camera_view_window.skip_roi_requested.connect(
+                    self.parent_gui.microscopy_service.skip_current_point
+                )
+                self.camera_view_window.pause_toggled.connect(
+                    self.parent_gui.microscopy_service.set_paused
+                )
+                self.log_message("🔗 Botones de control conectados a MicroscopyService")
         
         # Actualizar parámetros de detección desde UI
         self._update_detection_params()
@@ -968,10 +1061,30 @@ class CameraTab(QWidget):
             max_area = self.max_pixels_spin.value()
             self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
             self.log_message(f"📐 Params: área [{min_area}-{max_area}] px")
+        
+        # Actualizar parámetros de morfología en SmartFocusScorer
+        if (self.parent_gui and 
+            hasattr(self.parent_gui, 'smart_focus_scorer') and 
+            self.parent_gui.smart_focus_scorer is not None and
+            hasattr(self.parent_gui.smart_focus_scorer, 'set_morphology_params')):
+            min_circ = self.circularity_spin.value()
+            min_aspect = self.aspect_ratio_spin.value()
+            self.parent_gui.smart_focus_scorer.set_morphology_params(
+                min_circularity=min_circ,
+                min_aspect_ratio=min_aspect
+            )
+            self.log_message(f"🔧 Morfología: circ≥{min_circ:.2f}, aspect≥{min_aspect:.2f}")
     
     def start_camera_live_view(self):
         """Inicia vista en vivo."""
-        if not self.camera_worker:
+        # Verificar que hay cámara conectada
+        worker = None
+        if self.camera_service and getattr(self.camera_service, 'worker', None):
+            worker = self.camera_service.worker
+        else:
+            worker = self.camera_worker
+
+        if worker is None:
             self.log_message("❌ Error: Conecta la cámara primero")
             QMessageBox.warning(self.parent_gui, "Error", "Conecta la cámara primero")
             return
@@ -986,16 +1099,18 @@ class CameraTab(QWidget):
             fps = 60
             buffer_size = 2
         
-        # Configurar cámara
-        self.camera_worker.exposure = exposure_s
-        self.camera_worker.fps = fps
-        self.camera_worker.buffer_size = buffer_size
-        
         self.log_message(f"▶️ Iniciando vista en vivo...")
         self.log_message(f"   Exposición: {exposure_s}s, FPS: {fps}, Buffer: {buffer_size}")
-        
-        # Iniciar vista en vivo (en thread)
-        self.camera_worker.start()
+
+        # Usar CameraService si está disponible
+        if self.camera_service:
+            self.camera_service.start_live(exposure_s, fps, buffer_size)
+        else:
+            # Fallback legacy: configurar directamente el worker
+            worker.exposure = exposure_s
+            worker.fps = fps
+            worker.buffer_size = buffer_size
+            worker.start()
         
         # Actualizar UI
         self.start_live_btn.setEnabled(False)
@@ -1009,7 +1124,9 @@ class CameraTab(QWidget):
         """Detiene vista en vivo."""
         self.log_message("⏹️ Deteniendo vista en vivo...")
         
-        if self.camera_worker:
+        if self.camera_service:
+            self.camera_service.stop_live()
+        elif self.camera_worker:
             self.camera_worker.stop_live_view()
         
         self.start_live_btn.setEnabled(True)
@@ -1154,18 +1271,18 @@ class CameraTab(QWidget):
                         cv2.imwrite(filename, frame)
                         self.log_message(f"   16-bit TIFF: rango [{frame_min}, {frame_max}]")
                     else:
-                        # PNG/JPG: normalizar a 8 bits
-                        if frame_max > frame_min:
-                            frame_norm = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                        # PNG/JPG: normalizar a 8 bits usando el mismo esquema que CameraWorker
+                        if frame_max > 0:
+                            frame_norm = (frame / frame_max * 255).astype(np.uint8)
                         else:
                             frame_norm = np.zeros_like(frame, dtype=np.uint8)
-                        
+
                         if img_format == 'jpg':
                             cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_JPEG_QUALITY, 95])
                         else:  # png
                             cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-                        
-                        self.log_message(f"   Normalizado: [{frame_min}, {frame_max}] → 8-bit")
+
+                        self.log_message(f"   Normalizado: [{frame_min}, {frame_max}] → 8-bit (max-scale)")
                 else:
                     # Frame ya es uint8
                     if img_format == 'jpg':

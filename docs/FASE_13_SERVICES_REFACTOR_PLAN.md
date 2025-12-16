@@ -2,7 +2,7 @@
 ## Plan de Refactorización de Servicios
 
 **Documento creado:** 2025-12-12  
-**Estado:** PLANIFICACIÓN  
+**Estado:** EN PROGRESO (HInfService completado; foco actual: CameraTab)  
 **Objetivo:** Separar lógica de negocio de la interfaz en las tabs
 
 ---
@@ -186,6 +186,18 @@ class CameraService(QObject):
 - load_previous_controller()
 ```
 
+**Estado actual (2025-12-13):**
+
+- Toda la lógica de estos métodos se ha movido a
+  `src/core/services/hinf_service.py` como funciones libres que reciben
+  una instancia de `HInfTab` (`tab`).
+- `HInfTab` ha quedado con métodos ligeros que solo delegan en el
+  servicio (`simulate_step_response`, `plot_bode`, `export_controller`,
+  `load_previous_controller`, `start_hinf_control`,
+  `execute_hinf_control`, `stop_hinf_control`,
+  `synthesize_hinf_controller`).
+- El comportamiento y la interfaz visual siguen siendo idénticos.
+
 **Señales del servicio:**
 ```python
 class HInfService(QObject):
@@ -329,24 +341,24 @@ src/core/services/
 ## 🚀 ORDEN DE EJECUCIÓN RECOMENDADO
 
 ### Sprint 1: Servicios Críticos (4-6 horas)
-1. ✅ Crear `CameraService` - Mover lógica de cámara
-2. ✅ Refactorizar `camera_tab.py` - Solo UI
+1. ⏳ Crear `CameraService` - Mover lógica de cámara
+2. ⏳ Refactorizar `camera_tab.py` - Solo UI
 
 ### Sprint 2: Control H∞ (4-6 horas)
 3. ✅ Crear `HInfService` - Mover síntesis y control
 4. ✅ Refactorizar `hinf_tab.py` - Solo UI
 
 ### Sprint 3: Trayectorias (3-4 horas)
-5. ✅ Crear `TrajectoryService` + `DualControlService`
-6. ✅ Refactorizar `test_tab.py` - Solo UI
+5. ⏳ Crear `TrajectoryService` + `DualControlService`
+6. ⏳ Refactorizar `test_tab.py` - Solo UI
 
 ### Sprint 4: Microscopía (2-3 horas)
-7. ✅ Crear `MicroscopyService`
-8. ✅ Limpiar `main.py`
+7. ⏳ Crear `MicroscopyService`
+8. ⏳ Limpiar `main.py`
 
 ### Sprint 5: Verificación (2 horas)
-9. ✅ Pruebas de integración
-10. ✅ Documentación actualizada
+9. ⏳ Pruebas de integración
+10. ⏳ Documentación actualizada
 
 ---
 
@@ -362,13 +374,13 @@ src/core/services/
 - [ ] Verificar funcionalidad
 
 ### HInfService
-- [ ] Crear archivo `src/core/services/hinf_service.py`
-- [ ] Mover synthesize_hinf_controller()
-- [ ] Mover simulate_step_response() y plot_bode()
-- [ ] Mover control en tiempo real
-- [ ] Definir señales PyQt
-- [ ] Actualizar hinf_tab.py para usar servicio
-- [ ] Verificar funcionalidad
+- [x] Crear archivo `src/core/services/hinf_service.py`
+- [x] Mover synthesize_hinf_controller()
+- [x] Mover simulate_step_response() y plot_bode()
+- [x] Mover control en tiempo real
+- [ ] Definir señales PyQt (pendiente / opcional)
+- [x] Actualizar hinf_tab.py para usar servicio
+- [x] Verificar funcionalidad
 
 ### TrajectoryService
 - [ ] Crear archivo `src/core/services/trajectory_service.py`

@@ -20,6 +20,7 @@
 - [Módulos y Componentes](#-módulos-y-componentes)
 - [Optimizaciones de Rendimiento](#-optimizaciones-de-rendimiento)
 - [Estructura del Código](#-estructura-del-código)
+ - [Fundamentos Matemáticos de Control](#-fundamentos-matemáticos-de-control)
 - [Contribuir](#-contribuir)
 - [Licencia](#-licencia)
 
@@ -68,7 +69,22 @@ Este sistema proporciona una solución completa para el control y análisis de m
 
 ### 🔬 Análisis de Sistema
 - **Identificación de función de transferencia:**
-  - Modelo de primer orden: `G(s) = K / (s·(τs + 1))`
+  - Modelo experimental de segundo orden:
+    
+    ```math
+    G(s) = \frac{K}{(\tau_1 s + 1)(\tau_2 s + 1)}
+    ```
+    
+    donde \(\tau_1\) es el polo rápido (dinámica dominante en el rango de
+    interés) y \(\tau_2\) es un polo lento (dinámica muy lenta que se
+    desprecia en la síntesis H∞/H2 para evitar mal condicionamiento).
+  - Modelo de diseño (dinámica rápida equivalente):
+    
+    ```math
+    G_\text{fast}(s) = \frac{K}{\tau s + 1}
+    ```
+    
+    Este es el modelo que usa `hinf_service.py` para la síntesis robusta.
   - Cálculo automático de ganancia K y constante de tiempo τ
   - Calibración con distancia real medida
 - **Análisis de respuesta al escalón:**
@@ -92,6 +108,132 @@ Este sistema proporciona una solución completa para el control y análisis de m
 - **Transferencia de controladores:**
   - Desde módulo de diseño a módulo de prueba
   - Almacenamiento de múltiples diseños
+
+---
+
+## 📐 Fundamentos Matemáticos de Control
+
+Esta sección resume la formulación matemática que implementa el módulo
+`core/services/hinf_service.py`, siguiendo el enfoque estándar de
+"mixed-sensitivity" descrito en *Essentials of Robust Control* (Zhou,
+Doyle, Glover).
+
+### Modelo de planta
+
+El sistema motor–sensor se modela inicialmente como una planta de
+segundo orden identificada experimentalmente:
+
+```math
+G(s) = \frac{K}{(\tau_1 s + 1)(\tau_2 s + 1)}
+```
+
+Cuando existe separación fuerte de tiempos (\(\tau_2 \gg \tau_1\)), la
+síntesis robusta se realiza sobre la **dinámica rápida equivalente**:
+
+```math
+G_\text{fast}(s) = \frac{K}{\tau s + 1}
+```
+
+En el código (`synthesize_hinf_controller`) se usa este modelo de primer
+orden para evitar problemas numéricos en las ecuaciones de Riccati.
+
+### Formulación H∞ de sensibilidad mixta
+
+Se define el lazo abierto, la sensibilidad y la sensibilidad
+complementaria:
+
+```math
+L(s) = G(s) K(s)
+```
+
+```math
+S(s) = \frac{1}{1 + L(s)},
+\qquad
+T(s) = \frac{L(s)}{1 + L(s)}.
+```
+
+El problema H∞ que resuelve el software es el de **sensibilidad mixta**:
+
+```math
+\min_{K(s)} \; \gamma
+\quad \text{sujeto a} \quad
+\left\|\begin{bmatrix}
+W_1(s) S(s) \\
+W_2(s) K(s) S(s) \\
+W_3(s) T(s)
+\end{bmatrix}\right\|_\infty < \gamma,
+```
+
+donde \(\|\cdot\|_\infty\) es la norma H∞.
+
+En `hinf_service.py` se construyen las ponderaciones con las formas
+estándar (Zhou, Doyle, Glover):
+
+- **Peso de performance** (error de seguimiento):
+  
+  ```math
+  W_1(s) = \frac{\tfrac{1}{M_s} s + \omega_b}{s + \omega_b \, \varepsilon},
+  ```
+  
+  donde \(M_s\) es el pico máximo de sensibilidad admitido,
+  \(\omega_b\) el ancho de banda deseado y \(\varepsilon\) controla el
+  error en régimen permanente.
+
+- **Peso de esfuerzo de control**:
+  
+  ```math
+  W_2(s) = \frac{k_u}{\tfrac{1}{\omega_{b_u}} s + 1},
+  \qquad
+  k_u = \frac{1}{U_\text{max}},\; \omega_{b_u} = \frac{\omega_b}{10}.
+  ```
+
+- **Peso de robustez** (sensibilidad complementaria):
+  
+  ```math
+  W_3(s) = \frac{s + \omega_T \varepsilon_T}{\varepsilon_T s + \omega_T},
+  ```
+  
+  donde \(\omega_T\) es la frecuencia asociada a la incertidumbre de
+  modelo y \(\varepsilon_T\) gobierna el decaimiento en alta frecuencia.
+
+Después de sintetizar el controlador, el código verifica
+numéricamente:
+
+```math
+\|W_1 S\|_\infty,\; \|W_2 K S\|_\infty,\; \|W_3 T\|_\infty
+```
+
+y calcula \(\gamma_\text{verificado} = \max\{\|W_1 S\|_\infty,
+\|W_2 K S\|_\infty, \|W_3 T\|_\infty\}\), que se muestra en la
+interfaz junto con los márgenes clásicos de ganancia y fase.
+
+### Formulación H2
+
+Como alternativa, el sistema puede realizar síntesis H2 utilizando
+`control.augw` y `control.h2syn`. El sistema aumentado \(P\) se
+construye automáticamente con `augw(G, W1, W2, W3)` y se resuelve:
+
+```math
+K_\text{H2},\; \text{CL} = \operatorname{h2syn}(P, n_\text{meas}, n_\text{con}),
+```
+
+con una sola entrada medida (posición) y una sola señal de control.
+
+### Controlador resultante
+
+El controlador resultante se reduce típicamente a una estructura PI:
+
+```math
+K(s) = K_p + \frac{K_i}{s} = \frac{K_p s + K_i}{s},
+```
+
+cuyos parámetros \(K_p, K_i\) se extraen de la función de transferencia
+resultante y se exportan tanto en forma continua como en código Arduino
+discreto (sección `export_controller` de `hinf_service.py`).
+
+Esta sección del README sirve como referencia teórica para defender el
+procedimiento de diseño y análisis ante revisiones académicas o
+ingenieriles.
 
 ### 📹 Grabación de Experimentos
 - **Formato CSV estructurado:**

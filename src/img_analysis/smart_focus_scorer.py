@@ -100,6 +100,8 @@ class SmartFocusScorer:
         max_area: int = 35000,
         min_prob: float = 0.3,
         focus_threshold: float = 50.0,
+        min_circularity: float = 0.45,
+        min_aspect_ratio: float = 0.4,
         use_laplacian: bool = True,
         device: Optional[str] = None
     ):
@@ -124,6 +126,8 @@ class SmartFocusScorer:
         self.focus_threshold = focus_threshold
         self.use_laplacian = use_laplacian
         self.device = device
+        self.min_circularity = min_circularity
+        self.min_aspect_ratio = min_aspect_ratio
         
         # Detector de objetos salientes (lazy loading)
         self._detector = None
@@ -157,12 +161,21 @@ class SmartFocusScorer:
                 auto_download=True
             )
             self._model_loaded = True
-            logger.info("[SmartFocusScorer] Modelo U2-Net cargado exitosamente")
+            logger.info(f"[SmartFocusScorer] Modelo U2-Net cargado exitosamente")
             return True
         except Exception as e:
             self._load_error = str(e)
             logger.error(f"[SmartFocusScorer] Error cargando U2-Net: {e}")
             return False
+    
+    def set_morphology_params(self, min_circularity: float = None, min_aspect_ratio: float = None):
+        """Actualiza parámetros de morfología para filtrado de objetos."""
+        if min_circularity is not None:
+            self.min_circularity = min_circularity
+            logger.info(f"[SmartFocusScorer] Circularidad mínima actualizada: {min_circularity:.2f}")
+        if min_aspect_ratio is not None:
+            self.min_aspect_ratio = min_aspect_ratio
+            logger.info(f"[SmartFocusScorer] Aspect ratio mínimo actualizado: {min_aspect_ratio:.2f}")
     
     def _get_saliency_mask(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -513,33 +526,17 @@ class SmartFocusScorer:
             'model_loaded': self._model_loaded
         }
     
-    def set_parameters(
-        self,
-        threshold: Optional[float] = None,
-        min_area: Optional[int] = None,
-        max_area: Optional[int] = None,
-        min_prob: Optional[float] = None,
-        focus_threshold: Optional[float] = None,
-        use_laplacian: Optional[bool] = None,
-        **kwargs
-    ):
-        """Actualiza parámetros."""
+    def set_parameters(self, threshold: float = None, min_area: int = None, 
+                      max_area: int = None, focus_threshold: float = None):
+        """Actualiza parámetros dinámicamente."""
         if threshold is not None:
             self.threshold = threshold
         if min_area is not None:
             self.min_area = min_area
         if max_area is not None:
             self.max_area = max_area
-        if min_prob is not None:
-            self.min_prob = min_prob
         if focus_threshold is not None:
             self.focus_threshold = focus_threshold
-        if use_laplacian is not None:
-            self.use_laplacian = use_laplacian
-        for key, value in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-        logger.debug(f"[SmartFocusScorer] Params: min_area={self.min_area}, max_area={self.max_area}")
     
     def is_model_loaded(self) -> bool:
         """Verifica si el modelo U2-Net está cargado."""
