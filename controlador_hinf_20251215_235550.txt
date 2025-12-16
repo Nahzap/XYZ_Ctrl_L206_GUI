@@ -1,0 +1,26 @@
+======================================================================
+CONTROLADOR H∞ - Sistema de Control L206
+======================================================================
+
+Fecha: 2025-12-15 23:55:50
+
+PLANTA G(s): <TransferFunction>: sys[397]
+Inputs (1): ['u[0]']
+Outputs (1): ['y[0]']
+
+           0.9648
+  -------------------------
+  0.006 s^2 + 1.009 s + 1.5
+
+CONTROLADOR C(s): <TransferFunction>: sys[401]
+Inputs (1): ['u[0]']
+Outputs (1): ['y[0]']
+dt = None
+
+  139.9
+  -----
+    1
+
+COEFICIENTES:
+  Numerador: [139.92537313]
+  Denominador: [1]
