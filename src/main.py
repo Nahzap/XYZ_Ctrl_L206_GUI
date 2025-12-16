@@ -174,7 +174,9 @@ class ArduinoGUI(QMainWindow):
         self.autofocus_service = AutofocusService()
         
         # Iniciar comunicación serial ANTES de crear tabs (necesario para ControlTab)
-        self.serial_thread = SerialHandler(SERIAL_PORT, BAUD_RATE)
+        # Detectar puerto automáticamente o usar el configurado
+        initial_port = self._detect_arduino_port() or SERIAL_PORT
+        self.serial_thread = SerialHandler(initial_port, BAUD_RATE)
         
         # Widget central con pestañas
         central_widget = QWidget()
@@ -365,6 +367,32 @@ class ArduinoGUI(QMainWindow):
             logger.info("Ventana de señales mostrada y activada")
         except Exception as e:
             logger.error(f"Error al abrir ventana de señales: {e}\n{traceback.format_exc()}")
+    
+    def _detect_arduino_port(self):
+        """
+        Detecta automáticamente el puerto del Arduino.
+        
+        Returns:
+            str: Puerto detectado (ej: 'COM3') o None si no se encuentra
+        """
+        import serial.tools.list_ports
+        
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            logger.warning("No se encontraron puertos seriales disponibles")
+            return None
+        
+        # Buscar Arduino por descripción
+        for port in ports:
+            desc_lower = port.description.lower()
+            if any(x in desc_lower for x in ['arduino', 'ch340', 'ch341', 'ftdi', 'usb serial']):
+                logger.info(f"Arduino detectado automáticamente en: {port.device} ({port.description})")
+                return port.device
+        
+        # Si no se encuentra Arduino, usar el primer puerto disponible
+        first_port = ports[0].device
+        logger.warning(f"Arduino no detectado. Usando primer puerto disponible: {first_port}")
+        return first_port
 
     # NOTA: create_control_group(), create_motors_group(), create_sensors_group() 
     # ELIMINADOS - Reemplazados por ControlTab modular (Fase 12)

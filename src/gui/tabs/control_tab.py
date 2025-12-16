@@ -5,9 +5,12 @@ Encapsula la UI para control manual/automático de motores y visualización de s
 """
 
 import logging
+import serial.tools.list_ports
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox)
 from PyQt5.QtCore import pyqtSignal
+
+from config.constants import BAUD_RATE
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -78,28 +81,35 @@ class ControlTab(QWidget):
         group_box = QGroupBox("⚙️ Configuración Serial")
         layout = QGridLayout()
         
-        # Puerto COM
+        # Puerto COM con detección automática
         layout.addWidget(QLabel("Puerto:"), 0, 0)
         self.port_combo = QComboBox()
-        # Agregar puertos comunes de Windows
-        self.port_combo.addItems(['COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'COM10'])
-        self.port_combo.setCurrentText('COM5')  # Por defecto
         self.port_combo.setToolTip("Selecciona el puerto serial del Arduino")
         layout.addWidget(self.port_combo, 0, 1)
         
-        # Baudrate
+        # Botón escanear puertos
+        scan_btn = QPushButton("🔄")
+        scan_btn.setFixedWidth(40)
+        scan_btn.setToolTip("Escanear puertos disponibles")
+        scan_btn.clicked.connect(self._scan_ports)
+        layout.addWidget(scan_btn, 0, 2)
+        
+        # Escanear puertos al inicializar
+        self._scan_ports()
+        
+        # Baudrate (sincronizado con constants.py)
         layout.addWidget(QLabel("Baudrate:"), 1, 0)
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '1000000'])
-        self.baudrate_combo.setCurrentText('115200')  # Por defecto
+        self.baudrate_combo.setCurrentText(str(BAUD_RATE))  # Sincronizado con constants.py
         self.baudrate_combo.setToolTip("Velocidad de comunicación serial")
-        layout.addWidget(self.baudrate_combo, 1, 1)
+        layout.addWidget(self.baudrate_combo, 1, 1, 1, 2)
         
         # Estado de conexión
         layout.addWidget(QLabel("Estado:"), 2, 0)
         self.connection_status = QLabel("❌ Desconectado")
         self.connection_status.setStyleSheet("font-weight: bold; color: #E74C3C;")
-        layout.addWidget(self.connection_status, 2, 1)
+        layout.addWidget(self.connection_status, 2, 1, 1, 2)
         
         # Botón reconectar
         reconnect_btn = QPushButton("🔌 Conectar / Reconectar")
@@ -108,7 +118,7 @@ class ControlTab(QWidget):
             QPushButton:hover { background-color: #5DADE2; }
         """)
         reconnect_btn.clicked.connect(self._request_reconnect)
-        layout.addWidget(reconnect_btn, 3, 0, 1, 2)
+        layout.addWidget(reconnect_btn, 3, 0, 1, 3)
         
         group_box.setLayout(layout)
         return group_box
@@ -199,6 +209,46 @@ class ControlTab(QWidget):
         group_box.setLayout(layout)
         return group_box
     
+    def _scan_ports(self):
+        """Escanea puertos seriales disponibles y actualiza el combo."""
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        
+        if not ports:
+            self.port_combo.addItem("No hay puertos disponibles")
+            logger.warning("No se encontraron puertos seriales disponibles")
+            return
+        
+        arduino_index = -1
+        for i, port in enumerate(ports):
+            # Mostrar puerto con descripción
+            display = f"{port.device} - {port.description[:30]}"
+            self.port_combo.addItem(display, port.device)
+            
+            # Detectar Arduino automáticamente
+            desc_lower = port.description.lower()
+            if any(x in desc_lower for x in ['arduino', 'ch340', 'ch341', 'ftdi', 'usb serial']):
+                arduino_index = i
+        
+        # Seleccionar Arduino si se encontró
+        if arduino_index >= 0:
+            self.port_combo.setCurrentIndex(arduino_index)
+            logger.info(f"Arduino detectado en: {ports[arduino_index].device}")
+        
+        logger.info(f"Puertos escaneados: {[p.device for p in ports]}")
+    
+    def _get_selected_port(self):
+        """Obtiene el puerto seleccionado (solo el nombre del dispositivo)."""
+        # El combo puede tener formato "COM3 - Arduino Mega" o solo "COM3"
+        current_data = self.port_combo.currentData()
+        if current_data:
+            return current_data
+        # Fallback: extraer del texto
+        text = self.port_combo.currentText()
+        if " - " in text:
+            return text.split(" - ")[0]
+        return text
+    
     def _request_manual_mode(self):
         """Cambia a modo manual."""
         self.set_manual_mode()
@@ -209,7 +259,7 @@ class ControlTab(QWidget):
     
     def _request_reconnect(self):
         """Solicita reconexión serial con los parámetros seleccionados."""
-        port = self.port_combo.currentText()
+        port = self._get_selected_port()
         baudrate = int(self.baudrate_combo.currentText())
         
         logger.info(f"Solicitando reconexión serial: {port} @ {baudrate}")

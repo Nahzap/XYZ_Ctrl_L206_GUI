@@ -373,7 +373,7 @@ def plot_bode(tab):
 # =============================================================================
 
 def export_controller(tab):
-    """Exporta el controlador a archivo de texto y pickle."""
+    """Exporta el controlador a archivo de texto y pickle con nombre personalizado."""
     logger.info("HInfTab: Exportar Controlador solicitado")
 
     if tab.synthesized_controller is None:
@@ -381,55 +381,84 @@ def export_controller(tab):
         return
 
     try:
-        filename = f"controlador_hinf_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        # Pedir nombre personalizado al usuario
+        from PyQt5.QtWidgets import QInputDialog
+        default_name = f"controlador_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        name, ok = QInputDialog.getText(
+            tab.parent_gui, 
+            "💾 Guardar Controlador",
+            "Nombre del controlador:",
+            text=default_name
+        )
+        
+        if not ok or not name.strip():
+            tab.results_text.append("❌ Exportación cancelada")
+            return
+        
+        # Sanitizar nombre (quitar caracteres inválidos)
+        import re
+        name = re.sub(r'[<>:"/\\|?*]', '_', name.strip())
+        filename = f"{name}.txt"
+        pickle_filename = f"{name}.pkl"
 
-        # Extraer coeficientes
-        num = tab.synthesized_controller.num[0][0]
-        den = tab.synthesized_controller.den[0][0]
+        # Convertir a TransferFunction si es StateSpace
+        controller = tab.synthesized_controller
+        if hasattr(controller, 'A') and not hasattr(controller, 'num'):
+            # Es StateSpace, convertir a TF
+            controller_tf = ct.ss2tf(controller)
+            num = np.array(controller_tf.num[0][0]).flatten()
+            den = np.array(controller_tf.den[0][0]).flatten()
+            is_statespace = True
+        else:
+            # Ya es TransferFunction
+            num = np.array(controller.num[0][0]).flatten()
+            den = np.array(controller.den[0][0]).flatten()
+            is_statespace = False
 
-        # Detectar PI
-        is_pi = len(num) >= 2 and len(den) == 2 and abs(den[1]) < 1e-10
-        Kp = num[0] / den[0] if is_pi else 0
-        Ki = num[1] / den[0] if is_pi and len(num) >= 2 else 0
+        # Usar Kp/Ki ya calculados si existen
+        Kp = getattr(tab, 'Kp_designed', 0)
+        Ki = getattr(tab, 'Ki_designed', 0)
+        is_pi = Ki != 0
 
-        # Discretización
-        Ts = 0.001
-        try:
-            K_discrete = ct.sample_system(tab.synthesized_controller, Ts, method='tustin')
-            num_d = K_discrete.num[0][0]
-            den_d = K_discrete.den[0][0]
-            b_coefs = num_d / den_d[0]
-            a_coefs = den_d / den_d[0]
-        except:
-            if is_pi:
-                q0 = Kp + Ki * Ts/2
-                q1 = -Kp + Ki * Ts/2
-                b_coefs = np.array([q0, q1])
-                a_coefs = np.array([1.0, -1.0])
-            else:
-                b_coefs = np.array([0])
-                a_coefs = np.array([1])
+        # Convertir planta también si es necesario
+        plant = tab.synthesized_plant
+        if hasattr(plant, 'A') and not hasattr(plant, 'num'):
+            plant_tf = ct.ss2tf(plant)
+            plant_num = np.array(plant_tf.num[0][0]).flatten()
+            plant_den = np.array(plant_tf.den[0][0]).flatten()
+        else:
+            plant_num = np.array(plant.num[0][0]).flatten()
+            plant_den = np.array(plant.den[0][0]).flatten()
 
-        # Escribir archivo
+        # Escribir archivo de texto
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("=" * 70 + "\n")
             f.write("CONTROLADOR H∞ - Sistema de Control L206\n")
             f.write("=" * 70 + "\n\n")
+            f.write(f"Nombre: {name}\n")
             f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write(f"PLANTA G(s): {tab.synthesized_plant}\n\n")
-            f.write(f"CONTROLADOR C(s): {tab.synthesized_controller}\n\n")
-            if is_pi:
-                f.write(f"PARÁMETROS PI:\n  Kp = {Kp:.6f}\n  Ki = {Ki:.6f}\n")
-                f.write(f"  Gamma (γ) = {tab.gamma:.6f}\n\n")
-            f.write(f"COEFICIENTES:\n  Numerador: {num}\n  Denominador: {den}\n")
+            f.write(f"PLANTA G(s):\n  Numerador: {plant_num}\n  Denominador: {plant_den}\n\n")
+            f.write(f"CONTROLADOR C(s):\n  Numerador: {num}\n  Denominador: {den}\n")
+            if is_statespace:
+                f.write(f"  (Convertido desde StateSpace de orden {len(controller.A)})\n")
+            f.write(f"\nPARÁMETROS PI EQUIVALENTES:\n")
+            f.write(f"  Kp = {Kp:.6f}\n")
+            f.write(f"  Ki = {Ki:.6f}\n")
+            f.write(f"  Gamma (γ) = {tab.gamma:.6f}\n\n")
+            f.write(f"PARÁMETROS DE SÍNTESIS:\n")
+            f.write(f"  K = {tab.K_input.text()} µm/s/PWM\n")
+            f.write(f"  τ = {tab.tau_input.text()} s\n")
+            f.write(f"  Ms = {tab.w1_Ms.text()}\n")
+            f.write(f"  ωb = {tab.w1_wb.text()} rad/s\n")
+            f.write(f"  U_max = {tab.w2_umax.text()} PWM\n")
 
         # Guardar pickle
-        pickle_filename = filename.replace('.txt', '.pkl')
         controller_data = {
-            'controller_num': num.tolist() if hasattr(num, 'tolist') else list(num),
-            'controller_den': den.tolist() if hasattr(den, 'tolist') else list(den),
-            'plant_num': tab.synthesized_plant.num[0][0].tolist(),
-            'plant_den': tab.synthesized_plant.den[0][0].tolist(),
+            'name': name,
+            'controller_num': num.tolist(),
+            'controller_den': den.tolist(),
+            'plant_num': plant_num.tolist(),
+            'plant_den': plant_den.tolist(),
             'gamma': tab.gamma,
             'K': float(tab.K_input.text()),
             'tau': float(tab.tau_input.text()),
@@ -448,12 +477,13 @@ def export_controller(tab):
         with open(pickle_filename, 'wb') as pf:
             pickle.dump(controller_data, pf)
 
-        tab.results_text.append(f"\n✅ Controlador exportado:\n  📄 {filename}\n  💾 {pickle_filename}")
-        QMessageBox.information(tab.parent_gui, "✅ Exportación Completa",
-                               f"Controlador exportado:\n\n📄 {filename}\n💾 {pickle_filename}")
+        tab.results_text.append(f"\n✅ Controlador '{name}' exportado:\n  📄 {filename}\n  💾 {pickle_filename}")
+        logger.info(f"Controlador exportado: {filename}")
 
     except Exception as e:
         logger.error(f"Error al exportar: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         tab.results_text.setText(f"❌ Error al exportar:\n{str(e)}")
 
 
@@ -600,25 +630,34 @@ def execute_hinf_control(tab):
         sensor_adc = tab.get_sensor_value_callback(sensor_key)
 
         if sensor_adc is None:
+            logger.warning(f"Sensor {sensor_key} retornó None")
             return
 
         # Convertir referencia a ADC
+        # Calibración: pendiente=-12.22 µm/ADC, intercepto=21601 µm
         ref_adc = (21601.0 - tab.reference_um) / 12.22
         ref_adc = max(0, min(1023, ref_adc))
 
-        # Error
+        # Error en ADC
         error = ref_adc - sensor_adc
 
-        # Zona muerta
+        # Inicializar contador de log si no existe
+        if not hasattr(tab, '_log_counter'):
+            tab._log_counter = 0
+
+        # Zona muerta (±3 ADC ≈ ±37µm)
         if abs(error) <= 3:
             tab.send_command_callback('A,0,0')
             tab.control_integral = 0
+            tab._log_counter += 1
+            if tab._log_counter % 50 == 0:
+                tab.results_text.append(f"⚪ ZONA MUERTA | RefADC={ref_adc:.0f} | ADC={sensor_adc} | Err={error:.0f}")
             return
 
         # Actualizar integral
         tab.control_integral += error * Ts
 
-        # Calcular PWM
+        # Calcular PWM (PI controller)
         pwm_base = tab.Kp_control * error + tab.Ki_control * tab.control_integral
 
         # Invertir si necesario
@@ -627,13 +666,27 @@ def execute_hinf_control(tab):
         else:
             pwm_float = pwm_base
 
-        # Limitar
+        # Limitar PWM
         PWM_MAX = int(tab.Umax_designed) if hasattr(tab, 'Umax_designed') else 100
-        if abs(pwm_float) > PWM_MAX:
+        saturated = ""
+        if pwm_float > PWM_MAX:
+            pwm = PWM_MAX
             tab.control_integral -= error * Ts  # Anti-windup
-            pwm = PWM_MAX if pwm_float > 0 else -PWM_MAX
+            saturated = "SAT+"
+        elif pwm_float < -PWM_MAX:
+            pwm = -PWM_MAX
+            tab.control_integral -= error * Ts  # Anti-windup
+            saturated = "SAT-"
         else:
             pwm = int(pwm_float)
+
+        # MOSTRAR EN TERMINAL (cada 10 ciclos ≈ 100ms)
+        tab._log_counter += 1
+        if tab._log_counter % 10 == 0:
+            icon = "🔴" if saturated else "🟢"
+            tab.results_text.append(
+                f"{icon} RefADC={ref_adc:.0f} | ADC={sensor_adc} | Err={error:.0f} | Int={tab.control_integral:.1f} | PWM={pwm} {saturated}"
+            )
 
         # Enviar comando
         if tab.control_motor == 'A':

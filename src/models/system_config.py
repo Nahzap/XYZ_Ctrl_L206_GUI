@@ -11,8 +11,8 @@ class SystemConfig:
     """Configuración global del sistema."""
     
     # Comunicación serial
-    serial_port: str = 'COM5'
-    baud_rate: int = 115200
+    serial_port: str = 'COM5'  # Puerto por defecto (se auto-detecta en runtime)
+    baud_rate: int = 1000000   # Sincronizado con constants.py
     
     # Buffer de señales
     plot_length: int = 200
@@ -34,7 +34,7 @@ class SystemConfig:
     
     def __post_init__(self):
         """Valida la configuración."""
-        if not 0 < self.baud_rate <= 921600:
+        if not 0 < self.baud_rate <= 2000000:
             raise ValueError(f"baud_rate inválido: {self.baud_rate}")
         
         if not 10 <= self.plot_length <= 10000:
