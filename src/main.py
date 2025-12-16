@@ -114,19 +114,8 @@ logger = setup_logging()
 # --- Diseño de controlador H∞ ---
 import control as ct
 
-# --- Cámara Thorlabs ---
-try:
-    import pylablib as pll
-    # Configurar la ruta del SDK de Thorlabs
-    pll.par["devices/dlls/thorlabs_tlcam"] = r"C:\Program Files\Thorlabs\ThorImageCAM\Bin"
-    from pylablib.devices import Thorlabs
-    THORLABS_AVAILABLE = True
-except ImportError:
-    THORLABS_AVAILABLE = False
-    logger.warning("pylablib no está instalado. Funcionalidad de cámara deshabilitada.")
-except Exception as e:
-    THORLABS_AVAILABLE = False
-    logger.warning(f"Error al configurar Thorlabs SDK: {e}")
+# --- Cámara Thorlabs (centralizado) ---
+from config.hardware_availability import THORLABS_AVAILABLE
 
 # =========================================================================
 # --- Las clases MatplotlibWindow, SignalWindow, CameraWorker y 
@@ -498,22 +487,6 @@ class ArduinoGUI(QMainWindow):
             logger.warning(f"Error parseando datos: '{line}' - {e}")
             return
     
-    def _on_show_plot(self, fig, title):
-        """Muestra una ventana con un gráfico de matplotlib."""
-        logger.info(f"=== MOSTRANDO GRÁFICO: {title} ===")
-        
-        # Cerrar ventana anterior si existe
-        if self.data_window is not None:
-            self.data_window.close()
-        
-        # Crear y mostrar nueva ventana
-        self.data_window = MatplotlibWindow(fig, title, self)
-        self.data_window.show()
-        self.data_window.raise_()
-        self.data_window.activateWindow()
-        QApplication.processEvents()
-        logger.info(f"Ventana '{title}' mostrada exitosamente")
-            
     # --- Lógica de Control y Comandos ---
     # Toda la lógica de grabación está ahora en RecordingTab
     def _on_recording_started(self, filename: str):

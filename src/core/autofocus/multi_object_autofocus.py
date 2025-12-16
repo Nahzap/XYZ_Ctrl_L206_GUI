@@ -11,18 +11,10 @@ from typing import List, Tuple, Optional, Callable
 import numpy as np
 import cv2
 
+# Importar modelo unificado
+from core.models.detected_object import DetectedObject
+
 logger = logging.getLogger('MotorControl_L206')
-
-
-@dataclass
-class DetectedObject:
-    """Objeto detectado en pre-escaneo."""
-    index: int
-    bounding_box: Tuple[int, int, int, int]
-    centroid: Tuple[int, int]
-    area: float
-    initial_score: float
-    circularity: float = 0.0  # Métrica de forma: 1.0 = círculo perfecto
 
 
 @dataclass

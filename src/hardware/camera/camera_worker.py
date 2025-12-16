@@ -17,13 +17,8 @@ from PyQt5.QtGui import QImage
 
 logger = logging.getLogger(__name__)
 
-# Importar Thorlabs si esta disponible
-try:
-    from pylablib.devices import Thorlabs
-    THORLABS_AVAILABLE = True
-except ImportError:
-    THORLABS_AVAILABLE = False
-    logger.warning("pylablib no disponible para CameraWorker")
+# Importar Thorlabs desde módulo centralizado
+from config.hardware_availability import THORLABS_AVAILABLE, Thorlabs
 
 
 class CameraWorker(QThread):
@@ -36,9 +31,9 @@ class CameraWorker(QThread):
         super().__init__()
         self.cam = None
         self.running = False
-        self.exposure = 0.01
-        self.fps = 60
-        self.buffer_size = 2  # Buffer de 2: visualiza actual, guarda anterior
+        self.exposure = 0.02
+        self.fps = 30
+        self.buffer_size = 1  # Buffer de 2: visualiza actual, guarda anterior
         self.current_frame = None  # Para captura de imagen
         self.frame_count = 0  # Contador para limpieza periódica
     

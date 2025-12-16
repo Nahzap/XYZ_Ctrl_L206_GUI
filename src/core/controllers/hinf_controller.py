@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SynthesisConfig:
     """Configuración para síntesis H∞."""
-    K: float = 0.5598          # Ganancia de planta (µm/s/PWM)
-    tau: float = 0.033         # Constante de tiempo (s)
+    K: float = 1          # Ganancia de planta (µm/s/PWM)
+    tau: float = 0.001         # Constante de tiempo (s)
     Ms: float = 1.5            # Pico de sensibilidad
     wb: float = 5.0            # Ancho de banda (rad/s)
     eps: float = 0.3           # Epsilon para W1

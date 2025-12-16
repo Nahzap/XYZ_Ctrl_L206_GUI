@@ -14,7 +14,6 @@ import logging
 import numpy as np
 import cv2
 from typing import Tuple, List, Dict, Optional
-from dataclasses import dataclass
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -28,15 +27,8 @@ except ImportError:
     logger.warning("[U2NetDetector] PyTorch no disponible - usando detección por contornos")
 
 
-@dataclass
-class DetectedObject:
-    """Objeto detectado con sus propiedades."""
-    index: int
-    bbox: Tuple[int, int, int, int]  # (x, y, w, h)
-    area: int
-    probability: float
-    centroid: Tuple[int, int]
-    contour: Optional[np.ndarray] = None
+# Importar modelo unificado
+from core.models.detected_object import DetectedObject
 
 
 class U2NetDetector:

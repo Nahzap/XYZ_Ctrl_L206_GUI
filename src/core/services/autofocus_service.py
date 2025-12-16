@@ -15,24 +15,17 @@ import numpy as np
 import cv2
 
 from typing import List, Tuple, Optional, Callable
-from dataclasses import dataclass
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from core.detection.u2net_detector import DetectedObject
+from core.models.detected_object import DetectedObject
+from core.models.focus_result import AutofocusResult
 from core.autofocus.smart_focus_scorer import SmartFocusScorer
 
 logger = logging.getLogger('MotorControl_L206')
 
-
-@dataclass
-class FocusResult:
-    """Resultado de autofoco para un objeto."""
-    object_index: int
-    z_optimal: float
-    focus_score: float
-    bbox: Tuple[int, int, int, int]
-    frame: Optional[np.ndarray] = None
+# Alias para compatibilidad
+FocusResult = AutofocusResult
 
 
 class AutofocusService(QThread):

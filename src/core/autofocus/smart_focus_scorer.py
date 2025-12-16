@@ -1,17 +1,26 @@
 """
-Smart Focus Scorer - Evaluador de Enfoque Inteligente
-======================================================
+Smart Focus Scorer - Evaluador de Enfoque Inteligente UNIFICADO
+=================================================================
+
+Versión unificada que combina:
+- core/autofocus/smart_focus_scorer.py (métodos de autofoco)
+- img_analysis/smart_focus_scorer.py (U2-Net real, assess_image)
 
 Combina U2-Net para detección de objetos con métricas de nitidez
 para evaluar la calidad de enfoque en regiones de interés.
 
 Autor: Sistema de Control L206
+Fecha: 2025-12-15 (Unificación)
 """
 
 import numpy as np
 import cv2
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Union
+from pathlib import Path
+
+# Importar modelos unificados
+from core.models.focus_result import ObjectInfo, ImageAssessmentResult
 
 # PyTorch es opcional - solo necesario para U2-Net
 try:
@@ -20,7 +29,10 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('MotorControl_L206')
+
+# Constante para evitar división por cero
+EPSILON = 1e-10
 
 
 class SmartFocusScorer:
@@ -511,3 +523,296 @@ class SmartFocusScorer:
         )
 
         return smart_score, mask
+
+    # =========================================================================
+    # MÉTODOS DE img_analysis/smart_focus_scorer.py (UNIFICADOS)
+    # =========================================================================
+    
+    def _ensure_model_loaded(self) -> bool:
+        """
+        Carga el modelo U2-Net si no está cargado (lazy loading).
+        Intenta usar ai_segmentation.SalientObjectDetector si está disponible.
+        
+        Returns:
+            True si el modelo está listo, False si hay error
+        """
+        if hasattr(self, '_model_loaded') and self._model_loaded:
+            return True
+        
+        if hasattr(self, '_load_error') and self._load_error:
+            return False
+        
+        try:
+            from ai_segmentation import SalientObjectDetector
+            self._detector = SalientObjectDetector(
+                model_type=self.model_name,
+                device=str(self.device) if hasattr(self, 'device') else None,
+                auto_download=True
+            )
+            self._model_loaded = True
+            logger.info("[SmartFocusScorer] Modelo U2-Net cargado exitosamente via SalientObjectDetector")
+            return True
+        except ImportError:
+            # ai_segmentation no disponible, usar fallback
+            self._model_loaded = False
+            self._load_error = "ai_segmentation no disponible"
+            logger.info("[SmartFocusScorer] ai_segmentation no disponible - usando detección morfológica")
+            return False
+        except Exception as e:
+            self._load_error = str(e)
+            logger.error(f"[SmartFocusScorer] Error cargando U2-Net: {e}")
+            return False
+    
+    def _get_saliency_mask(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Obtiene la máscara de saliencia usando U2-Net o fallback morfológico.
+        
+        Args:
+            image: Imagen BGR o grayscale
+            
+        Returns:
+            (binary_mask, probability_map)
+        """
+        h, w = image.shape[:2]
+        
+        if self._ensure_model_loaded() and hasattr(self, '_detector'):
+            # Usar U2-Net real
+            prob_map = self._detector.get_mask(image, return_probability=True)
+            binary_mask = (prob_map > self.detection_threshold).astype(np.uint8) * 255
+            return binary_mask, prob_map
+        
+        # Fallback: usar detección morfológica
+        _, mask = self.get_smart_score(image)
+        # Crear mapa de probabilidad sintético basado en la máscara
+        prob_map = (mask.astype(np.float32) / 255.0) * 0.8  # Max prob 0.8 para fallback
+        return mask, prob_map
+    
+    def _find_all_objects(self, binary_mask: np.ndarray, prob_map: np.ndarray, 
+                          img_gray: np.ndarray, focus_threshold: float = 50.0) -> List[ObjectInfo]:
+        """
+        Encuentra TODOS los objetos válidos en la máscara, con sus scores individuales.
+        
+        Args:
+            binary_mask: Máscara binaria de saliencia
+            prob_map: Mapa de probabilidad para validar objetos reales
+            img_gray: Imagen en escala de grises para calcular focus
+            focus_threshold: Umbral para clasificar como enfocado
+            
+        Returns:
+            Lista de ObjectInfo ordenada por área (mayor primero)
+        """
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return []
+        
+        objects = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            
+            # Filtrar por área mínima
+            if area < self.min_object_area:
+                continue
+            
+            # Crear máscara para este contorno
+            contour_mask = np.zeros(binary_mask.shape, dtype=np.uint8)
+            cv2.drawContours(contour_mask, [c], -1, 255, -1)
+            
+            # Probabilidad promedio dentro del contorno
+            mean_prob = float(cv2.mean(prob_map, mask=contour_mask)[0])
+            
+            if mean_prob < self.min_probability:
+                continue
+            
+            # Bounding box
+            x, y, w, h = cv2.boundingRect(c)
+            
+            # Centroide
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx, cy = x + w // 2, y + h // 2
+            
+            # Calcular focus score para ESTE objeto
+            focus_score, raw_score = self._calculate_masked_focus(img_gray, contour_mask)
+            is_focused = focus_score >= focus_threshold
+            
+            objects.append(ObjectInfo(
+                contour=c,
+                bounding_box=(x, y, w, h),
+                centroid=(cx, cy),
+                area=area,
+                mean_probability=mean_prob,
+                focus_score=focus_score,
+                raw_score=raw_score,
+                is_focused=is_focused
+            ))
+        
+        # Ordenar por área (mayor primero)
+        objects.sort(key=lambda o: o.area, reverse=True)
+        
+        return objects
+    
+    def _calculate_masked_focus(self, img_gray: np.ndarray, mask: np.ndarray, 
+                                 use_laplacian: bool = True) -> Tuple[float, float]:
+        """
+        Calcula el score de enfoque SOLO en los píxeles de la máscara.
+        
+        Args:
+            img_gray: Imagen en escala de grises
+            mask: Máscara binaria (255 = objeto)
+            use_laplacian: Si True usa Laplacian, si False usa Brenner
+            
+        Returns:
+            (focus_score_normalized, raw_score)
+        """
+        mask_bool = mask > 127
+        n_pixels = np.sum(mask_bool)
+        
+        if n_pixels < 10:
+            return 0.0, 0.0
+        
+        if use_laplacian:
+            laplacian = cv2.Laplacian(img_gray, cv2.CV_64F)
+            masked_laplacian = laplacian[mask_bool]
+            raw_score = float(np.var(masked_laplacian))
+        else:
+            # Brenner gradient
+            img_float = img_gray.astype(np.float32)
+            diff_h = np.zeros_like(img_float)
+            diff_v = np.zeros_like(img_float)
+            diff_h[:, 2:] = img_float[:, 2:] - img_float[:, :-2]
+            diff_v[2:, :] = img_float[2:, :] - img_float[:-2, :]
+            energy = (diff_h ** 2 + diff_v ** 2)[mask_bool]
+            raw_score = float(np.mean(energy))
+        
+        focus_score = np.sqrt(raw_score)
+        return float(focus_score), float(raw_score)
+    
+    def assess_image(self, image: Union[str, Path, np.ndarray], 
+                     return_debug_mask: bool = True,
+                     focus_threshold: float = 50.0) -> ImageAssessmentResult:
+        """
+        Evalúa el enfoque de una imagen usando U2-Net o detección morfológica.
+        
+        Pipeline:
+        1. Obtener máscara de saliencia (U2-Net o morfológica)
+        2. Binarizar y encontrar objetos
+        3. Calcular enfoque SOLO en los píxeles del objeto
+        4. Clasificar: FOCUSED_OBJECT, BLURRY_OBJECT, EMPTY, MULTIPLE_OBJECTS
+        
+        Args:
+            image: Ruta a imagen o array numpy
+            return_debug_mask: Si True, incluye visualización de debug
+            focus_threshold: Umbral para clasificar como enfocado
+            
+        Returns:
+            ImageAssessmentResult con status, focus_score, objetos, etc.
+        """
+        # Cargar imagen
+        if isinstance(image, (str, Path)):
+            img_bgr = cv2.imread(str(image))
+            if img_bgr is None:
+                logger.error(f"[SmartFocusScorer] No se pudo cargar: {image}")
+                return ImageAssessmentResult(
+                    status="ERROR",
+                    focus_score=0.0,
+                    is_valid=False
+                )
+            img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            if len(image.shape) == 3:
+                img_bgr = image
+                img_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                img_gray = image
+                img_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        
+        # Normalizar uint16 si es necesario
+        if img_gray.dtype == np.uint16:
+            img_gray = (img_gray / 256).astype(np.uint8)
+        
+        # PASO 1: Obtener máscara de saliencia
+        binary_mask, prob_map = self._get_saliency_mask(img_bgr)
+        
+        # PASO 2: Encontrar TODOS los objetos válidos
+        objects = self._find_all_objects(binary_mask, prob_map, img_gray, focus_threshold)
+        num_objects = len(objects)
+        
+        global_mean_prob = float(np.mean(prob_map))
+        
+        if not objects:
+            logger.debug(f"[SmartFocusScorer] EMPTY: No se encontró objeto")
+            return ImageAssessmentResult(
+                status="EMPTY",
+                focus_score=0.0,
+                is_valid=False,
+                num_objects=0,
+                mean_probability=global_mean_prob,
+                objects=[],
+                binary_mask=binary_mask,
+                probability_map=prob_map
+            )
+        
+        main_obj = objects[0]
+        focused_count = sum(1 for o in objects if o.is_focused)
+        
+        # PASO 3: Clasificar
+        if num_objects > 1:
+            status = "MULTIPLE_OBJECTS"
+        elif main_obj.is_focused:
+            status = "FOCUSED_OBJECT"
+        else:
+            status = "BLURRY_OBJECT"
+        
+        logger.debug(f"[SmartFocusScorer] {status}: {num_objects} obj, {focused_count} focused, "
+                    f"main_score={main_obj.focus_score:.2f}")
+        
+        return ImageAssessmentResult(
+            status=status,
+            focus_score=main_obj.focus_score,
+            centroid=main_obj.centroid,
+            bounding_box=main_obj.bounding_box,
+            contour_area=main_obj.area,
+            raw_score=main_obj.raw_score,
+            is_valid=True,
+            num_objects=num_objects,
+            mean_probability=main_obj.mean_probability,
+            objects=objects,
+            binary_mask=binary_mask,
+            probability_map=prob_map
+        )
+    
+    def set_parameters(self, threshold: float = None, min_area: int = None, 
+                      max_area: int = None, focus_threshold: float = None):
+        """Actualiza parámetros dinámicamente."""
+        if threshold is not None:
+            self.detection_threshold = threshold
+        if min_area is not None:
+            self.min_object_area = min_area
+        if max_area is not None:
+            self.max_object_area = max_area
+        if focus_threshold is not None:
+            self.focus_threshold = focus_threshold
+    
+    def get_parameters(self) -> Dict:
+        """Retorna parámetros actuales."""
+        return {
+            'model_name': self.model_name,
+            'detection_threshold': self.detection_threshold,
+            'min_object_area': self.min_object_area,
+            'min_probability': self.min_probability,
+            'min_circularity': self.min_circularity,
+            'min_aspect_ratio': self.min_aspect_ratio,
+            'model_loaded': getattr(self, '_model_loaded', False)
+        }
+    
+    def is_model_loaded(self) -> bool:
+        """Verifica si el modelo U2-Net está cargado."""
+        return getattr(self, '_model_loaded', False)
+
+
+# Alias para compatibilidad con código que importa FocusResult desde aquí
+FocusResult = ImageAssessmentResult

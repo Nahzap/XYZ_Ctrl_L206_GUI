@@ -18,14 +18,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QComboBox, QSpinBox, QDoubleSpinBox, QScrollArea)
 from PyQt5.QtCore import pyqtSignal, Qt
 
-# Imports para lógica de cámara
-try:
-    import pylablib as pll
-    pll.par["devices/dlls/thorlabs_tlcam"] = r"C:\Program Files\Thorlabs\ThorImageCAM\Bin"
-    from pylablib.devices import Thorlabs
-    THORLABS_AVAILABLE = True
-except:
-    THORLABS_AVAILABLE = False
+# Imports para lógica de cámara (centralizado)
+from config.hardware_availability import THORLABS_AVAILABLE
 
 from gui.windows.camera_window import CameraViewWindow
 

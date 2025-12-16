@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
 
-from img_analysis.smart_focus_scorer import SmartFocusScorer, FocusResult
+# SmartFocusScorer viene de core.autofocus (versión unificada), re-exportado por img_analysis
+from img_analysis import SmartFocusScorer, FocusResult
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -125,13 +126,12 @@ class ImgAnalysisTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         
-        # Scorer U2-Net
+        # Scorer U2-Net (versión unificada desde core.autofocus)
         self.scorer = SmartFocusScorer(
-            model_type='u2netp',
-            threshold=0.5,
-            min_area=500,
-            min_prob=0.3,
-            focus_threshold=20.0,
+            model_name='u2netp',
+            detection_threshold=0.5,
+            min_object_area=500,
+            min_probability=0.3,
             min_circularity=0.45,
             min_aspect_ratio=0.4
         )
