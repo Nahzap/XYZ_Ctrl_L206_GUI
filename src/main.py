@@ -636,8 +636,9 @@ class ArduinoGUI(QMainWindow):
             return
 
         # Si estamos en microscopia, delegar captura y avance al servicio
+        # Pasar los resultados del autofoco que incluyen el frame ya capturado en BPoF
         if hasattr(self, 'microscopy_service') and self.microscopy_service.is_running():
-            self.microscopy_service.handle_autofocus_complete()
+            self.microscopy_service.handle_autofocus_complete(results)
     
     def _on_show_autofocus_masks(self, masks_data):
         """Muestra máscaras de autofoco en la ventana de cámara."""

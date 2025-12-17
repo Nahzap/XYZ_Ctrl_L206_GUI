@@ -116,23 +116,16 @@ class CameraTab(QWidget):
         self.set_trajectory_status(False, 0)
         return False
     
-    def _setup_ui(self):
-        """Configura la interfaz de usuario."""
-        # Crear scroll area para permitir navegación vertical
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    # =========================================================================
+    # MÉTODOS DE CREACIÓN DE UI (Secciones modulares)
+    # =========================================================================
+    
+    def _create_connection_section(self) -> QGroupBox:
+        """Crea la sección de conexión de cámara."""
+        group = QGroupBox("1️⃣ Conexión")
+        layout = QVBoxLayout()
         
-        # Widget contenedor para el contenido
-        content_widget = QWidget()
-        main_layout = QVBoxLayout(content_widget)
-        
-        # Sección 1: Conexión
-        connection_group = QGroupBox("1️⃣ Conexión")
-        conn_layout = QVBoxLayout()
-        
-        conn_buttons = QHBoxLayout()
+        btn_layout = QHBoxLayout()
         self.connect_btn = QPushButton("🔌 Conectar Cámara")
         self.connect_btn.setStyleSheet("""
             QPushButton { font-size: 13px; font-weight: bold; padding: 8px; background-color: #27AE60; }
@@ -153,24 +146,25 @@ class CameraTab(QWidget):
             self.connect_btn.setText("⚠️ pylablib no instalado")
             self.detect_btn.setEnabled(False)
         
-        conn_buttons.addWidget(self.connect_btn)
-        conn_buttons.addWidget(self.disconnect_btn)
-        conn_buttons.addWidget(self.detect_btn)
-        conn_buttons.addStretch()
-        conn_layout.addLayout(conn_buttons)
+        btn_layout.addWidget(self.connect_btn)
+        btn_layout.addWidget(self.disconnect_btn)
+        btn_layout.addWidget(self.detect_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
         
         self.camera_info_label = QLabel("Estado: Desconectada")
         self.camera_info_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
-        conn_layout.addWidget(self.camera_info_label)
+        layout.addWidget(self.camera_info_label)
         
-        connection_group.setLayout(conn_layout)
-        main_layout.addWidget(connection_group)
+        group.setLayout(layout)
+        return group
+    
+    def _create_live_view_section(self) -> QGroupBox:
+        """Crea la sección de vista en vivo."""
+        group = QGroupBox("2️⃣ Vista en Vivo")
+        layout = QVBoxLayout()
         
-        # Sección 2: Vista en Vivo
-        view_group = QGroupBox("2️⃣ Vista en Vivo")
-        view_layout = QVBoxLayout()
-        
-        view_buttons = QHBoxLayout()
+        btn_layout = QHBoxLayout()
         self.view_btn = QPushButton("📹 Ver Cámara")
         self.view_btn.setStyleSheet("""
             QPushButton { font-size: 13px; font-weight: bold; padding: 8px; background-color: #2E86C1; }
@@ -188,68 +182,71 @@ class CameraTab(QWidget):
         self.stop_live_btn.setEnabled(False)
         self.stop_live_btn.clicked.connect(self.stop_camera_live_view)
         
-        view_buttons.addWidget(self.view_btn)
-        view_buttons.addWidget(self.start_live_btn)
-        view_buttons.addWidget(self.stop_live_btn)
-        view_buttons.addStretch()
-        view_layout.addLayout(view_buttons)
+        btn_layout.addWidget(self.view_btn)
+        btn_layout.addWidget(self.start_live_btn)
+        btn_layout.addWidget(self.stop_live_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
         
-        view_group.setLayout(view_layout)
-        main_layout.addWidget(view_group)
-        
-        # Sección 3: Configuración
-        config_group = QGroupBox("3️⃣ Configuración")
-        config_layout = QGridLayout()
+        group.setLayout(layout)
+        return group
+    
+    def _create_config_section(self) -> QGroupBox:
+        """Crea la sección de configuración de cámara."""
+        group = QGroupBox("3️⃣ Configuración")
+        layout = QGridLayout()
         
         # Exposición
-        config_layout.addWidget(QLabel("Exposición (s):"), 0, 0)
+        layout.addWidget(QLabel("Exposición (s):"), 0, 0)
         self.exposure_input = QLineEdit("0.015")
         self.exposure_input.setFixedWidth(100)
-        config_layout.addWidget(self.exposure_input, 0, 1)
+        layout.addWidget(self.exposure_input, 0, 1)
         
         self.apply_exposure_btn = QPushButton("✓ Aplicar")
         self.apply_exposure_btn.setEnabled(False)
         self.apply_exposure_btn.setFixedWidth(80)
         self.apply_exposure_btn.clicked.connect(self._apply_exposure)
-        config_layout.addWidget(self.apply_exposure_btn, 0, 2)
+        layout.addWidget(self.apply_exposure_btn, 0, 2)
         
         # FPS
-        config_layout.addWidget(QLabel("FPS:"), 1, 0)
+        layout.addWidget(QLabel("FPS:"), 1, 0)
         self.fps_input = QLineEdit("30")
         self.fps_input.setFixedWidth(100)
-        config_layout.addWidget(self.fps_input, 1, 1)
+        layout.addWidget(self.fps_input, 1, 1)
         
         self.apply_fps_btn = QPushButton("✓ Aplicar")
         self.apply_fps_btn.setEnabled(False)
         self.apply_fps_btn.setFixedWidth(80)
         self.apply_fps_btn.clicked.connect(self._apply_fps)
-        config_layout.addWidget(self.apply_fps_btn, 1, 2)
+        layout.addWidget(self.apply_fps_btn, 1, 2)
         
         # Buffer de imágenes
-        config_layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
-        self.buffer_input = QLineEdit("1")  # Predeterminado: 1 frame
+        layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
+        self.buffer_input = QLineEdit("1")
         self.buffer_input.setFixedWidth(100)
         self.buffer_input.setToolTip("Número de frames en buffer (1-10). Usar 2 para estabilidad.")
-        config_layout.addWidget(self.buffer_input, 2, 1)
+        layout.addWidget(self.buffer_input, 2, 1)
         
         self.apply_buffer_btn = QPushButton("✓ Aplicar")
         self.apply_buffer_btn.setEnabled(False)
         self.apply_buffer_btn.setFixedWidth(80)
         self.apply_buffer_btn.clicked.connect(self._apply_buffer)
-        config_layout.addWidget(self.apply_buffer_btn, 2, 2)
+        layout.addWidget(self.apply_buffer_btn, 2, 2)
         
         # Info de buffer
         buffer_info = QLabel("ℹ️ Buffer=2 recomendado: visualiza frame actual, guarda el anterior")
         buffer_info.setStyleSheet("color: #888888; font-size: 10px;")
-        config_layout.addWidget(buffer_info, 3, 0, 1, 3)
+        layout.addWidget(buffer_info, 3, 0, 1, 3)
         
-        config_group.setLayout(config_layout)
-        main_layout.addWidget(config_group)
+        group.setLayout(layout)
+        return group
+    
+    def _create_capture_section(self) -> QGroupBox:
+        """Crea la sección de captura de imágenes."""
+        group = QGroupBox("4️⃣ Captura de Imágenes")
+        layout = QVBoxLayout()
         
-        # Sección 4: Captura
-        capture_group = QGroupBox("4️⃣ Captura de Imágenes")
-        capture_layout = QVBoxLayout()
-        
+        # Carpeta
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(QLabel("Carpeta:"))
         self.save_folder_input = QLineEdit(r"C:\CapturasCamara")
@@ -258,21 +255,22 @@ class CameraTab(QWidget):
         browse_btn = QPushButton("📁 Explorar")
         browse_btn.clicked.connect(self._browse_folder)
         folder_layout.addWidget(browse_btn)
-        capture_layout.addLayout(folder_layout)
+        layout.addLayout(folder_layout)
         
-        # Fila de formato de imagen
+        # Formato de imagen
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("Formato:"))
         self.image_format_combo = QComboBox()
         self.image_format_combo.addItems(["PNG", "TIFF", "JPG"])
-        self.image_format_combo.setCurrentText("PNG")  # Default PNG
+        self.image_format_combo.setCurrentText("PNG")
         self.image_format_combo.setFixedWidth(80)
         self.image_format_combo.setToolTip("Formato de imagen para capturas")
         format_layout.addWidget(self.image_format_combo)
         format_layout.addStretch()
-        capture_layout.addLayout(format_layout)
+        layout.addLayout(format_layout)
         
-        capture_btn_layout = QHBoxLayout()
+        # Botones de captura
+        btn_layout = QHBoxLayout()
         self.capture_btn = QPushButton("📸 Capturar Imagen")
         self.capture_btn.setStyleSheet("""
             QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #E67E22; }
@@ -281,9 +279,8 @@ class CameraTab(QWidget):
         """)
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self.capture_single_image)
-        capture_btn_layout.addWidget(self.capture_btn)
+        btn_layout.addWidget(self.capture_btn)
         
-        # Botón para enfocar objetos sin capturar
         self.focus_btn = QPushButton("🎯 Enfocar Objs")
         self.focus_btn.setStyleSheet("""
             QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #9B59B6; }
@@ -292,13 +289,30 @@ class CameraTab(QWidget):
         """)
         self.focus_btn.setEnabled(False)
         self.focus_btn.clicked.connect(self._focus_objects_only)
-        capture_btn_layout.addWidget(self.focus_btn)
+        btn_layout.addWidget(self.focus_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
         
-        capture_btn_layout.addStretch()
-        capture_layout.addLayout(capture_btn_layout)
+        group.setLayout(layout)
+        return group
+    
+    def _setup_ui(self):
+        """Configura la interfaz de usuario."""
+        # Crear scroll area para permitir navegación vertical
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
-        capture_group.setLayout(capture_layout)
-        main_layout.addWidget(capture_group)
+        # Widget contenedor para el contenido
+        content_widget = QWidget()
+        main_layout = QVBoxLayout(content_widget)
+        
+        # Agregar secciones modulares
+        main_layout.addWidget(self._create_connection_section())
+        main_layout.addWidget(self._create_live_view_section())
+        main_layout.addWidget(self._create_config_section())
+        main_layout.addWidget(self._create_capture_section())
         
         # Sección 5: Microscopía Automatizada
         microscopy_group = QGroupBox("🔬 Microscopía Automatizada")
@@ -793,6 +807,10 @@ class CameraTab(QWidget):
         self._microscopy_image_counter = 0
         self.set_microscopy_progress(0, config['n_points'])
         
+        # Habilitar botones de control en ventana de cámara
+        if self.camera_view_window:
+            self.camera_view_window.set_microscopy_active(True, 0)
+        
         # Emitir señal con configuración
         self.microscopy_start_requested.emit(config)
     
@@ -801,6 +819,11 @@ class CameraTab(QWidget):
         self.log_message("⏹️ DETENIENDO MICROSCOPÍA...")
         self.microscopy_start_btn.setEnabled(True)
         self.microscopy_stop_btn.setEnabled(False)
+        
+        # Deshabilitar botones de control en ventana de cámara
+        if self.camera_view_window:
+            self.camera_view_window.set_microscopy_active(False)
+        
         self.microscopy_stop_requested.emit()
     
     # === Métodos para actualizar estado desde el padre ===

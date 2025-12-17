@@ -84,6 +84,44 @@ from config.hardware_availability import THORLABS_AVAILABLE, Thorlabs
 
 ---
 
+## ✅ Refactorización Realizada (2025-12-16)
+
+### Métodos Modulares Creados
+
+Se extrajeron las secciones de UI en métodos independientes para mejorar legibilidad:
+
+| Método | Sección | Descripción |
+|--------|---------|-------------|
+| `_create_connection_section()` | 1️⃣ Conexión | Botones conectar/desconectar/detectar |
+| `_create_live_view_section()` | 2️⃣ Vista en Vivo | Botones ver/iniciar/detener |
+| `_create_config_section()` | 3️⃣ Configuración | Exposición, FPS, Buffer |
+| `_create_capture_section()` | 4️⃣ Captura | Carpeta, formato, botones captura |
+
+### Estructura de `_setup_ui()` Simplificada
+
+```python
+def _setup_ui(self):
+    # Agregar secciones modulares
+    main_layout.addWidget(self._create_connection_section())
+    main_layout.addWidget(self._create_live_view_section())
+    main_layout.addWidget(self._create_config_section())
+    main_layout.addWidget(self._create_capture_section())
+    
+    # Secciones restantes (microscopía, autofoco, log)
+    # ... código inline por ahora
+```
+
+### Backups Creados
+
+Ubicación: `backup_camera_2025-12-16/`
+- `camera_tab.py` (68,688 bytes)
+- `camera_window.py` (21,824 bytes)
+- `camera_worker.py` (18,114 bytes)
+- `camera_service.py` (5,736 bytes)
+- `microscopy_service.py` (29,223 bytes)
+
+---
+
 ## 📋 Análisis de CameraTab (1,425 líneas)
 
 ### Secciones Identificadas

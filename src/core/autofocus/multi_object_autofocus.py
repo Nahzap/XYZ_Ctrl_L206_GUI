@@ -294,9 +294,10 @@ class MultiObjectAutofocusController:
             
             logger.info(f"Autofoco Obj{obj.index} completado: Z={z_optimal:.2f}µm, S={final_score:.1f}")
         
-        # Mover a posición óptima final
+        # Mover a posición óptima final con estabilización extendida (500ms)
+        logger.info(f"[Autofocus] Moviendo a BPoF Z={z_optimal:.1f}µm y esperando 500ms para captura...")
         self.cfocus.move_z(z_optimal)
-        time.sleep(0.05)  # Settle time mínimo
+        time.sleep(0.50)  # 500ms de estabilización para captura nítida
         
         return z_optimal, final_score
     

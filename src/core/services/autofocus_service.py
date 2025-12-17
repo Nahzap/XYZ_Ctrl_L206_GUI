@@ -62,11 +62,15 @@ class AutofocusService(QThread):
         self.objects_to_focus: List[DetectedObject] = []
         
         # Parámetros de escaneo
-        self.z_step_coarse = 5.0  # µm - paso grueso
-        self.z_step_fine = 1.0   # µm - paso fino
-        self.z_search_range = 40.0  # µm - rango de búsqueda
+        self.z_step_coarse = 5.0  # µm - paso grueso inicial
+        self.z_step_fine = 1.0   # µm - paso fino para refinamiento
+        self.z_search_range = 40.0  # µm - rango de búsqueda (ignorado en full scan)
         self.z_tolerance = 0.5  # µm - tolerancia
-        self.settle_time = 0.05  # segundos
+        self.settle_time = 0.10  # segundos - tiempo de estabilización base
+        self.capture_settle_time = 0.50  # segundos - tiempo para captura final (500ms)
+        
+        # Registro del máximo Z encontrado (para optimizar futuros escaneos)
+        self.z_max_recorded = None  # Se actualiza tras primer escaneo completo
         
         # Control
         self.running = False
@@ -153,18 +157,9 @@ class AutofocusService(QThread):
                 logger.error(f"[AutofocusService] Error en objeto {i}: {e}")
                 self.error_occurred.emit(f"Error en objeto {i}: {e}")
         
-        # MEJORA: Retornar a la mitad del rango Z después de completar autofoco
-        # Esto permite que el siguiente punto comience desde la posición central
-        if self.cfocus_controller and len(results) > 0:
-            try:
-                z_current = self.cfocus_controller.read_z()
-                z_mid = 50.0  # Mitad del rango 0-100µm
-                logger.info(f"[AutofocusService] Retornando de Z={z_current:.1f}µm a posición central Z={z_mid:.1f}µm")
-                self.cfocus_controller.move_z(z_mid)
-                time.sleep(self.settle_time * 2)
-                logger.info(f"[AutofocusService] ✓ Eje Z retornado a posición central para próximo punto")
-            except Exception as e:
-                logger.warning(f"[AutofocusService] No se pudo retornar a posición central: {e}")
+        # NOTA: NO mover Z después del autofoco - el frame ya fue capturado en BPoF
+        # El sistema debe permanecer en BPoF hasta que se guarde la imagen
+        # El movimiento a posición central se hace DESPUÉS de guardar la imagen
         
         self.running = False
         self.scan_complete.emit(results)
@@ -172,75 +167,100 @@ class AutofocusService(QThread):
     
     def _scan_single_object(self, obj, obj_index: int) -> FocusResult:
         """
-        Algoritmo de autofoco bidireccional desde punto medio.
+        Algoritmo de autofoco con ESCANEO COMPLETO desde Z=0 hasta Z_max.
         
-        1. Guarda posición Z inicial (referencia)
-        2. Mueve al punto medio del rango de búsqueda
-        3. Busca el Best Plane of Focus hacia arriba y abajo
-        4. Captura en el BPoF
-        5. Vuelve a la posición de referencia inicial
+        MEJORAS IMPLEMENTADAS:
+        1. Siempre empieza desde Z=0 (punto más bajo)
+        2. Escaneo completo 0→max registrando todos los scores
+        3. Refinamiento alrededor del pico encontrado
+        4. Captura con 500ms de estabilización cuando S está magnificado
+        5. Registra Z_max para futuros escaneos
+        6. Calcula sharpness SOLO sobre la máscara del objeto (U2-Net)
         """
         bbox = obj.bounding_box
-        
-        # PASO 1: Guardar posición Z inicial (referencia)
-        reference_z = self.cfocus_controller.read_z()
-        if reference_z is None:
-            reference_z = 50.0  # Fallback
-        
-        logger.info(f"[Autofocus] Posición de referencia guardada: Z={reference_z:.1f}µm")
+        # Obtener contorno del objeto para calcular sharpness solo sobre la máscara
+        contour = getattr(obj, 'contour', None)
         
         # Obtener rango calibrado del C-Focus
         z_max_hardware = self.cfocus_controller.get_z_range()
         if z_max_hardware is None or z_max_hardware <= 0:
-            z_max_hardware = 100.0  # Fallback
+            z_max_hardware = 80.0  # Fallback
         
-        # PASO 2: Calcular punto medio del rango de búsqueda
-        # Usar z_search_range (ej: 50µm) centrado en la referencia
-        z_min = max(0, reference_z - self.z_search_range / 2)
-        z_max = min(z_max_hardware, reference_z + self.z_search_range / 2)
-        z_mid = (z_min + z_max) / 2
+        # PASO 1: Mover a Z=0 (punto más bajo)
+        logger.info(f"[Autofocus] Iniciando escaneo completo: Z=0 → {z_max_hardware:.1f}µm")
+        self.cfocus_controller.move_z(0.0)
+        time.sleep(self.settle_time * 2)  # Estabilización inicial
         
-        logger.info(f"[Autofocus] Rango de búsqueda: [{z_min:.1f}, {z_max:.1f}]µm")
-        logger.info(f"[Autofocus] Moviendo a punto medio: Z={z_mid:.1f}µm")
+        # PASO 2: ESCANEO COMPLETO 0→max con paso grueso
+        z_positions = []
+        sharpness_scores = []
+        z_current = 0.0
+        step = self.z_step_coarse  # 5µm por defecto
         
-        # Mover al punto medio
-        self.cfocus_controller.move_z(z_mid)
-        time.sleep(self.settle_time * 2)  # Esperar estabilización
+        logger.info(f"[Autofocus] Paso grueso: {step}µm, evaluaciones estimadas: {int(z_max_hardware/step)+1}")
         
-        # PASO 3: Buscar el Best Plane of Focus con Hill-Climbing bidireccional
-        best_z = z_mid
-        best_score = self._get_score_at_z(z_mid, bbox)
-        logger.debug(f"[Autofocus] Inicio desde medio: Z={best_z:.1f}µm, S={best_score:.2f}")
-        
-        # Parámetros de hill-climbing
-        step = self.z_step_coarse  # Empezar con paso grueso
-        min_step = self.z_step_fine  # Paso mínimo para convergencia
-        direction = 1  # 1 = subir, -1 = bajar
-        max_iterations = 30  # Límite de seguridad
-        no_improvement_count = 0
-        
-        for iteration in range(max_iterations):
+        while z_current <= z_max_hardware:
             if self.cancel_requested:
                 break
             
-            # Calcular nueva posición
-            new_z = best_z + (direction * step)
+            # Mover y esperar estabilización
+            self.cfocus_controller.move_z(z_current)
+            time.sleep(self.settle_time)
             
-            # Verificar límites del rango de búsqueda
-            if new_z < z_min or new_z > z_max:
-                # Cambiar dirección si llegamos al límite
-                direction *= -1
-                new_z = best_z + (direction * step)
-                if new_z < z_min or new_z > z_max:
-                    # Ambas direcciones fuera de rango, reducir paso
-                    step = step / 2
-                    if step < min_step:
-                        break
-                    continue
+            # Obtener score estable (usando máscara del contorno U2-Net)
+            score = self._get_stable_score(bbox, contour, n_samples=2)
+            z_positions.append(z_current)
+            sharpness_scores.append(score)
             
-            # Medir score en nueva posición
-            new_score = self._get_score_at_z(new_z, bbox)
-            logger.debug(f"[Autofocus] #{iteration}: Z={new_z:.1f}µm, S={new_score:.2f} (best={best_score:.2f})")
+            # Emitir progreso para visualización
+            frame = self.get_frame_callback()
+            if frame is not None:
+                x, y, w, h = bbox
+                if y+h <= frame.shape[0] and x+w <= frame.shape[1]:
+                    roi_frame = frame[y:y+h, x:x+w].copy()
+                    self.z_changed.emit(z_current, score, roi_frame)
+            
+            logger.debug(f"[Autofocus] Z={z_current:.1f}µm, S={score:.2f}")
+            z_current += step
+        
+        if not z_positions:
+            logger.error("[Autofocus] No se pudo evaluar ninguna posición Z")
+            return FocusResult(
+                object_index=obj_index,
+                z_optimal=0.0,
+                focus_score=0.0,
+                bbox=bbox,
+                frame=None
+            )
+        
+        # PASO 3: Encontrar el pico (máximo S)
+        max_idx = int(np.argmax(sharpness_scores))
+        z_peak = z_positions[max_idx]
+        peak_score = sharpness_scores[max_idx]
+        
+        logger.info(f"[Autofocus] Pico encontrado: Z={z_peak:.1f}µm, S={peak_score:.2f} ({len(z_positions)} evaluaciones)")
+        
+        # Registrar Z_max para futuros escaneos (optimización)
+        self.z_max_recorded = z_peak
+        
+        # PASO 4: REFINAMIENTO alrededor del pico con paso fino
+        logger.info(f"[Autofocus] Refinando ±{self.z_step_coarse}µm con paso {self.z_step_fine}µm")
+        
+        z_refine_min = max(0.0, z_peak - self.z_step_coarse)
+        z_refine_max = min(z_max_hardware, z_peak + self.z_step_coarse)
+        
+        best_z = z_peak
+        best_score = peak_score
+        
+        z_refine = z_refine_min
+        while z_refine <= z_refine_max:
+            if self.cancel_requested:
+                break
+            
+            self.cfocus_controller.move_z(z_refine)
+            time.sleep(self.settle_time)
+            
+            score = self._get_stable_score(bbox, contour, n_samples=2)
             
             # Emitir progreso
             frame = self.get_frame_callback()
@@ -248,52 +268,77 @@ class AutofocusService(QThread):
                 x, y, w, h = bbox
                 if y+h <= frame.shape[0] and x+w <= frame.shape[1]:
                     roi_frame = frame[y:y+h, x:x+w].copy()
-                    self.z_changed.emit(new_z, new_score, roi_frame)
+                    self.z_changed.emit(z_refine, score, roi_frame)
             
-            if new_score > best_score:
-                # Mejora! Continuar en esta dirección
-                best_z = new_z
-                best_score = new_score
-                no_improvement_count = 0
+            if score > best_score:
+                best_z = z_refine
+                best_score = score
+                logger.debug(f"[Autofocus] Refinamiento: Z={z_refine:.1f}µm, S={score:.2f} ★ NUEVO MEJOR")
             else:
-                # No mejora
-                no_improvement_count += 1
-                
-                if no_improvement_count >= 2:
-                    # Dos fallos seguidos: reducir paso y cambiar dirección
-                    step = step / 2
-                    direction *= -1
-                    no_improvement_count = 0
-                    
-                    if step < min_step:
-                        # Convergencia alcanzada
-                        logger.info(f"[Autofocus] Convergencia en Z={best_z:.1f}µm, S={best_score:.2f}")
-                        break
-                else:
-                    # Primer fallo: cambiar dirección
-                    direction *= -1
+                logger.debug(f"[Autofocus] Refinamiento: Z={z_refine:.1f}µm, S={score:.2f}")
+            
+            z_refine += self.z_step_fine
         
-        # PASO 4: Mover al BPoF para captura
-        logger.info(f"[Autofocus] BPoF encontrado: Z={best_z:.1f}µm, S={best_score:.2f}")
+        # PASO 5: CAPTURA PRINCIPAL en BPoF con estabilización extendida (500ms)
+        logger.info(f"[Autofocus] BPoF final: Z={best_z:.1f}µm, S={best_score:.2f}")
+        logger.info(f"[Autofocus] Moviendo a BPoF y esperando {self.capture_settle_time*1000:.0f}ms para captura...")
+        
         self.cfocus_controller.move_z(best_z)
-        time.sleep(self.settle_time * 2)
+        time.sleep(self.capture_settle_time)  # 500ms de estabilización para captura nítida
         
-        # Capturar frame en el BPoF
+        # Capturar frame en el BPoF con S magnificado
         final_frame = self.get_frame_callback()
-        logger.info(f"[Autofocus] Frame capturado en BPoF: Z={best_z:.1f}µm")
         
-        # PASO 5: QUEDARSE EN EL BPoF (NO volver a referencia)
-        # La imagen debe capturarse AQUÍ, en el plano de mejor enfoque
+        # Verificar score final (debe estar cerca del máximo)
+        final_score = self._get_stable_score(bbox, contour, n_samples=3)
+        logger.info(f"[Autofocus] ✓ Frame 1 (BPoF) capturado: Z={best_z:.1f}µm, S={final_score:.2f}")
+        
+        # PASO 6: CAPTURA ALTERNATIVA (segundo mejor foco o offset)
+        # Buscar el segundo mejor pico en los datos del escaneo
+        z_alt = None
+        score_alt = 0.0
+        frame_alt = None
+        
+        # Estrategia: usar un offset de ±10µm desde el BPoF para captura alternativa
+        alt_offset = 10.0  # µm de diferencia
+        
+        # Elegir dirección del offset (hacia donde hay más rango disponible)
+        if best_z + alt_offset <= z_max_hardware:
+            z_alt = best_z + alt_offset
+        elif best_z - alt_offset >= 0:
+            z_alt = best_z - alt_offset
+        else:
+            z_alt = best_z + (alt_offset / 2)  # Fallback: medio offset
+        
+        logger.info(f"[Autofocus] Capturando imagen alternativa en Z={z_alt:.1f}µm (offset={z_alt-best_z:+.1f}µm)")
+        
+        self.cfocus_controller.move_z(z_alt)
+        time.sleep(self.capture_settle_time)  # 500ms de estabilización
+        
+        frame_alt = self.get_frame_callback()
+        score_alt = self._get_stable_score(bbox, contour, n_samples=2)
+        
+        logger.info(f"[Autofocus] ✓ Frame 2 (alternativo) capturado: Z={z_alt:.1f}µm, S={score_alt:.2f}")
+        
+        # IMPORTANTE: Volver a BPoF para dejar el sistema enfocado
+        logger.info(f"[Autofocus] Regresando a BPoF: Z={best_z:.1f}µm")
+        self.cfocus_controller.move_z(best_z)
+        time.sleep(self.capture_settle_time)  # Estabilizar en posición óptima
+        
+        # Verificar posición final (debe ser BPoF)
         final_z = self.cfocus_controller.read_z()
         if final_z is not None:
-            logger.info(f"[Autofocus] ✓ Posición final en BPoF: Z={final_z:.1f}µm (objetivo={best_z:.1f}µm)")
+            logger.info(f"[Autofocus] ✓ Posición final verificada: Z={final_z:.1f}µm (BPoF={best_z:.1f}µm)")
         
         return FocusResult(
             object_index=obj_index,
             z_optimal=best_z,
             focus_score=best_score,
             bbox=bbox,
-            frame=final_frame
+            frame=final_frame,
+            frame_alt=frame_alt,
+            z_alt=z_alt,
+            score_alt=score_alt
         )
     
     def _get_score_at_z(self, z: float, bbox: Tuple[int, int, int, int]) -> float:
@@ -302,29 +347,40 @@ class AutofocusService(QThread):
         time.sleep(self.settle_time)
         return self._get_stable_score(bbox, n_samples=2)  # Solo 2 muestras para velocidad
     
-    def _get_stable_score(self, bbox: Tuple[int, int, int, int], n_samples: int = 3) -> float:
+    def _get_stable_score(self, bbox: Tuple[int, int, int, int], contour: np.ndarray = None, n_samples: int = 3) -> float:
         """
         Obtiene un score estable promediando múltiples lecturas.
-        Esto reduce el ruido y mejora la reproducibilidad.
+        Calcula sharpness SOLO sobre los píxeles de la máscara (contorno).
         """
         scores = []
-        for _ in range(n_samples):
+        for i in range(n_samples):
             frame = self.get_frame_callback()
             if frame is not None:
-                score = self._calculate_sharpness(frame, bbox)
+                # Verificar que el frame tiene contenido
+                if frame.size == 0:
+                    logger.warning(f"[Autofocus] Frame {i} vacío")
+                    continue
+                    
+                score = self._calculate_sharpness(frame, bbox, contour)
                 scores.append(score)
+            else:
+                logger.warning(f"[Autofocus] Frame {i} es None")
             time.sleep(0.02)  # Pequeña pausa entre lecturas
         
         if scores:
-            return float(np.median(scores))  # Mediana es más robusta que promedio
+            median_score = float(np.median(scores))
+            return median_score
+        
+        logger.warning(f"[Autofocus] No se obtuvieron scores válidos para bbox={bbox}")
         return 0.0
     
-    def _calculate_sharpness(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    def _calculate_sharpness(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], 
+                              contour: np.ndarray = None) -> float:
         """
-        Calcula el índice de nitidez combinando múltiples métricas:
-        - Laplacian Variance (bordes)
-        - Tenengrad (gradiente Sobel)
-        - Normalized Variance
+        Calcula el índice de nitidez SOLO sobre los píxeles de la máscara del objeto.
+        
+        Si se proporciona un contorno (de U2-Net), crea una máscara y calcula
+        el sharpness solo sobre esos píxeles. Si no, usa todo el bbox.
         """
         x, y, w, h = bbox
         h_frame, w_frame = frame.shape[:2]
@@ -336,43 +392,69 @@ class AutofocusService(QThread):
         h = min(h, h_frame - y)
         
         if w <= 0 or h <= 0:
+            logger.warning(f"[Autofocus] bbox inválido: w={w}, h={h}")
             return 0.0
         
-        # Extraer ROI (región del objeto) y aplicar SmartFocusScorer sobre ella
+        # Extraer ROI (región del objeto)
         roi = frame[y:y+h, x:x+w]
-        try:
-            if hasattr(self, "_focus_scorer") and self._focus_scorer is not None:
-                smart_score, _ = self._focus_scorer.get_smart_score(roi)
-                return float(smart_score)
-        except Exception as e:
-            logger.error(f"[AutofocusService] Error en SmartFocusScorer.get_smart_score: {e}")
-            # En caso de error, continuar con el cálculo clásico como fallback
         
-        # --- Fallback: métrica clásica combinada (código original) ---
+        # Convertir a grayscale
         if len(roi.shape) == 3:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         else:
             gray = roi.copy()
         
+        # Normalizar uint16 → uint8 si es necesario
         if gray.dtype == np.uint16:
             gray = (gray / 256).astype(np.uint8)
         
+        # Crear máscara del objeto si hay contorno disponible
+        mask = None
+        if contour is not None and len(contour) > 0:
+            # Crear máscara del tamaño del ROI
+            mask = np.zeros((h, w), dtype=np.uint8)
+            # Ajustar contorno a coordenadas del ROI
+            contour_shifted = contour.copy()
+            contour_shifted[:, :, 0] -= x
+            contour_shifted[:, :, 1] -= y
+            cv2.drawContours(mask, [contour_shifted], -1, 255, -1)
+        
+        # Suavizado ligero para reducir ruido
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         
+        # Calcular Laplacian
         laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
-        lap_var = laplacian.var()
         
+        # Calcular gradientes Sobel
         gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        tenengrad = np.mean(gx**2 + gy**2)
+        gradient_mag = gx**2 + gy**2
         
-        mean_val = gray.mean()
-        if mean_val > 0:
-            norm_var = gray.var() / mean_val
+        # Si hay máscara, aplicarla para calcular solo sobre el objeto
+        if mask is not None and np.count_nonzero(mask) > 0:
+            # Extraer valores solo donde la máscara es > 0
+            lap_values = laplacian[mask > 0]
+            grad_values = gradient_mag[mask > 0]
+            gray_values = gray[mask > 0]
+            
+            lap_var = lap_values.var() if len(lap_values) > 0 else 0
+            tenengrad = grad_values.mean() if len(grad_values) > 0 else 0
+            mean_val = gray_values.mean() if len(gray_values) > 0 else 0
+            norm_var = gray_values.var() / mean_val if mean_val > 0 else 0
+            n_pixels = len(lap_values)
         else:
-            norm_var = 0
+            # Sin máscara: usar todo el ROI
+            lap_var = laplacian.var()
+            tenengrad = gradient_mag.mean()
+            mean_val = gray.mean()
+            norm_var = gray.var() / mean_val if mean_val > 0 else 0
+            n_pixels = gray.size
         
-        combined = (lap_var * 0.3) + (tenengrad * 0.5) + (norm_var * 0.2)
+        # Combinar métricas
+        combined = (lap_var * 0.25) + (tenengrad * 0.50) + (norm_var * 0.25)
+        
+        logger.debug(f"[Autofocus] S={combined:.1f} (lap={lap_var:.1f}, ten={tenengrad:.1f}, nv={norm_var:.1f}, px={n_pixels})")
+        
         return float(combined)
     
     def set_parameters(self, z_step_coarse: float = None, z_step_fine: float = None,

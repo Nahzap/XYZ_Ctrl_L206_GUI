@@ -487,34 +487,131 @@ class MicroscopyService(QObject):
 
         self._advance_point()
 
-    def handle_autofocus_complete(self) -> None:
+    def handle_autofocus_complete(self, results: list = None) -> None:
         """Debe llamarse cuando AutofocusService completa el autofoco en microscopia.
 
-        Captura la imagen con mejor foco y avanza al siguiente punto.
+        Usa el frame ya capturado durante el autofoco (en BPoF) para guardar la imagen.
+        
+        Args:
+            results: Lista de FocusResult con frames ya capturados en BPoF
         """
         if not self._microscopy_active:
             return
 
-        self.status_changed.emit("📸 Capturando imagen con BPoF...")
+        self.status_changed.emit("📸 Guardando imagen con BPoF...")
         success = False
-        if self._capture_microscopy_image and self._microscopy_config:
-            success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
+        
+        # Usar el frame ya capturado durante el autofoco (evita desenfoque)
+        if results and len(results) > 0 and results[0].frame is not None:
+            # Guardar el frame que ya fue capturado en BPoF
+            success = self._save_autofocus_frame(results[0], self._current_point)
+            
+            # También guardar frame alternativo si existe
+            if results[0].frame_alt is not None:
+                self._save_autofocus_frame_alt(results[0], self._current_point)
+        else:
+            # Fallback: capturar frame actual (puede estar desenfocado)
+            logger.warning("[MicroscopyService] No hay frame en resultado de autofoco, usando frame actual")
+            if self._capture_microscopy_image and self._microscopy_config:
+                success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
 
         if success:
             logger.info(
-                "[MicroscopyService] Imagen %d capturada con autofoco",
+                "[MicroscopyService] Imagen %d guardada con autofoco (BPoF)",
                 self._current_point + 1,
             )
         else:
             self.status_changed.emit(
-                f"  ERROR: Fallo captura imagen {self._current_point + 1} tras autofoco"
+                f"  ERROR: Fallo guardar imagen {self._current_point + 1} tras autofoco"
             )
             logger.error(
-                "[MicroscopyService] Fallo captura imagen %d tras autofoco",
+                "[MicroscopyService] Fallo guardar imagen %d tras autofoco",
                 self._current_point + 1,
             )
 
         self._advance_point()
+    
+    def _save_autofocus_frame(self, result, image_index: int) -> bool:
+        """Guarda el frame capturado durante el autofoco (BPoF).
+        
+        Args:
+            result: FocusResult con el frame ya capturado en BPoF
+            image_index: Índice de la imagen
+            
+        Returns:
+            bool: True si se guardó correctamente
+        """
+        if result.frame is None or self._microscopy_config is None:
+            return False
+        
+        try:
+            frame = result.frame.copy()
+            
+            # Normalizar uint16 a uint8 si es necesario
+            if frame.dtype == np.uint16:
+                if frame.max() > 0:
+                    frame = (frame / frame.max() * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+            
+            # Obtener configuración
+            save_folder = self._microscopy_config.get('save_folder', '.')
+            class_name = self._microscopy_config.get('class_name', 'sample')
+            
+            # Generar nombre de archivo
+            filename = f"{class_name}_{image_index + 1:04d}.png"
+            filepath = os.path.join(save_folder, filename)
+            
+            # Guardar imagen
+            cv2.imwrite(filepath, frame)
+            logger.info(f"[MicroscopyService] Frame BPoF guardado: {filename} (Z={result.z_optimal:.1f}µm, S={result.focus_score:.1f})")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[MicroscopyService] Error guardando frame BPoF: {e}")
+            return False
+    
+    def _save_autofocus_frame_alt(self, result, image_index: int) -> bool:
+        """Guarda el frame alternativo (ligeramente desenfocado).
+        
+        Args:
+            result: FocusResult con el frame alternativo
+            image_index: Índice de la imagen
+            
+        Returns:
+            bool: True si se guardó correctamente
+        """
+        if result.frame_alt is None or self._microscopy_config is None:
+            return False
+        
+        try:
+            frame = result.frame_alt.copy()
+            
+            # Normalizar uint16 a uint8 si es necesario
+            if frame.dtype == np.uint16:
+                if frame.max() > 0:
+                    frame = (frame / frame.max() * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+            
+            # Obtener configuración
+            save_folder = self._microscopy_config.get('save_folder', '.')
+            class_name = self._microscopy_config.get('class_name', 'sample')
+            
+            # Generar nombre de archivo con sufijo _alt
+            filename = f"{class_name}_{image_index + 1:04d}_alt.png"
+            filepath = os.path.join(save_folder, filename)
+            
+            # Guardar imagen
+            cv2.imwrite(filepath, frame)
+            logger.info(f"[MicroscopyService] Frame alternativo guardado: {filename} (Z={result.z_alt:.1f}µm, S={result.score_alt:.1f})")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[MicroscopyService] Error guardando frame alternativo: {e}")
+            return False
 
     def _advance_point(self) -> None:
         """Avanza al siguiente punto de microscopía."""
