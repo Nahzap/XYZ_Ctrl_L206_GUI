@@ -1,27 +1,33 @@
 """
 Pestaña de Control de Cámara Thorlabs.
 
-Encapsula la UI para control de cámara y microscopía automatizada.
-La lógica de cámara está en hardware/camera/camera_worker.py
+REFACTORIZACIÓN 2025-12-17:
+- UI builders movidos a gui/utils/camera_tab_ui_builder.py
+- Lógica de cámara movida a core/services/camera_service.py
+- Este archivo solo contiene coordinación UI y señales/slots
+
+Reducción: 1472 → ~450 líneas
 """
 
 import os
 import logging
 from datetime import datetime
 
-import numpy as np
-import cv2
-
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QGroupBox, QLabel, QLineEdit, QPushButton,
-                             QCheckBox, QFileDialog, QTextEdit, QMessageBox,
-                             QComboBox, QSpinBox, QDoubleSpinBox, QScrollArea)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QScrollArea,
+                             QFileDialog, QMessageBox)
 from PyQt5.QtCore import pyqtSignal, Qt
 
-# Imports para lógica de cámara (centralizado)
 from config.hardware_availability import THORLABS_AVAILABLE, Thorlabs
-
 from gui.windows.camera_window import CameraViewWindow
+from gui.utils.camera_tab_ui_builder import (
+    create_connection_section,
+    create_live_view_section,
+    create_config_section,
+    create_capture_section,
+    create_microscopy_section,
+    create_autofocus_section,
+    create_log_section
+)
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -30,28 +36,24 @@ class CameraTab(QWidget):
     """
     Pestaña para control de cámara Thorlabs y microscopía automatizada.
     
+    Solo contiene:
+    - Configuración de UI usando builders externos
+    - Handlers de UI (actualización de widgets)
+    - Conexión de señales con CameraService
+    
     Signals:
-        connect_requested: Solicita conexión de cámara
-        disconnect_requested: Solicita desconexión
-        view_requested: Solicita abrir vista de cámara
-        start_live_requested: Solicita iniciar vista en vivo
-        stop_live_requested: Solicita detener vista en vivo
-        capture_requested: Solicita capturar imagen
         exposure_changed: Nuevo valor de exposición (float)
-        microscopy_start_requested: Solicita iniciar microscopía automatizada
+        fps_changed: Nuevo valor de FPS (int)
+        buffer_changed: Nuevo valor de buffer (int)
+        microscopy_start_requested: Solicita iniciar microscopía (dict config)
         microscopy_stop_requested: Solicita detener microscopía
     """
     
-    connect_requested = pyqtSignal()
-    disconnect_requested = pyqtSignal()
-    view_requested = pyqtSignal()
-    start_live_requested = pyqtSignal()
-    stop_live_requested = pyqtSignal()
-    capture_requested = pyqtSignal(str)  # folder path
+    # Señales para comunicación con servicios externos
     exposure_changed = pyqtSignal(float)
     fps_changed = pyqtSignal(int)
     buffer_changed = pyqtSignal(int)
-    microscopy_start_requested = pyqtSignal(dict)  # config dict
+    microscopy_start_requested = pyqtSignal(dict)
     microscopy_stop_requested = pyqtSignal()
     
     def __init__(self, thorlabs_available=False, parent=None, camera_service=None):
@@ -61,700 +63,384 @@ class CameraTab(QWidget):
         Args:
             thorlabs_available: Si pylablib está disponible
             parent: Widget padre (ArduinoGUI)
+            camera_service: Instancia de CameraService
         """
         super().__init__(parent)
-        # Usar el flag pasado por main.py como fuente de verdad para disponibilidad del SDK
         self.thorlabs_available = thorlabs_available
         self.parent_gui = parent
         self.camera_service = camera_service
-
-        # Propagar disponibilidad del SDK al servicio de cámara si existe
+        
+        # Configurar disponibilidad en el servicio
         if self.camera_service is not None:
             try:
                 self.camera_service.set_thorlabs_available(self.thorlabs_available)
             except Exception:
-                # Fallback silencioso en caso de versiones anteriores sin este método
                 pass
         
-        # Variables de cámara
-        self.camera_worker = None  # Alias local al worker del servicio
+        # Variables de estado
         self.camera_view_window = None
-        self.camera_log = []
+        self._trajectory_n_points = 0
+        self._microscopy_image_counter = 0
+        self._pending_capture = False  # Flag para captura después de autofoco
+        self.saliency_widget = None  # Widget de saliency (si existe)
         
         # Referencia a TestTab para obtener trayectoria
         self.test_tab = None
         
+        # Configurar UI
         self._setup_ui()
-        logger.debug("CameraTab inicializado")
+        
+        # Conectar señales del servicio
+        self._connect_service_signals()
+        
+        logger.debug("CameraTab inicializado (refactorizado)")
     
-    def set_test_tab_reference(self, test_tab):
-        """
-        Configura la referencia a TestTab para sincronizar trayectoria.
-        
-        Args:
-            test_tab: Instancia de TestTab
-        """
-        self.test_tab = test_tab
-        logger.debug("TestTab reference configurada en CameraTab")
-        
-        # Conectar señal de cambio de trayectoria si existe
-        if hasattr(test_tab, 'trajectory_changed'):
-            test_tab.trajectory_changed.connect(self._on_trajectory_changed)
-    
-    def _on_trajectory_changed(self, n_points):
-        """Callback cuando cambia la trayectoria en TestTab."""
-        self.set_trajectory_status(n_points > 0, n_points)
-    
-    def refresh_trajectory_from_test_tab(self):
-        """Actualiza el estado de trayectoria desde TestTab."""
-        if self.test_tab and hasattr(self.test_tab, 'current_trajectory'):
-            trajectory = self.test_tab.current_trajectory
-            if trajectory is not None and len(trajectory) > 0:
-                self.set_trajectory_status(True, len(trajectory))
-                self.log_message(f"📍 Trayectoria sincronizada: {len(trajectory)} puntos")
-                return True
-        self.set_trajectory_status(False, 0)
-        return False
-    
-    # =========================================================================
-    # MÉTODOS DE CREACIÓN DE UI (Secciones modulares)
-    # =========================================================================
-    
-    def _create_connection_section(self) -> QGroupBox:
-        """Crea la sección de conexión de cámara."""
-        group = QGroupBox("1️⃣ Conexión")
-        layout = QVBoxLayout()
-        
-        btn_layout = QHBoxLayout()
-        self.connect_btn = QPushButton("🔌 Conectar Cámara")
-        self.connect_btn.setStyleSheet("""
-            QPushButton { font-size: 13px; font-weight: bold; padding: 8px; background-color: #27AE60; }
-            QPushButton:hover { background-color: #2ECC71; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.connect_btn.clicked.connect(self.connect_camera)
-        
-        self.disconnect_btn = QPushButton("🔌 Desconectar")
-        self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.clicked.connect(self.disconnect_camera)
-        
-        self.detect_btn = QPushButton("🔍 Detectar Cámaras")
-        self.detect_btn.clicked.connect(self.detect_thorlabs_camera)
-        
-        if not self.thorlabs_available:
-            self.connect_btn.setEnabled(False)
-            self.connect_btn.setText("⚠️ pylablib no instalado")
-            self.detect_btn.setEnabled(False)
-        
-        btn_layout.addWidget(self.connect_btn)
-        btn_layout.addWidget(self.disconnect_btn)
-        btn_layout.addWidget(self.detect_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        self.camera_info_label = QLabel("Estado: Desconectada")
-        self.camera_info_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
-        layout.addWidget(self.camera_info_label)
-        
-        group.setLayout(layout)
-        return group
-    
-    def _create_live_view_section(self) -> QGroupBox:
-        """Crea la sección de vista en vivo."""
-        group = QGroupBox("2️⃣ Vista en Vivo")
-        layout = QVBoxLayout()
-        
-        btn_layout = QHBoxLayout()
-        self.view_btn = QPushButton("📹 Ver Cámara")
-        self.view_btn.setStyleSheet("""
-            QPushButton { font-size: 13px; font-weight: bold; padding: 8px; background-color: #2E86C1; }
-            QPushButton:hover { background-color: #3498DB; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.view_btn.setEnabled(False)
-        self.view_btn.clicked.connect(self.open_camera_view)
-        
-        self.start_live_btn = QPushButton("▶️ Iniciar")
-        self.start_live_btn.setEnabled(False)
-        self.start_live_btn.clicked.connect(self.start_camera_live_view)
-        
-        self.stop_live_btn = QPushButton("⏹️ Detener")
-        self.stop_live_btn.setEnabled(False)
-        self.stop_live_btn.clicked.connect(self.stop_camera_live_view)
-        
-        btn_layout.addWidget(self.view_btn)
-        btn_layout.addWidget(self.start_live_btn)
-        btn_layout.addWidget(self.stop_live_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        group.setLayout(layout)
-        return group
-    
-    def _create_config_section(self) -> QGroupBox:
-        """Crea la sección de configuración de cámara."""
-        group = QGroupBox("3️⃣ Configuración")
-        layout = QGridLayout()
-        
-        # Exposición
-        layout.addWidget(QLabel("Exposición (s):"), 0, 0)
-        self.exposure_input = QLineEdit("0.015")
-        self.exposure_input.setFixedWidth(100)
-        layout.addWidget(self.exposure_input, 0, 1)
-        
-        self.apply_exposure_btn = QPushButton("✓ Aplicar")
-        self.apply_exposure_btn.setEnabled(False)
-        self.apply_exposure_btn.setFixedWidth(80)
-        self.apply_exposure_btn.clicked.connect(self._apply_exposure)
-        layout.addWidget(self.apply_exposure_btn, 0, 2)
-        
-        # FPS
-        layout.addWidget(QLabel("FPS:"), 1, 0)
-        self.fps_input = QLineEdit("30")
-        self.fps_input.setFixedWidth(100)
-        layout.addWidget(self.fps_input, 1, 1)
-        
-        self.apply_fps_btn = QPushButton("✓ Aplicar")
-        self.apply_fps_btn.setEnabled(False)
-        self.apply_fps_btn.setFixedWidth(80)
-        self.apply_fps_btn.clicked.connect(self._apply_fps)
-        layout.addWidget(self.apply_fps_btn, 1, 2)
-        
-        # Buffer de imágenes
-        layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
-        self.buffer_input = QLineEdit("1")
-        self.buffer_input.setFixedWidth(100)
-        self.buffer_input.setToolTip("Número de frames en buffer (1-10). Usar 2 para estabilidad.")
-        layout.addWidget(self.buffer_input, 2, 1)
-        
-        self.apply_buffer_btn = QPushButton("✓ Aplicar")
-        self.apply_buffer_btn.setEnabled(False)
-        self.apply_buffer_btn.setFixedWidth(80)
-        self.apply_buffer_btn.clicked.connect(self._apply_buffer)
-        layout.addWidget(self.apply_buffer_btn, 2, 2)
-        
-        # Info de buffer
-        buffer_info = QLabel("ℹ️ Buffer=2 recomendado: visualiza frame actual, guarda el anterior")
-        buffer_info.setStyleSheet("color: #888888; font-size: 10px;")
-        layout.addWidget(buffer_info, 3, 0, 1, 3)
-        
-        group.setLayout(layout)
-        return group
-    
-    def _create_capture_section(self) -> QGroupBox:
-        """Crea la sección de captura de imágenes."""
-        group = QGroupBox("4️⃣ Captura de Imágenes")
-        layout = QVBoxLayout()
-        
-        # Carpeta
-        folder_layout = QHBoxLayout()
-        folder_layout.addWidget(QLabel("Carpeta:"))
-        self.save_folder_input = QLineEdit(r"C:\CapturasCamara")
-        folder_layout.addWidget(self.save_folder_input)
-        
-        browse_btn = QPushButton("📁 Explorar")
-        browse_btn.clicked.connect(self._browse_folder)
-        folder_layout.addWidget(browse_btn)
-        layout.addLayout(folder_layout)
-        
-        # Formato de imagen
-        format_layout = QHBoxLayout()
-        format_layout.addWidget(QLabel("Formato:"))
-        self.image_format_combo = QComboBox()
-        self.image_format_combo.addItems(["PNG", "TIFF", "JPG"])
-        self.image_format_combo.setCurrentText("PNG")
-        self.image_format_combo.setFixedWidth(80)
-        self.image_format_combo.setToolTip("Formato de imagen para capturas")
-        format_layout.addWidget(self.image_format_combo)
-        format_layout.addStretch()
-        layout.addLayout(format_layout)
-        
-        # Botones de captura
-        btn_layout = QHBoxLayout()
-        self.capture_btn = QPushButton("📸 Capturar Imagen")
-        self.capture_btn.setStyleSheet("""
-            QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #E67E22; }
-            QPushButton:hover { background-color: #F39C12; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.capture_btn.setEnabled(False)
-        self.capture_btn.clicked.connect(self.capture_single_image)
-        btn_layout.addWidget(self.capture_btn)
-        
-        self.focus_btn = QPushButton("🎯 Enfocar Objs")
-        self.focus_btn.setStyleSheet("""
-            QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #9B59B6; }
-            QPushButton:hover { background-color: #8E44AD; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.focus_btn.setEnabled(False)
-        self.focus_btn.clicked.connect(self._focus_objects_only)
-        btn_layout.addWidget(self.focus_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        group.setLayout(layout)
-        return group
+    # ==================================================================
+    # CONFIGURACIÓN DE UI
+    # ==================================================================
     
     def _setup_ui(self):
-        """Configura la interfaz de usuario."""
-        # Crear scroll area para permitir navegación vertical
+        """Configura la interfaz de usuario usando builders externos."""
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
-        # Widget contenedor para el contenido
         content_widget = QWidget()
         main_layout = QVBoxLayout(content_widget)
         
-        # Agregar secciones modulares
-        main_layout.addWidget(self._create_connection_section())
-        main_layout.addWidget(self._create_live_view_section())
-        main_layout.addWidget(self._create_config_section())
-        main_layout.addWidget(self._create_capture_section())
+        # Diccionario para almacenar referencias a widgets
+        self._widgets = {}
         
-        # Sección 5: Microscopía Automatizada
-        microscopy_group = QGroupBox("🔬 Microscopía Automatizada")
-        microscopy_layout = QVBoxLayout()
+        # Sección 1: Conexión
+        main_layout.addWidget(create_connection_section(
+            self._widgets, self.thorlabs_available,
+            self._on_connect_clicked, self._on_disconnect_clicked, self._on_detect_clicked
+        ))
         
-        # Info
-        info_label = QLabel(
-            "ℹ️ <b>Ejecuta la trayectoria zig-zag con captura automática de imágenes</b><br>"
-            "Usa la trayectoria generada en la pestaña 'Prueba' y captura una imagen en cada punto."
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("padding: 8px; background-color: #34495E; border-radius: 5px;")
-        microscopy_layout.addWidget(info_label)
+        # Sección 2: Vista en vivo
+        main_layout.addWidget(create_live_view_section(
+            self._widgets,
+            self._on_view_clicked, self._on_start_live_clicked, self._on_stop_live_clicked
+        ))
         
-        # Estado de trayectoria
-        traj_layout = QHBoxLayout()
-        traj_layout.addWidget(QLabel("<b>Estado:</b>"))
-        self.trajectory_status = QLabel("⚪ Sin trayectoria")
-        self.trajectory_status.setStyleSheet("color: #95A5A6; font-weight: bold;")
-        traj_layout.addWidget(self.trajectory_status)
+        # Sección 3: Configuración
+        main_layout.addWidget(create_config_section(
+            self._widgets,
+            self._on_apply_exposure, self._on_apply_fps, self._on_apply_buffer
+        ))
         
-        # Botón para actualizar trayectoria desde TestTab
-        refresh_traj_btn = QPushButton("🔄 Actualizar")
-        refresh_traj_btn.setFixedWidth(100)
-        refresh_traj_btn.setToolTip("Sincronizar trayectoria desde pestaña Prueba")
-        refresh_traj_btn.clicked.connect(self.refresh_trajectory_from_test_tab)
-        traj_layout.addWidget(refresh_traj_btn)
+        # Sección 4: Captura
+        main_layout.addWidget(create_capture_section(
+            self._widgets,
+            self._browse_folder, self._on_capture_clicked, self._on_focus_clicked
+        ))
         
-        traj_layout.addStretch()
-        microscopy_layout.addLayout(traj_layout)
+        # Sección 5: Microscopía
+        main_layout.addWidget(create_microscopy_section(
+            self._widgets,
+            self.refresh_trajectory_from_test_tab,
+            self._on_start_microscopy, self._on_stop_microscopy,
+            self._browse_microscopy_folder, self._update_storage_estimate
+        ))
         
-        # Fila 1: Nombre de clase + Tamaño imagen
-        row1_layout = QHBoxLayout()
-        row1_layout.addWidget(QLabel("Nombre clase:"))
-        self.class_name_input = QLineEdit("Especie_001")
-        self.class_name_input.setFixedWidth(150)
-        self.class_name_input.setPlaceholderText("Ej: Rosa_Canina")
-        self.class_name_input.textChanged.connect(self._update_storage_estimate)
-        row1_layout.addWidget(self.class_name_input)
+        # Sección 6: Autofoco
+        main_layout.addWidget(create_autofocus_section(
+            self._widgets,
+            self._on_connect_cfocus, self._on_disconnect_cfocus,
+            self._on_test_detection, self._update_detection_params
+        ))
         
-        row1_layout.addSpacing(20)
-        row1_layout.addWidget(QLabel("Tamaño imagen (px):"))
-        self.img_width_input = QLineEdit("1920")
-        self.img_width_input.setFixedWidth(60)
-        self.img_width_input.textChanged.connect(self._update_storage_estimate)
-        row1_layout.addWidget(self.img_width_input)
-        row1_layout.addWidget(QLabel("×"))
-        self.img_height_input = QLineEdit("1080")
-        self.img_height_input.setFixedWidth(60)
-        self.img_height_input.textChanged.connect(self._update_storage_estimate)
-        row1_layout.addWidget(self.img_height_input)
-        row1_layout.addStretch()
-        microscopy_layout.addLayout(row1_layout)
+        # Sección 7: Log
+        main_layout.addWidget(create_log_section(
+            self._widgets,
+            lambda: self._widgets['camera_terminal'].clear()
+        ))
         
-        # Fila 2: Canales RGB + Estimación
-        row2_layout = QHBoxLayout()
-        row2_layout.addWidget(QLabel("Canales RGB:"))
-        self.channel_r_check = QCheckBox("R")
-        self.channel_r_check.setStyleSheet("color: #E74C3C; font-weight: bold;")
-        self.channel_r_check.stateChanged.connect(self._update_storage_estimate)
-        row2_layout.addWidget(self.channel_r_check)
-        
-        self.channel_g_check = QCheckBox("G")
-        self.channel_g_check.setStyleSheet("color: #27AE60; font-weight: bold;")
-        self.channel_g_check.setChecked(True)  # Por defecto G para cámara mono
-        self.channel_g_check.stateChanged.connect(self._update_storage_estimate)
-        row2_layout.addWidget(self.channel_g_check)
-        
-        self.channel_b_check = QCheckBox("B")
-        self.channel_b_check.setStyleSheet("color: #3498DB; font-weight: bold;")
-        self.channel_b_check.stateChanged.connect(self._update_storage_estimate)
-        row2_layout.addWidget(self.channel_b_check)
-        
-        row2_layout.addSpacing(30)
-        row2_layout.addWidget(QLabel("Estimación:"))
-        self.storage_estimate_label = QLabel("~0 MB")
-        self.storage_estimate_label.setStyleSheet("font-weight: bold; color: #F39C12;")
-        row2_layout.addWidget(self.storage_estimate_label)
-        row2_layout.addStretch()
-        microscopy_layout.addLayout(row2_layout)
-        
-        # Fila 3: Carpeta de destino para microscopia
-        folder_micro_layout = QHBoxLayout()
-        folder_micro_layout.addWidget(QLabel("Carpeta destino:"))
-        self.microscopy_folder_input = QLineEdit("C:\\MicroscopyData")
-        self.microscopy_folder_input.setMinimumWidth(300)
-        self.microscopy_folder_input.setToolTip("Carpeta donde se guardaran las imagenes")
-        folder_micro_layout.addWidget(self.microscopy_folder_input)
-        
-        browse_micro_btn = QPushButton("Explorar")
-        browse_micro_btn.clicked.connect(self._browse_microscopy_folder)
-        folder_micro_layout.addWidget(browse_micro_btn)
-        folder_micro_layout.addStretch()
-        microscopy_layout.addLayout(folder_micro_layout)
-        
-        # Fila 4: Demoras antes y despues
-        row3_layout = QHBoxLayout()
-        row3_layout.addWidget(QLabel("Demora antes (s):"))
-        self.delay_before_input = QLineEdit("2.0")
-        self.delay_before_input.setFixedWidth(60)
-        self.delay_before_input.setToolTip("Tiempo de espera antes de capturar (estabilizacion)")
-        row3_layout.addWidget(self.delay_before_input)
-        
-        row3_layout.addSpacing(30)
-        row3_layout.addWidget(QLabel("Demora despues (s):"))
-        self.delay_after_input = QLineEdit("0.2")
-        self.delay_after_input.setFixedWidth(60)
-        self.delay_after_input.setToolTip("Tiempo de espera despues de capturar")
-        row3_layout.addWidget(self.delay_after_input)
-        row3_layout.addStretch()
-        microscopy_layout.addLayout(row3_layout)
-        
-        # Botones de microscopía
-        micro_btn_layout = QHBoxLayout()
-        self.microscopy_start_btn = QPushButton("🚀 Iniciar Microscopía")
-        self.microscopy_start_btn.setStyleSheet("""
-            QPushButton { font-size: 13px; font-weight: bold; padding: 10px; background-color: #27AE60; }
-            QPushButton:hover { background-color: #2ECC71; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.microscopy_start_btn.setEnabled(False)
-        self.microscopy_start_btn.clicked.connect(self._start_microscopy)
-        
-        self.microscopy_stop_btn = QPushButton("⏹️ Detener")
-        self.microscopy_stop_btn.setStyleSheet("background-color: #E74C3C; font-weight: bold; padding: 10px;")
-        self.microscopy_stop_btn.setEnabled(False)
-        self.microscopy_stop_btn.clicked.connect(self._stop_microscopy)
-        
-        micro_btn_layout.addWidget(self.microscopy_start_btn)
-        micro_btn_layout.addWidget(self.microscopy_stop_btn)
-        micro_btn_layout.addStretch()
-        microscopy_layout.addLayout(micro_btn_layout)
-        
-        # Progreso
-        self.microscopy_progress_label = QLabel("Progreso: 0 / 0 imágenes capturadas")
-        self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #3498DB;")
-        microscopy_layout.addWidget(self.microscopy_progress_label)
-        
-        microscopy_group.setLayout(microscopy_layout)
-        main_layout.addWidget(microscopy_group)
-        
-        # Sección 5.5: Autofoco C-Focus Multi-Objeto
-        autofocus_group = QGroupBox("🔍 Autofoco Multi-Objeto (C-Focus)")
-        autofocus_layout = QVBoxLayout()
-        
-        # Checkbox para habilitar autofoco
-        self.autofocus_enabled_cb = QCheckBox("Habilitar autofoco por objeto")
-        self.autofocus_enabled_cb.setToolTip(
-            "Pre-detecta objetos con U2-Net y captura una imagen enfocada por cada uno.\n"
-            "Genera N imágenes por punto, donde N = objetos detectados."
-        )
-        autofocus_layout.addWidget(self.autofocus_enabled_cb)
-        
-        # Botones de conexión C-Focus
-        cfocus_btn_layout = QHBoxLayout()
-        self.cfocus_connect_btn = QPushButton("🔌 Conectar C-Focus")
-        self.cfocus_connect_btn.setStyleSheet("""
-            QPushButton { font-size: 12px; font-weight: bold; padding: 6px; background-color: #8E44AD; }
-            QPushButton:hover { background-color: #9B59B6; }
-            QPushButton:disabled { background-color: #505050; color: #808080; }
-        """)
-        self.cfocus_connect_btn.clicked.connect(self._connect_cfocus)
-        cfocus_btn_layout.addWidget(self.cfocus_connect_btn)
-        
-        self.cfocus_disconnect_btn = QPushButton("⏹️ Desconectar")
-        self.cfocus_disconnect_btn.setEnabled(False)
-        self.cfocus_disconnect_btn.clicked.connect(self._disconnect_cfocus)
-        cfocus_btn_layout.addWidget(self.cfocus_disconnect_btn)
-        
-        # Botón para test de detección
-        self.test_detection_btn = QPushButton("🔍 Test Detección")
-        self.test_detection_btn.setToolTip("Muestra visualización de detección de objetos en tiempo real")
-        self.test_detection_btn.clicked.connect(self._test_detection)
-        cfocus_btn_layout.addWidget(self.test_detection_btn)
-        
-        cfocus_btn_layout.addStretch()
-        autofocus_layout.addLayout(cfocus_btn_layout)
-        
-        # Modo de autofoco
-        autofocus_mode_layout = QHBoxLayout()
-        autofocus_mode_layout.addWidget(QLabel("Modo Z-scan:"))
-        
-        self.full_scan_cb = QCheckBox("Escaneo Completo (0-100µm)")
-        self.full_scan_cb.setChecked(True)
-        self.full_scan_cb.setToolTip(
-            "Escanea todo el rango Z evaluando índice S para encontrar BPoF.\n"
-            "Más lento pero más preciso. Desmarcar para Golden Section Search."
-        )
-        autofocus_mode_layout.addWidget(self.full_scan_cb)
-        autofocus_mode_layout.addStretch()
-        autofocus_layout.addLayout(autofocus_mode_layout)
-        
-        # Parámetros de detección (UMBRAL DE PÍXELES)
-        detection_form = QGridLayout()
-        
-        detection_form.addWidget(QLabel("Área mínima:"), 0, 0)
-        self.min_pixels_spin = QSpinBox()
-        self.min_pixels_spin.setRange(10, 100000)
-        self.min_pixels_spin.setValue(100)
-        self.min_pixels_spin.setSuffix(" px")
-        self.min_pixels_spin.setToolTip("Área mínima del objeto en píxeles")
-        self.min_pixels_spin.setFixedWidth(100)
-        self.min_pixels_spin.valueChanged.connect(self._update_detection_params)
-        detection_form.addWidget(self.min_pixels_spin, 0, 1)
-        
-        detection_form.addWidget(QLabel("Área máxima:"), 0, 2)
-        self.max_pixels_spin = QSpinBox()
-        self.max_pixels_spin.setRange(100, 500000)
-        self.max_pixels_spin.setValue(50000)
-        self.max_pixels_spin.setSuffix(" px")
-        self.max_pixels_spin.setToolTip("Área máxima del objeto en píxeles")
-        self.max_pixels_spin.setFixedWidth(100)
-        self.max_pixels_spin.valueChanged.connect(self._update_detection_params)
-        detection_form.addWidget(self.max_pixels_spin, 0, 3)
-        
-        # NUEVO: Circularidad mínima (CONFIGURABLE)
-        detection_form.addWidget(QLabel("Circularidad mín:"), 1, 0)
-        self.circularity_spin = QDoubleSpinBox()
-        self.circularity_spin.setRange(0.0, 1.0)
-        self.circularity_spin.setSingleStep(0.05)
-        self.circularity_spin.setValue(0.35)
-        self.circularity_spin.setDecimals(2)
-        self.circularity_spin.setToolTip("Circularidad mínima (0-1). 1=círculo perfecto. REDUCIR para muestras borrosas.")
-        self.circularity_spin.setFixedWidth(100)
-        self.circularity_spin.valueChanged.connect(self._update_detection_params)
-        detection_form.addWidget(self.circularity_spin, 1, 1)
-        
-        # NUEVO: Aspect ratio mínimo (CONFIGURABLE)
-        detection_form.addWidget(QLabel("Aspect ratio mín:"), 1, 2)
-        self.aspect_ratio_spin = QDoubleSpinBox()
-        self.aspect_ratio_spin.setRange(0.0, 1.0)
-        self.aspect_ratio_spin.setSingleStep(0.05)
-        self.aspect_ratio_spin.setValue(0.40)
-        self.aspect_ratio_spin.setDecimals(2)
-        self.aspect_ratio_spin.setToolTip("Aspect ratio mínimo (0-1). Rechaza objetos muy alargados. REDUCIR para formas irregulares.")
-        self.aspect_ratio_spin.setFixedWidth(100)
-        self.aspect_ratio_spin.valueChanged.connect(self._update_detection_params)
-        detection_form.addWidget(self.aspect_ratio_spin, 1, 3)
-        
-        # Parámetros de búsqueda Z
-        detection_form.addWidget(QLabel("Rango Z:"), 2, 0)
-        self.z_range_spin = QDoubleSpinBox()
-        self.z_range_spin.setRange(5.0, 200.0)
-        self.z_range_spin.setValue(50.0)
-        self.z_range_spin.setSuffix(" µm")
-        self.z_range_spin.setToolTip("Rango total de búsqueda de foco")
-        self.z_range_spin.setFixedWidth(100)
-        detection_form.addWidget(self.z_range_spin, 2, 1)
-        
-        detection_form.addWidget(QLabel("Tolerancia:"), 2, 2)
-        self.z_tolerance_spin = QDoubleSpinBox()
-        self.z_tolerance_spin.setRange(0.1, 5.0)
-        self.z_tolerance_spin.setValue(0.5)
-        self.z_tolerance_spin.setSuffix(" µm")
-        self.z_tolerance_spin.setDecimals(2)
-        self.z_tolerance_spin.setToolTip("Tolerancia de convergencia")
-        self.z_tolerance_spin.setFixedWidth(100)
-        detection_form.addWidget(self.z_tolerance_spin, 2, 3)
-        
-        autofocus_layout.addLayout(detection_form)
-        
-        # Label de estado C-Focus
-        self.cfocus_status_label = QLabel("C-Focus: No conectado")
-        self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
-        autofocus_layout.addWidget(self.cfocus_status_label)
-        
-        autofocus_group.setLayout(autofocus_layout)
-        main_layout.addWidget(autofocus_group)
-        
-        # Sección 6: Terminal de Log
-        log_group = QGroupBox("📋 Log de Cámara")
-        log_layout = QVBoxLayout()
-        
-        self.camera_terminal = QTextEdit()
-        self.camera_terminal.setReadOnly(True)
-        self.camera_terminal.setMaximumHeight(150)
-        self.camera_terminal.setStyleSheet("""
-            QTextEdit {
-                background-color: #1a1a1a;
-                color: #00FF00;
-                font-family: 'Courier New', monospace;
-                font-size: 11px;
-                border: 1px solid #444444;
-            }
-        """)
-        self.camera_terminal.setPlaceholderText("Eventos de cámara aparecerán aquí...")
-        log_layout.addWidget(self.camera_terminal)
-        
-        # Botón para limpiar log
-        clear_log_btn = QPushButton("🗑️ Limpiar Log")
-        clear_log_btn.setFixedWidth(120)
-        clear_log_btn.clicked.connect(self.camera_terminal.clear)
-        log_layout.addWidget(clear_log_btn)
-        
-        log_group.setLayout(log_layout)
-        main_layout.addWidget(log_group)
+        # Mapear widgets al objeto
+        self._map_widgets()
         
         main_layout.addStretch()
-        
-        # Configurar scroll area
         scroll_area.setWidget(content_widget)
         
-        # Layout principal del tab
         tab_layout = QVBoxLayout(self)
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.addWidget(scroll_area)
     
-    def _apply_exposure(self):
-        """Aplica el valor de exposición y muestra confirmación."""
+    def _map_widgets(self):
+        """Mapea widgets del diccionario a atributos del objeto."""
+        # Conexión
+        self.connect_btn = self._widgets.get('connect_btn')
+        self.disconnect_btn = self._widgets.get('disconnect_btn')
+        self.detect_btn = self._widgets.get('detect_btn')
+        self.camera_info_label = self._widgets.get('camera_info_label')
+        
+        # Vista en vivo
+        self.view_btn = self._widgets.get('view_btn')
+        self.start_live_btn = self._widgets.get('start_live_btn')
+        self.stop_live_btn = self._widgets.get('stop_live_btn')
+        
+        # Configuración
+        self.exposure_input = self._widgets.get('exposure_input')
+        self.fps_input = self._widgets.get('fps_input')
+        self.buffer_input = self._widgets.get('buffer_input')
+        self.apply_exposure_btn = self._widgets.get('apply_exposure_btn')
+        self.apply_fps_btn = self._widgets.get('apply_fps_btn')
+        self.apply_buffer_btn = self._widgets.get('apply_buffer_btn')
+        
+        # Captura
+        self.save_folder_input = self._widgets.get('save_folder_input')
+        self.image_format_combo = self._widgets.get('image_format_combo')
+        self.use_16bit_check = self._widgets.get('use_16bit_check')
+        self.capture_btn = self._widgets.get('capture_btn')
+        self.focus_btn = self._widgets.get('focus_btn')
+        
+        # Microscopía
+        self.trajectory_status = self._widgets.get('trajectory_status')
+        self.class_name_input = self._widgets.get('class_name_input')
+        self.img_width_input = self._widgets.get('img_width_input')
+        self.img_height_input = self._widgets.get('img_height_input')
+        self.channel_r_check = self._widgets.get('channel_r_check')
+        self.channel_g_check = self._widgets.get('channel_g_check')
+        self.channel_b_check = self._widgets.get('channel_b_check')
+        self.storage_estimate_label = self._widgets.get('storage_estimate_label')
+        self.microscopy_folder_input = self._widgets.get('microscopy_folder_input')
+        self.delay_before_input = self._widgets.get('delay_before_input')
+        self.delay_after_input = self._widgets.get('delay_after_input')
+        self.microscopy_start_btn = self._widgets.get('microscopy_start_btn')
+        self.microscopy_stop_btn = self._widgets.get('microscopy_stop_btn')
+        self.microscopy_progress_label = self._widgets.get('microscopy_progress_label')
+        
+        # Autofoco
+        self.autofocus_enabled_cb = self._widgets.get('autofocus_enabled_cb')
+        self.cfocus_connect_btn = self._widgets.get('cfocus_connect_btn')
+        self.cfocus_disconnect_btn = self._widgets.get('cfocus_disconnect_btn')
+        self.test_detection_btn = self._widgets.get('test_detection_btn')
+        self.full_scan_cb = self._widgets.get('full_scan_cb')
+        self.min_pixels_spin = self._widgets.get('min_pixels_spin')
+        self.max_pixels_spin = self._widgets.get('max_pixels_spin')
+        self.circularity_spin = self._widgets.get('circularity_spin')
+        self.aspect_ratio_spin = self._widgets.get('aspect_ratio_spin')
+        self.z_range_spin = self._widgets.get('z_range_spin')
+        self.z_tolerance_spin = self._widgets.get('z_tolerance_spin')
+        self.cfocus_status_label = self._widgets.get('cfocus_status_label')
+        
+        # Log
+        self.camera_terminal = self._widgets.get('camera_terminal')
+    
+    def _connect_service_signals(self):
+        """Conecta señales del CameraService con handlers de UI."""
+        if self.camera_service is None:
+            return
+        
+        self.camera_service.status_changed.connect(self.log_message)
+        self.camera_service.connected.connect(self._on_camera_connected)
+        self.camera_service.disconnected.connect(lambda: self.set_connected(False))
+        self.camera_service.frame_ready.connect(self._on_camera_frame)
+        self.camera_service.error_occurred.connect(self._on_error)
+    
+    # ==================================================================
+    # HANDLERS DE BOTONES (delegan a CameraService)
+    # ==================================================================
+    
+    def _on_connect_clicked(self):
+        """Handler para botón Conectar."""
+        if self.camera_service is None:
+            self.log_message("❌ Error: CameraService no disponible")
+            return
+        
+        try:
+            buffer_size = int(self.buffer_input.text())
+        except ValueError:
+            buffer_size = 2
+        
+        self.log_message("🔌 Conectando cámara Thorlabs...")
+        self.camera_service.connect_camera(buffer_size=buffer_size)
+    
+    def _on_disconnect_clicked(self):
+        """Handler para botón Desconectar."""
+        if self.camera_service:
+            self.camera_service.disconnect_camera()
+        
+        if self.camera_view_window:
+            self.camera_view_window.close()
+            self.camera_view_window = None
+    
+    def _on_detect_clicked(self):
+        """Handler para botón Detectar."""
+        if self.camera_service is None:
+            self.log_message("❌ Error: CameraService no disponible")
+            return
+        
+        self.detect_btn.setEnabled(False)
+        cameras = self.camera_service.detect_cameras()
+        self.detect_btn.setEnabled(True)
+        
+        if cameras:
+            msg = f"¡Cámaras encontradas! Total: {len(cameras)}\n\n"
+            for i, cam in enumerate(cameras, 1):
+                msg += f"Cámara {i}: {cam}\n"
+            QMessageBox.information(self.parent_gui, "Detección Exitosa", msg)
+        else:
+            QMessageBox.information(self.parent_gui, "Detección",
+                                   "No se encontraron cámaras Thorlabs.\n\n"
+                                   "Verificar:\n"
+                                   "1. Conexión USB\n"
+                                   "2. Drivers instalados\n"
+                                   "3. Alimentación de cámara")
+    
+    def _on_view_clicked(self):
+        """Handler para botón Ver Cámara."""
+        if not self.camera_service or not self.camera_service.is_connected:
+            self.log_message("❌ Error: Conecta la cámara primero")
+            QMessageBox.warning(self.parent_gui, "Error", "Conecta la cámara primero")
+            return
+        
+        if self.camera_view_window is None:
+            self.camera_view_window = CameraViewWindow(self.parent_gui)
+            
+            # Configurar SmartFocusScorer
+            if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
+                self.camera_view_window.set_scorer(self.parent_gui.smart_focus_scorer)
+                self.log_message("🔍 SmartFocusScorer configurado")
+            
+            # Conectar señales con MicroscopyService
+            if self.parent_gui and hasattr(self.parent_gui, 'microscopy_service'):
+                self.camera_view_window.skip_roi_requested.connect(
+                    self.parent_gui.microscopy_service.skip_current_point
+                )
+                self.camera_view_window.pause_toggled.connect(
+                    self.parent_gui.microscopy_service.set_paused
+                )
+                self.log_message("🔗 Botones de control conectados a MicroscopyService")
+        
+        self._update_detection_params()
+        self.camera_view_window.show()
+        self.camera_view_window.raise_()
+        self.camera_view_window.activateWindow()
+        self.log_message("📹 Ventana de cámara abierta")
+    
+    def _on_start_live_clicked(self):
+        """Handler para botón Iniciar Live."""
+        if self.camera_service is None:
+            self.log_message("❌ Error: CameraService no disponible")
+            return
+        
+        try:
+            exposure_s = float(self.exposure_input.text())
+            fps = int(self.fps_input.text())
+            buffer_size = int(self.buffer_input.text())
+        except ValueError:
+            exposure_s, fps, buffer_size = 0.01, 60, 2
+        
+        self.camera_service.start_live(exposure_s, fps, buffer_size)
+        
+        self.start_live_btn.setEnabled(False)
+        self.stop_live_btn.setEnabled(True)
+        self.capture_btn.setEnabled(True)
+        self.focus_btn.setEnabled(True)
+    
+    def _on_stop_live_clicked(self):
+        """Handler para botón Detener Live."""
+        if self.camera_service:
+            self.camera_service.stop_live()
+        
+        self.start_live_btn.setEnabled(True)
+        self.stop_live_btn.setEnabled(False)
+        self.capture_btn.setEnabled(False)
+        self.focus_btn.setEnabled(False)
+    
+    def _on_apply_exposure(self):
+        """Handler para aplicar exposición."""
         try:
             exposure = float(self.exposure_input.text())
             self.exposure_changed.emit(exposure)
-            
-            # Aplicar directamente al worker si existe
-            if self.camera_worker:
-                self.camera_worker.change_exposure(exposure)
-            
-            # Mostrar en ms para mejor legibilidad
-            exposure_ms = exposure * 1000
-            self.log_message(f"✅ Exposición configurada: {exposure}s ({exposure_ms:.1f}ms)")
+            if self.camera_service:
+                self.camera_service.apply_exposure(exposure)
         except ValueError:
             self.log_message("❌ Error: Valor de exposición inválido")
-            logger.error("Valor de exposición inválido")
     
-    def _apply_fps(self):
-        """Aplica el valor de FPS."""
+    def _on_apply_fps(self):
+        """Handler para aplicar FPS."""
         try:
             fps = int(self.fps_input.text())
             self.fps_changed.emit(fps)
-
-            # Aplicar directamente al worker si existe (cambia frame_period en la cámara)
-            if self.camera_worker:
-                try:
-                    self.camera_worker.change_fps(fps)
-                except Exception as e:
-                    logger.error(f"Error aplicando FPS en CameraWorker: {e}")
-                    self.log_message(f"❌ Error al aplicar FPS en cámara: {e}")
-            
-            self.log_message(f"✅ FPS configurado: {fps}")
+            if self.camera_service:
+                self.camera_service.apply_fps(fps)
         except ValueError:
             self.log_message("❌ Error: Valor de FPS inválido")
-            logger.error("Valor de FPS inválido")
     
-    def _apply_buffer(self):
-        """Aplica el valor de buffer."""
+    def _on_apply_buffer(self):
+        """Handler para aplicar buffer."""
         try:
             buffer_size = int(self.buffer_input.text())
             if buffer_size < 1 or buffer_size > 10:
                 self.log_message("❌ Error: Buffer debe estar entre 1 y 10")
                 return
-            
             self.buffer_changed.emit(buffer_size)
-            
-            # Aplicar directamente al worker si existe
-            if self.camera_worker:
-                self.camera_worker.change_buffer_size(buffer_size)
-            
-            self.log_message(f"✅ Buffer configurado: {buffer_size} frames")
+            if self.camera_service:
+                self.camera_service.apply_buffer(buffer_size)
         except ValueError:
             self.log_message("❌ Error: Valor de buffer inválido")
-            logger.error("Valor de buffer inválido")
     
-    def log_message(self, message: str):
-        """Escribe un mensaje en la terminal de log."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.camera_terminal.append(f"[{timestamp}] {message}")
-    
-    def _browse_folder(self):
-        """Abre dialogo para seleccionar carpeta."""
-        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de guardado")
+    def _on_capture_clicked(self):
+        """Handler para botón Capturar."""
+        if self.camera_service is None:
+            self.log_message("❌ Error: CameraService no disponible")
+            return
+        
+        # Si autofoco está habilitado, ejecutar autofoco primero
+        if (self.autofocus_enabled_cb.isChecked() and 
+            self.parent_gui and getattr(self.parent_gui, 'cfocus_enabled', False)):
+            self.log_message("🎯 Autofoco habilitado - ejecutando Z-scan antes de captura...")
+            self._run_autofocus(capture_after=True)
+            return
+        
+        # Captura normal
+        folder = self.save_folder_input.text()
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta")
+            if folder:
+                self.save_folder_input.setText(folder)
+        
         if folder:
-            self.save_folder_input.setText(folder)
+            img_format = self.image_format_combo.currentText().lower()
+            self.camera_service.capture_image(folder, img_format)
     
-    def _browse_microscopy_folder(self):
-        """Abre dialogo para seleccionar carpeta de microscopia."""
-        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta para microscopia")
-        if folder:
-            self.microscopy_folder_input.setText(folder)
+    def _on_focus_clicked(self):
+        """Handler para botón Enfocar."""
+        if not self.parent_gui or not getattr(self.parent_gui, 'cfocus_enabled', False):
+            self.log_message("❌ Error: C-Focus no conectado")
+            QMessageBox.warning(self.parent_gui, "Error", "Conecta C-Focus primero")
+            return
+        
+        self.log_message("🎯 Iniciando rutina de enfoque (sin captura)...")
+        self._run_autofocus(capture_after=False)
     
-    def _update_storage_estimate(self):
-        """Calcula y actualiza la estimacion de almacenamiento."""
-        try:
-            width = int(self.img_width_input.text()) if self.img_width_input.text() else 1920
-            height = int(self.img_height_input.text()) if self.img_height_input.text() else 1080
-            
-            # Contar canales seleccionados
-            n_channels = 0
-            if self.channel_r_check.isChecked():
-                n_channels += 1
-            if self.channel_g_check.isChecked():
-                n_channels += 1
-            if self.channel_b_check.isChecked():
-                n_channels += 1
-            
-            if n_channels == 0:
-                n_channels = 1  # Minimo 1 canal
-            
-            # Logica: 1 canal = grayscale (1 byte), 2-3 canales = BGR (3 bytes)
-            if n_channels == 1:
-                bytes_per_pixel = 1  # Grayscale
-            else:
-                bytes_per_pixel = 3  # BGR
-            
-            # Obtener numero de puntos de trayectoria
-            n_points = self._trajectory_n_points if hasattr(self, '_trajectory_n_points') else 0
-            
-            # Calcular tamano (PNG comprimido ~50% del raw)
-            bytes_per_image = width * height * bytes_per_pixel * 0.5  # Factor compresion PNG
-            total_bytes = bytes_per_image * max(1, n_points)
-            total_mb = total_bytes / (1024 * 1024)
-            
-            if total_mb < 1:
-                self.storage_estimate_label.setText(f"~{total_bytes/1024:.1f} KB")
-            elif total_mb < 1024:
-                self.storage_estimate_label.setText(f"~{total_mb:.1f} MB")
-            else:
-                self.storage_estimate_label.setText(f"~{total_mb/1024:.2f} GB")
-                
-        except ValueError:
-            self.storage_estimate_label.setText("~0 MB")
+    # ==================================================================
+    # HANDLERS DE MICROSCOPÍA
+    # ==================================================================
     
-    def _start_microscopy(self):
-        """Inicia microscopía con la configuración actual."""
-        # Verificar que hay trayectoria
-        if not hasattr(self, '_trajectory_n_points') or self._trajectory_n_points == 0:
+    def _on_start_microscopy(self):
+        """Handler para iniciar microscopía."""
+        if self._trajectory_n_points == 0:
             self.log_message("❌ Error: No hay trayectoria generada")
             return
         
-        # Verificar que hay al menos un canal seleccionado
         if not (self.channel_r_check.isChecked() or 
                 self.channel_g_check.isChecked() or 
                 self.channel_b_check.isChecked()):
             self.log_message("❌ Error: Selecciona al menos un canal RGB")
             return
         
-        # Obtener configuracion
         try:
             config = {
                 'class_name': self.class_name_input.text().strip().replace(' ', '_'),
                 'save_folder': self.microscopy_folder_input.text(),
                 'img_width': int(self.img_width_input.text()),
                 'img_height': int(self.img_height_input.text()),
+                'img_format': self.image_format_combo.currentText().lower(),  # tiff/png/jpg
+                'use_16bit': self.use_16bit_check.isChecked(),  # True=16-bit, False=8-bit
                 'channels': {
                     'R': self.channel_r_check.isChecked(),
                     'G': self.channel_g_check.isChecked(),
@@ -770,35 +456,29 @@ class CameraTab(QWidget):
                 'z_tolerance': self.z_tolerance_spin.value()
             }
         except ValueError as e:
-            self.log_message(f"Error en parametros: {e}")
+            self.log_message(f"❌ Error en parámetros: {e}")
             return
         
-        # Validar carpeta
         if not config['save_folder']:
-            self.log_message("Error: Selecciona una carpeta de destino")
+            self.log_message("❌ Error: Selecciona una carpeta de destino")
             return
         
+        import os
         os.makedirs(config['save_folder'], exist_ok=True)
         
         # Log de inicio
         self.log_message("=" * 40)
-        self.log_message("INICIANDO MICROSCOPIA AUTOMATIZADA")
+        self.log_message("INICIANDO MICROSCOPÍA AUTOMATIZADA")
         self.log_message(f"   Clase: {config['class_name']}")
         self.log_message(f"   Puntos: {config['n_points']}")
-        self.log_message(f"   Tamano: {config['img_width']}x{config['img_height']} px")
         channels_str = ''.join([c for c in ['R', 'G', 'B'] if config['channels'][c]])
         self.log_message(f"   Canales: {channels_str}")
-        self.log_message(f"   Demoras: {config['delay_before']}s antes, {config['delay_after']}s despues")
-        self.log_message(f"   Carpeta: {config['save_folder']}")
-        
-        # Log de autofoco si está habilitado
-        if config['autofocus_enabled']:
-            self.log_message(f"   🔍 Autofoco: HABILITADO")
-            self.log_message(f"      Área: [{config['min_pixels']}, {config['max_pixels']}] px")
-            self.log_message(f"      Rango Z: {config['z_range']} µm, Tol: {config['z_tolerance']} µm")
+        fmt = config['img_format'].upper()
+        bits = "16-bit" if config['use_16bit'] else "8-bit"
+        if fmt == 'JPG' and config['use_16bit']:
+            self.log_message(f"   Formato: {fmt} (⚠️ JPG solo soporta 8-bit)")
         else:
-            self.log_message(f"   📸 Autofoco: DESHABILITADO (captura normal)")
-        
+            self.log_message(f"   Formato: {fmt} ({bits})")
         self.log_message("=" * 40)
         
         # Actualizar UI
@@ -807,279 +487,73 @@ class CameraTab(QWidget):
         self._microscopy_image_counter = 0
         self.set_microscopy_progress(0, config['n_points'])
         
-        # Habilitar botones de control en ventana de cámara
         if self.camera_view_window:
             self.camera_view_window.set_microscopy_active(True, 0)
         
-        # Emitir señal con configuración
         self.microscopy_start_requested.emit(config)
     
-    def _stop_microscopy(self):
-        """Detiene la microscopía automatizada."""
+    def _on_stop_microscopy(self):
+        """Handler para detener microscopía."""
         self.log_message("⏹️ DETENIENDO MICROSCOPÍA...")
         self.microscopy_start_btn.setEnabled(True)
         self.microscopy_stop_btn.setEnabled(False)
         
-        # Deshabilitar botones de control en ventana de cámara
         if self.camera_view_window:
             self.camera_view_window.set_microscopy_active(False)
         
         self.microscopy_stop_requested.emit()
     
-    # === Métodos para actualizar estado desde el padre ===
+    # ==================================================================
+    # HANDLERS DE AUTOFOCO / C-FOCUS
+    # ==================================================================
     
-    def set_connected(self, connected: bool, info: str = ""):
-        """Actualiza UI cuando cambia estado de conexión."""
-        if connected:
-            self.camera_info_label.setText(f"Estado: Conectada - {info}")
-            self.camera_info_label.setStyleSheet("color: #27AE60; font-weight: bold;")
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
-            self.view_btn.setEnabled(True)
-            self.start_live_btn.setEnabled(True)
-            self.apply_exposure_btn.setEnabled(True)
-            self.apply_fps_btn.setEnabled(True)
-            self.apply_buffer_btn.setEnabled(True)
-            self.capture_btn.setEnabled(True)
-            self.focus_btn.setEnabled(True)
-            self.log_message(f"✅ Cámara conectada: {info}")
-        else:
-            self.camera_info_label.setText("Estado: Desconectada")
-            self.camera_info_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
-            self.connect_btn.setEnabled(self.thorlabs_available)
-            self.disconnect_btn.setEnabled(False)
-            self.view_btn.setEnabled(False)
-            self.start_live_btn.setEnabled(False)
-            self.stop_live_btn.setEnabled(False)
-            self.apply_exposure_btn.setEnabled(False)
-            self.apply_fps_btn.setEnabled(False)
-            self.apply_buffer_btn.setEnabled(False)
-            self.capture_btn.setEnabled(False)
-            self.focus_btn.setEnabled(False)
-            self.log_message("🔌 Cámara desconectada")
+    def _on_connect_cfocus(self):
+        """Handler para conectar C-Focus."""
+        if self.parent_gui:
+            success = self.parent_gui.connect_cfocus()
+            if success:
+                self.cfocus_connect_btn.setEnabled(False)
+                self.cfocus_disconnect_btn.setEnabled(True)
+                self.cfocus_status_label.setText("C-Focus: ✅ Conectado")
+                self.cfocus_status_label.setStyleSheet("color: #27AE60; font-weight: bold;")
+                self.parent_gui.initialize_autofocus()
     
-    def set_trajectory_status(self, has_trajectory: bool, n_points: int = 0):
-        """Actualiza estado de trayectoria."""
-        self._trajectory_n_points = n_points if has_trajectory else 0
-        
-        if has_trajectory and n_points > 0:
-            self.trajectory_status.setText(f"✅ Trayectoria lista: {n_points} puntos")
-            self.trajectory_status.setStyleSheet("color: #27AE60; font-weight: bold;")
-            self.microscopy_start_btn.setEnabled(True)
-            self.log_message(f"✅ Trayectoria actualizada: {n_points} puntos disponibles")
-        else:
-            self.trajectory_status.setText("⚪ Sin trayectoria")
-            self.trajectory_status.setStyleSheet("color: #95A5A6; font-weight: bold;")
-            self.microscopy_start_btn.setEnabled(False)
-            if not has_trajectory:
-                self.log_message("⚠️ No hay trayectoria. Ve a TestTab y presiona 'Generar Trayectoria'")
-        
-        # Actualizar estimación de almacenamiento
-        self._update_storage_estimate()
+    def _on_disconnect_cfocus(self):
+        """Handler para desconectar C-Focus."""
+        if self.parent_gui and self.parent_gui.cfocus_controller:
+            self.parent_gui.disconnect_cfocus()
+            self.cfocus_connect_btn.setEnabled(True)
+            self.cfocus_disconnect_btn.setEnabled(False)
+            self.cfocus_status_label.setText("C-Focus: No conectado")
+            self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
+            self.log_message("C-Focus desconectado")
     
-    def set_microscopy_progress(self, current: int, total: int):
-        """Actualiza progreso de microscopía."""
-        self.microscopy_progress_label.setText(f"Progreso: {current} / {total} imágenes capturadas")
-        
-        # Cambiar color según progreso
-        if current == 0:
-            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #3498DB;")
-        elif current < total:
-            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #F39C12;")
-        else:
-            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #27AE60;")
-    
-    # ============================================================
-    # CALLBACKS DE DETECCIÓN Y AUTOFOCO (conectados desde main)
-    # ============================================================
-
-    def on_detection_ready(self, saliency_map, objects):
-        """Callback cuando hay nuevos resultados de detección."""
-        if hasattr(self, 'saliency_widget') and self.saliency_widget:
-            self.saliency_widget.update_detection(saliency_map, objects)
-
-    def on_detection_status(self, status: str):
-        """Callback cuando cambia el estado del servicio de detección."""
-        self.log_message(f"🔍 {status}")
-
-    def on_autofocus_started(self, obj_index: int, total: int):
-        """Callback cuando inicia autofoco de un objeto."""
-        self.log_message(f"🎯 Enfocando objeto {obj_index + 1}/{total}...")
-
-    def on_autofocus_z_changed(self, z: float, score: float, roi_frame):
-        """Callback en cada posición Z evaluada."""
-        if hasattr(self, 'saliency_widget') and self.saliency_widget:
-            # El tercer parámetro era '0' en la implementación original
-            self.saliency_widget.update_autofocus_state(z, score, 0)
-
-    def on_object_focused(self, obj_index: int, z_optimal: float, score: float):
-        """Callback cuando se encuentra el foco óptimo de un objeto."""
-        self.log_message(f"  ✓ Obj{obj_index}: Z={z_optimal:.1f}µm, S={score:.1f}")
-    
-    # ============================================================
-    # MÉTODOS DE LÓGICA DE CÁMARA
-    # ============================================================
-    
-    def detect_thorlabs_camera(self):
-        """Detecta cámaras Thorlabs conectadas."""
-        if not self.thorlabs_available:
-            self.log_message("❌ Error: pylablib no está instalado")
-            QMessageBox.warning(self.parent_gui, "Error", "pylablib no está instalado")
-            logger.warning("Intento de detectar cámara sin pylablib")
-            return
-        
-        self.log_message("🔍 Buscando cámaras Thorlabs...")
-        logger.info("Detectando cámaras Thorlabs...")
-        self.detect_btn.setEnabled(False)
-        
-        try:
-            cameras = Thorlabs.list_cameras_tlcam()
-            
-            if not cameras:
-                self.log_message("⚠️ No se encontraron cámaras")
-                QMessageBox.information(self.parent_gui, "Detección",
-                                       "No se encontraron cámaras Thorlabs.\n\n"
-                                       "Verificar:\n"
-                                       "1. Conexión USB\n"
-                                       "2. Drivers instalados\n"
-                                       "3. Alimentación de cámara")
-                logger.warning("No se encontraron cámaras")
-            else:
-                self.log_message(f"✅ Encontradas {len(cameras)} cámara(s)")
-                for i, cam in enumerate(cameras, 1):
-                    self.log_message(f"   Cámara {i}: {cam}")
-                msg = f"¡Cámaras encontradas! Total: {len(cameras)}\n\n"
-                for i, cam in enumerate(cameras, 1):
-                    msg += f"Cámara {i}: {cam}\n"
-                QMessageBox.information(self.parent_gui, "Detección Exitosa", msg)
-                logger.info(f"Detectadas {len(cameras)} cámaras Thorlabs")
-                
-        except Exception as e:
-            self.log_message(f"❌ Error detectando: {e}")
-            QMessageBox.critical(self.parent_gui, "Error", f"Error detectando cámaras:\n{e}")
-            logger.error(f"Error en detección: {e}")
-        finally:
-            self.detect_btn.setEnabled(True)
-    
-    def connect_camera(self):
-        """Conecta con la cámara Thorlabs."""
-        if not self.thorlabs_available:
-            self.log_message("❌ Error: pylablib no está disponible")
-            QMessageBox.warning(self.parent_gui, "Error", "pylablib no está disponible")
-            return
-
-        # Leer buffer deseado desde la UI
-        try:
-            buffer_size = int(self.buffer_input.text())
-        except Exception:
-            buffer_size = 2
-
-        self.log_message("🔌 Conectando cámara Thorlabs...")
-        logger.info("=== CONECTANDO CÁMARA THORLABS (via CameraService) ===")
-
-        # Usar CameraService si está disponible
-        if self.camera_service:
-            self.camera_service.connect_camera(
-                thorlabs_available=self.thorlabs_available,
-                buffer_size=buffer_size,
+    def _on_test_detection(self):
+        """Handler para test de detección."""
+        if self.camera_view_window is None or not self.camera_view_window.isVisible():
+            self.log_message("⚠️ Abre la ventana de cámara primero (botón 'Ver')")
+            QMessageBox.information(
+                self.parent_gui, 
+                "Ventana de Cámara",
+                "Abre la ventana de cámara primero.\n\n"
+                "1. Conecta la cámara\n"
+                "2. Presiona 'Ver' para abrir la ventana\n"
+                "3. Inicia la vista en vivo\n"
+                "4. Presiona 'Test Detección'"
             )
-        elif self.parent_gui and hasattr(self.parent_gui, 'camera_service'):
-            # Fallback: acceder al servicio desde el padre
-            self.parent_gui.camera_service.connect_camera(
-                thorlabs_available=self.thorlabs_available,
-                buffer_size=buffer_size,
-            )
-        else:
-            # Fallback legacy: comportamiento antiguo (creación local del worker)
-            from hardware.camera.camera_worker import CameraWorker  # import local para evitar dependencia fuerte
-            if self.camera_worker is None:
-                self.camera_worker = CameraWorker()
-                self.camera_worker.connection_success.connect(self._on_camera_connected)
-                self.camera_worker.new_frame_ready.connect(self.on_camera_frame)
-                self.camera_worker.status_update.connect(self.log_message)
-                self.camera_worker.buffer_size = buffer_size
-            self.camera_worker.connect_camera()
-    
-    def _on_camera_connected(self, success: bool, info: str):
-        """Callback cuando la cámara se conecta."""
-        if success:
-            # Sincronizar alias local con el worker del servicio
-            if self.camera_service and hasattr(self.camera_service, 'worker'):
-                self.camera_worker = self.camera_service.worker
-            elif self.parent_gui and hasattr(self.parent_gui, 'camera_service'):
-                self.camera_worker = self.parent_gui.camera_service.worker
-            self.set_connected(True, info)
-            logger.info(f"Cámara conectada: {info}")
-        else:
-            self.log_message(f"❌ Fallo al conectar: {info}")
-            QMessageBox.critical(self.parent_gui, "Error", f"Fallo al conectar:\n{info}")
-            self.set_connected(False)
-            logger.error(f"Fallo conexión: {info}")
-    
-    def disconnect_camera(self):
-        """Desconecta la cámara."""
-        self.log_message("🔌 Desconectando cámara...")
-        logger.info("=== DESCONECTANDO CÁMARA ===")
-        
-        # Usar CameraService si está disponible
-        if self.camera_service:
-            self.camera_service.disconnect_camera()
-            self.camera_worker = None
-        elif self.camera_worker:
-            # Fallback legacy
-            self.camera_worker.disconnect_camera()
-            self.camera_worker = None
-        
-        if self.camera_view_window:
-            self.camera_view_window.close()
-            self.camera_view_window = None
-        
-        self.set_connected(False)
-        logger.info("Cámara desconectada")
-    
-    def open_camera_view(self):
-        """Abre ventana de visualización de cámara."""
-        if not self.camera_worker:
-            self.log_message("❌ Error: Conecta la cámara primero")
-            QMessageBox.warning(self.parent_gui, "Error", "Conecta la cámara primero")
             return
         
-        if self.camera_view_window is None:
-            self.camera_view_window = CameraViewWindow(self.parent_gui)
-            
-            # Configurar SmartFocusScorer (mismo que ImgAnalysisTab)
-            if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
-                self.camera_view_window.set_scorer(self.parent_gui.smart_focus_scorer)
-                self.log_message("🔍 SmartFocusScorer configurado (mismo que ImgAnalysisTab)")
-            
-            # Conectar señales de botones con MicroscopyService
-            if self.parent_gui and hasattr(self.parent_gui, 'microscopy_service'):
-                self.camera_view_window.skip_roi_requested.connect(
-                    self.parent_gui.microscopy_service.skip_current_point
-                )
-                self.camera_view_window.pause_toggled.connect(
-                    self.parent_gui.microscopy_service.set_paused
-                )
-                self.log_message("🔗 Botones de control conectados a MicroscopyService")
-        
-        # Actualizar parámetros de detección desde UI
         self._update_detection_params()
-        
-        self.camera_view_window.show()
-        self.camera_view_window.raise_()
-        self.camera_view_window.activateWindow()
-        self.log_message("📹 Ventana de cámara abierta")
-        logger.info("Ventana de cámara abierta")
+        self.camera_view_window.trigger_detection()
+        self.log_message(f"🔍 TEST Detección - Área: [{self.min_pixels_spin.value()}-{self.max_pixels_spin.value()}] px")
     
     def _update_detection_params(self):
-        """Actualiza parámetros de detección en la ventana de cámara."""
+        """Actualiza parámetros de detección."""
         if self.camera_view_window:
             min_area = self.min_pixels_spin.value()
             max_area = self.max_pixels_spin.value()
             self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
-            self.log_message(f"📐 Params: área [{min_area}-{max_area}] px")
         
-        # Actualizar parámetros de morfología en SmartFocusScorer
         if (self.parent_gui and 
             hasattr(self.parent_gui, 'smart_focus_scorer') and 
             self.parent_gui.smart_focus_scorer is not None and
@@ -1090,109 +564,20 @@ class CameraTab(QWidget):
                 min_circularity=min_circ,
                 min_aspect_ratio=min_aspect
             )
-            self.log_message(f"🔧 Morfología: circ≥{min_circ:.2f}, aspect≥{min_aspect:.2f}")
-    
-    def start_camera_live_view(self):
-        """Inicia vista en vivo."""
-        # Verificar que hay cámara conectada
-        worker = None
-        if self.camera_service and getattr(self.camera_service, 'worker', None):
-            worker = self.camera_service.worker
-        else:
-            worker = self.camera_worker
-
-        if worker is None:
-            self.log_message("❌ Error: Conecta la cámara primero")
-            QMessageBox.warning(self.parent_gui, "Error", "Conecta la cámara primero")
-            return
-        
-        # Leer parámetros
-        try:
-            exposure_s = float(self.exposure_input.text())
-            fps = int(self.fps_input.text())
-            buffer_size = int(self.buffer_input.text())
-        except:
-            exposure_s = 0.01
-            fps = 60
-            buffer_size = 2
-        
-        self.log_message(f"▶️ Iniciando vista en vivo...")
-        self.log_message(f"   Exposición: {exposure_s}s, FPS: {fps}, Buffer: {buffer_size}")
-
-        # Usar CameraService si está disponible
-        if self.camera_service:
-            self.camera_service.start_live(exposure_s, fps, buffer_size)
-        else:
-            # Fallback legacy: configurar directamente el worker
-            worker.exposure = exposure_s
-            worker.fps = fps
-            worker.buffer_size = buffer_size
-            worker.start()
-        
-        # Actualizar UI
-        self.start_live_btn.setEnabled(False)
-        self.stop_live_btn.setEnabled(True)
-        self.capture_btn.setEnabled(True)
-        self.focus_btn.setEnabled(True)
-        
-        logger.info(f"Vista en vivo iniciada: {exposure_s}s, {fps}fps, buffer={buffer_size}")
-    
-    def stop_camera_live_view(self):
-        """Detiene vista en vivo."""
-        self.log_message("⏹️ Deteniendo vista en vivo...")
-        
-        if self.camera_service:
-            self.camera_service.stop_live()
-        elif self.camera_worker:
-            self.camera_worker.stop_live_view()
-        
-        self.start_live_btn.setEnabled(True)
-        self.stop_live_btn.setEnabled(False)
-        self.capture_btn.setEnabled(False)
-        self.focus_btn.setEnabled(False)
-        
-        self.log_message("⏹️ Vista en vivo detenida")
-        logger.info("Vista en vivo detenida")
-    
-    def on_camera_frame(self, q_image, raw_frame=None):
-        """Callback cuando llega un frame de cámara."""
-        if self.camera_view_window and self.camera_view_window.isVisible():
-            # raw_frame viene directamente del signal (sincronizado con q_image)
-            self.camera_view_window.update_frame(q_image, raw_frame)
-    
-    def capture_single_image(self):
-        """Captura una imagen única. Si autofoco está habilitado, ejecuta Z-scan primero."""
-        if not self.camera_worker:
-            self.log_message("❌ Error: Cámara no conectada")
-            QMessageBox.warning(self.parent_gui, "Error", "Cámara no conectada")
-            return
-        
-        # Si autofoco está habilitado y C-Focus conectado, ejecutar autofoco primero
-        if self.autofocus_enabled_cb.isChecked() and self.parent_gui and self.parent_gui.cfocus_enabled:
-            self.log_message("🎯 Autofoco habilitado - ejecutando Z-scan antes de captura...")
-            self._run_autofocus(capture_after=True)
-            return
-        
-        # Captura normal sin autofoco
-        self._do_capture_image()
-    
-    def _focus_objects_only(self):
-        """Ejecuta rutina de enfoque sin capturar imagen."""
-        if not self.camera_worker:
-            self.log_message("❌ Error: Cámara no conectada")
-            return
-        
-        if not self.parent_gui or not self.parent_gui.cfocus_enabled:
-            self.log_message("❌ Error: C-Focus no conectado")
-            QMessageBox.warning(self.parent_gui, "Error", "Conecta C-Focus primero")
-            return
-        
-        self.log_message("🎯 Iniciando rutina de enfoque (sin captura)...")
-        self._run_autofocus(capture_after=False)
     
     def _run_autofocus(self, capture_after=False):
         """Ejecuta detección + autofoco. Opcionalmente captura después."""
-        if self.camera_worker.current_frame is None:
+        import numpy as np
+        import cv2
+        
+        # Obtener frame actual
+        current_frame = None
+        if self.camera_service and self.camera_service.current_frame is not None:
+            current_frame = self.camera_service.current_frame
+        elif self.camera_worker and self.camera_worker.current_frame is not None:
+            current_frame = self.camera_worker.current_frame
+        
+        if current_frame is None:
             self.log_message("❌ No hay frame disponible")
             return
         
@@ -1205,7 +590,7 @@ class CameraTab(QWidget):
         # Usar el scorer directamente para detección síncrona
         if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
             scorer = self.parent_gui.smart_focus_scorer
-            frame = self.camera_worker.current_frame.copy()
+            frame = current_frame.copy()
             
             # Convertir frame uint16 -> uint8
             if frame.dtype == np.uint16:
@@ -1222,7 +607,7 @@ class CameraTab(QWidget):
             else:
                 frame_bgr = frame_uint8
             
-            # Detectar objetos (scorer usa min_area=100 para detectar todos)
+            # Detectar objetos
             result = scorer.assess_image(frame_bgr)
             all_objects = result.objects if result.objects else []
             
@@ -1245,7 +630,7 @@ class CameraTab(QWidget):
             if hasattr(self.parent_gui, 'autofocus_service') and self.parent_gui.autofocus_service:
                 self.log_message("🎯 Iniciando Z-scan autofoco...")
                 self.parent_gui.autofocus_service.start_autofocus(objects)
-                self._pending_capture = capture_after  # Solo capturar si se pidió
+                self._pending_capture = capture_after
             else:
                 self.log_message("⚠️ AutofocusService no disponible")
                 if capture_after:
@@ -1255,217 +640,226 @@ class CameraTab(QWidget):
             if capture_after:
                 self._do_capture_image()
     
+    # ==================================================================
+    # CALLBACKS DE SERVICIO
+    # ==================================================================
+    
+    def _on_camera_connected(self, success: bool, info: str):
+        """Callback cuando la cámara se conecta."""
+        if success:
+            self.set_connected(True, info)
+        else:
+            self.log_message(f"❌ Fallo al conectar: {info}")
+            QMessageBox.critical(self.parent_gui, "Error", f"Fallo al conectar:\n{info}")
+            self.set_connected(False)
+    
+    def on_camera_frame(self, q_image, raw_frame=None):
+        """Callback cuando llega un frame de cámara."""
+        if self.camera_view_window and self.camera_view_window.isVisible():
+            self.camera_view_window.update_frame(q_image, raw_frame)
+    
+    # Alias para compatibilidad interna
+    _on_camera_frame = on_camera_frame
+    
+    def _on_error(self, error_msg: str):
+        """Callback cuando ocurre un error."""
+        self.log_message(f"❌ {error_msg}")
+    
+    # ==================================================================
+    # MÉTODOS DE ACTUALIZACIÓN DE UI
+    # ==================================================================
+    
+    def set_connected(self, connected: bool, info: str = ""):
+        """Actualiza UI cuando cambia estado de conexión."""
+        if connected:
+            self.camera_info_label.setText(f"Estado: Conectada - {info}")
+            self.camera_info_label.setStyleSheet("color: #27AE60; font-weight: bold;")
+            self.connect_btn.setEnabled(False)
+            self.disconnect_btn.setEnabled(True)
+            self.view_btn.setEnabled(True)
+            self.start_live_btn.setEnabled(True)
+            self.apply_exposure_btn.setEnabled(True)
+            self.apply_fps_btn.setEnabled(True)
+            self.apply_buffer_btn.setEnabled(True)
+            self.capture_btn.setEnabled(True)
+            self.focus_btn.setEnabled(True)
+        else:
+            self.camera_info_label.setText("Estado: Desconectada")
+            self.camera_info_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
+            self.connect_btn.setEnabled(self.thorlabs_available)
+            self.disconnect_btn.setEnabled(False)
+            self.view_btn.setEnabled(False)
+            self.start_live_btn.setEnabled(False)
+            self.stop_live_btn.setEnabled(False)
+            self.apply_exposure_btn.setEnabled(False)
+            self.apply_fps_btn.setEnabled(False)
+            self.apply_buffer_btn.setEnabled(False)
+            self.capture_btn.setEnabled(False)
+            self.focus_btn.setEnabled(False)
+    
+    def set_trajectory_status(self, has_trajectory: bool = None, n_points: int = 0, ready: bool = None):
+        """Actualiza estado de trayectoria.
+        
+        Args:
+            has_trajectory: Si hay trayectoria disponible
+            n_points: Número de puntos en la trayectoria
+            ready: Alias para has_trajectory (compatibilidad con main.py)
+        """
+        # Compatibilidad: ready es alias de has_trajectory
+        if ready is not None:
+            has_trajectory = ready
+        if has_trajectory is None:
+            has_trajectory = False
+            
+        self._trajectory_n_points = n_points if has_trajectory else 0
+        
+        if has_trajectory and n_points > 0:
+            self.trajectory_status.setText(f"✅ Trayectoria lista: {n_points} puntos")
+            self.trajectory_status.setStyleSheet("color: #27AE60; font-weight: bold;")
+            self.microscopy_start_btn.setEnabled(True)
+        else:
+            self.trajectory_status.setText("⚪ Sin trayectoria")
+            self.trajectory_status.setStyleSheet("color: #95A5A6; font-weight: bold;")
+            self.microscopy_start_btn.setEnabled(False)
+        
+        self._update_storage_estimate()
+    
+    def set_microscopy_progress(self, current: int, total: int):
+        """Actualiza progreso de microscopía."""
+        self.microscopy_progress_label.setText(f"Progreso: {current} / {total} imágenes capturadas")
+        
+        if current == 0:
+            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #3498DB;")
+        elif current < total:
+            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #F39C12;")
+        else:
+            self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #27AE60;")
+    
+    def log_message(self, message: str):
+        """Escribe un mensaje en la terminal de log."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.camera_terminal.append(f"[{timestamp}] {message}")
+    
+    # ==================================================================
+    # UTILIDADES
+    # ==================================================================
+    
+    def _browse_folder(self):
+        """Abre diálogo para seleccionar carpeta."""
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de guardado")
+        if folder:
+            self.save_folder_input.setText(folder)
+    
+    def _browse_microscopy_folder(self):
+        """Abre diálogo para seleccionar carpeta de microscopía."""
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta para microscopía")
+        if folder:
+            self.microscopy_folder_input.setText(folder)
+    
+    def _update_storage_estimate(self):
+        """Calcula y actualiza la estimación de almacenamiento."""
+        try:
+            width = int(self.img_width_input.text()) if self.img_width_input.text() else 1920
+            height = int(self.img_height_input.text()) if self.img_height_input.text() else 1080
+            
+            n_channels = sum([
+                self.channel_r_check.isChecked(),
+                self.channel_g_check.isChecked(),
+                self.channel_b_check.isChecked()
+            ])
+            
+            if n_channels == 0:
+                n_channels = 1
+            
+            bytes_per_pixel = 1 if n_channels == 1 else 3
+            n_points = self._trajectory_n_points
+            
+            bytes_per_image = width * height * bytes_per_pixel * 0.5
+            total_bytes = bytes_per_image * max(1, n_points)
+            total_mb = total_bytes / (1024 * 1024)
+            
+            if total_mb < 1:
+                self.storage_estimate_label.setText(f"~{total_bytes/1024:.1f} KB")
+            elif total_mb < 1024:
+                self.storage_estimate_label.setText(f"~{total_mb:.1f} MB")
+            else:
+                self.storage_estimate_label.setText(f"~{total_mb/1024:.2f} GB")
+                
+        except ValueError:
+            self.storage_estimate_label.setText("~0 MB")
+    
+    def set_test_tab_reference(self, test_tab):
+        """Configura la referencia a TestTab para sincronizar trayectoria."""
+        self.test_tab = test_tab
+        if hasattr(test_tab, 'trajectory_changed'):
+            test_tab.trajectory_changed.connect(self._on_trajectory_changed)
+    
+    def _on_trajectory_changed(self, n_points):
+        """Callback cuando cambia la trayectoria en TestTab."""
+        self.set_trajectory_status(n_points > 0, n_points)
+    
+    def refresh_trajectory_from_test_tab(self):
+        """Actualiza el estado de trayectoria desde TestTab."""
+        if self.test_tab and hasattr(self.test_tab, 'current_trajectory'):
+            trajectory = self.test_tab.current_trajectory
+            if trajectory is not None and len(trajectory) > 0:
+                self.set_trajectory_status(True, len(trajectory))
+                self.log_message(f"📍 Trayectoria sincronizada: {len(trajectory)} puntos")
+                return True
+        self.set_trajectory_status(False, 0)
+        return False
+    
+    # ==================================================================
+    # CALLBACKS DE DETECCIÓN Y AUTOFOCO (conectados desde main)
+    # ==================================================================
+    
+    def on_detection_ready(self, saliency_map, objects):
+        """Callback cuando hay nuevos resultados de detección."""
+        if hasattr(self, 'saliency_widget') and self.saliency_widget:
+            self.saliency_widget.update_detection(saliency_map, objects)
+    
+    def on_detection_status(self, status: str):
+        """Callback cuando cambia el estado del servicio de detección."""
+        self.log_message(f"🔍 {status}")
+    
+    def on_autofocus_started(self, obj_index: int, total: int):
+        """Callback cuando inicia autofoco de un objeto."""
+        self.log_message(f"🎯 Enfocando objeto {obj_index + 1}/{total}...")
+    
+    def on_autofocus_z_changed(self, z: float, score: float, roi_frame):
+        """Callback en cada posición Z evaluada."""
+        if hasattr(self, 'saliency_widget') and self.saliency_widget:
+            self.saliency_widget.update_autofocus_state(z, score, 0)
+    
+    def on_object_focused(self, obj_index: int, z_optimal: float, score: float):
+        """Callback cuando se encuentra el foco óptimo de un objeto."""
+        self.log_message(f"  ✓ Obj{obj_index}: Z={z_optimal:.1f}µm, S={score:.1f}")
+    
+    # ==================================================================
+    # PROPIEDADES PARA COMPATIBILIDAD
+    # ==================================================================
+    
+    @property
+    def camera_worker(self):
+        """Retorna el worker de cámara del servicio."""
+        if self.camera_service:
+            return self.camera_service.worker
+        return None
+    
+    def capture_microscopy_image(self, config: dict, image_index: int) -> bool:
+        """Captura una imagen para microscopía (delega a CameraService)."""
+        if self.camera_service:
+            return self.camera_service.capture_microscopy_image(config, image_index)
+        return False
+    
     def _do_capture_image(self):
-        """Realiza la captura de imagen (sin autofoco)."""
-        # Usar carpeta configurada
+        """Realiza la captura de imagen (sin autofoco). Delega a CameraService."""
         folder = self.save_folder_input.text()
         if not folder:
             folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta")
             if folder:
                 self.save_folder_input.setText(folder)
         
-        if folder:
-            # Crear carpeta si no existe
-            os.makedirs(folder, exist_ok=True)
-            
-            # Capturar usando el frame actual del buffer
-            if self.camera_worker.current_frame is not None:
-                # Obtener formato seleccionado
-                img_format = self.image_format_combo.currentText().lower()
-                
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = os.path.join(folder, f"captura_{timestamp}.{img_format}")
-                
-                frame = self.camera_worker.current_frame.copy()
-                frame_info = f"Original: {frame.shape}, dtype={frame.dtype}"
-                
-                # Normalizar frame uint16 para visualización correcta
-                if frame.dtype == np.uint16:
-                    frame_min, frame_max = frame.min(), frame.max()
-                    
-                    if img_format == 'tiff':
-                        # TIFF: mantener 16 bits original
-                        cv2.imwrite(filename, frame)
-                        self.log_message(f"   16-bit TIFF: rango [{frame_min}, {frame_max}]")
-                    else:
-                        # PNG/JPG: normalizar a 8 bits usando el mismo esquema que CameraWorker
-                        if frame_max > 0:
-                            frame_norm = (frame / frame_max * 255).astype(np.uint8)
-                        else:
-                            frame_norm = np.zeros_like(frame, dtype=np.uint8)
-
-                        if img_format == 'jpg':
-                            cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                        else:  # png
-                            cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-
-                        self.log_message(f"   Normalizado: [{frame_min}, {frame_max}] → 8-bit (max-scale)")
-                else:
-                    # Frame ya es uint8
-                    if img_format == 'jpg':
-                        cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    elif img_format == 'png':
-                        cv2.imwrite(filename, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-                    else:
-                        cv2.imwrite(filename, frame)
-                
-                self.log_message(f"📸 Imagen guardada: {filename}")
-                self.log_message(f"   {frame_info}")
-                logger.info(f"Captura guardada: {filename}")
-            else:
-                self.log_message("❌ Error: No hay frame disponible en buffer")
-                logger.warning("No hay frame en buffer para capturar")
-    
-    def capture_microscopy_image(self, config: dict, image_index: int) -> bool:
-        """
-        Captura una imagen para microscopia automatizada.
-        
-        Logica de canales:
-        - 1 canal seleccionado: Guarda como GRAYSCALE puro (1 canal, pequeno)
-        - 2-3 canales seleccionados: Guarda como BGR (3 canales)
-        
-        Args:
-            config: Configuracion de microscopia (class_name, save_folder, img_width, img_height, channels)
-            image_index: Indice de la imagen (0 a n_points-1)
-            
-        Returns:
-            bool: True si la captura fue exitosa
-        """
-        if not self.camera_worker or self.camera_worker.current_frame is None:
-            self.log_message(f"Error: No hay frame disponible para imagen {image_index}")
-            return False
-        
-        try:
-            # Obtener frame actual
-            frame = self.camera_worker.current_frame.copy()
-            h_orig, w_orig = frame.shape[:2]
-            
-            # Normalizar uint16 a uint8 para PNG
-            if frame.dtype == np.uint16:
-                if frame.max() > 0:
-                    frame = (frame / frame.max() * 255).astype(np.uint8)
-                else:
-                    frame = frame.astype(np.uint8)
-            
-            # Redimensionar si es necesario
-            target_width = config.get('img_width', 1920)
-            target_height = config.get('img_height', 1080)
-            
-            if w_orig != target_width or h_orig != target_height:
-                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            
-            # Procesar canales segun seleccion del usuario
-            channels = config.get('channels', {'R': False, 'G': True, 'B': False})
-            selected_channels = [c for c in ['R', 'G', 'B'] if channels.get(c, False)]
-            n_selected = len(selected_channels)
-            
-            # Logica de canales (igual que backup)
-            if len(frame.shape) == 2:  # Frame grayscale original
-                if n_selected == 1:
-                    # MONOBANDA: Guardar directamente en grayscale puro
-                    pass  # frame ya esta en grayscale
-                elif n_selected >= 2:
-                    # Duobanda o RGB: convertir a BGR y aplicar mascara
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                    
-                    # Crear mascara de canales (poner en 0 los NO seleccionados)
-                    if n_selected < 3:
-                        new_frame = np.zeros_like(frame)
-                        if channels.get('B', False):
-                            new_frame[:, :, 0] = frame[:, :, 0]
-                        if channels.get('G', False):
-                            new_frame[:, :, 1] = frame[:, :, 1]
-                        if channels.get('R', False):
-                            new_frame[:, :, 2] = frame[:, :, 2]
-                        frame = new_frame
-            
-            elif len(frame.shape) == 3:  # Frame ya es color (BGR)
-                if n_selected == 1:
-                    # MONOBANDA desde imagen color: extraer solo ese canal
-                    channel_map = {'B': 0, 'G': 1, 'R': 2}
-                    channel_idx = channel_map[selected_channels[0]]
-                    frame = frame[:, :, channel_idx]  # Convertir a grayscale
-                else:
-                    # Duobanda o RGB: aplicar mascara
-                    if n_selected < 3:
-                        new_frame = np.zeros_like(frame)
-                        if channels.get('B', False):
-                            new_frame[:, :, 0] = frame[:, :, 0]
-                        if channels.get('G', False):
-                            new_frame[:, :, 1] = frame[:, :, 1]
-                        if channels.get('R', False):
-                            new_frame[:, :, 2] = frame[:, :, 2]
-                        frame = new_frame
-            
-            # Generar nombre de archivo: NombreClase_XXXXX.png
-            class_name = config.get('class_name', 'Imagen')
-            save_folder = config.get('save_folder', '.')
-            
-            # Formato PNG por defecto (5 digitos: 00000-99999)
-            filename = f"{class_name}_{image_index:05d}.png"
-            filepath = os.path.join(save_folder, filename)
-            
-            # Guardar imagen
-            success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-            
-            if not success:
-                self.log_message(f"Error: cv2.imwrite fallo para {filename}")
-                return False
-            
-            # Calcular tamano del archivo
-            file_size_kb = os.path.getsize(filepath) / 1024
-            channels_str = ''.join(selected_channels)
-            self.log_message(f"[{image_index+1}] {filename} ({channels_str}, {file_size_kb:.0f} KB)")
-            logger.info(f"Microscopía: {filepath}")
-            
-            return True
-            
-        except Exception as e:
-            self.log_message(f"❌ Error capturando imagen {image_index}: {e}")
-            logger.error(f"Error en capture_microscopy_image: {e}")
-            return False
-    
-    # === Métodos de Autofoco C-Focus ===
-    
-    def _test_detection(self):
-        """Ejecuta detección U2-Net UNA SOLA VEZ (test manual)."""
-        # Verificar que la ventana de cámara esté abierta
-        if self.camera_view_window is None or not self.camera_view_window.isVisible():
-            self.log_message("⚠️ Abre la ventana de cámara primero (botón 'Ver')")
-            QMessageBox.information(
-                self.parent_gui, 
-                "Ventana de Cámara",
-                "Abre la ventana de cámara primero.\n\n"
-                "1. Conecta la cámara\n"
-                "2. Presiona 'Ver' para abrir la ventana\n"
-                "3. Inicia la vista en vivo\n"
-                "4. Presiona 'Test Detección'"
-            )
-            return
-        
-        # Actualizar parámetros desde CameraTab y ejecutar UNA detección
-        self._update_detection_params()
-        self.camera_view_window.trigger_detection()
-        self.log_message(f"🔍 TEST Detección - Área: [{self.min_pixels_spin.value()}-{self.max_pixels_spin.value()}] px")
-    
-    def _connect_cfocus(self):
-        """Conecta el piezo C-Focus."""
-        if self.parent_gui:
-            success = self.parent_gui.connect_cfocus()
-            if success:
-                self.cfocus_connect_btn.setEnabled(False)
-                self.cfocus_disconnect_btn.setEnabled(True)
-                self.cfocus_status_label.setText("C-Focus: ✅ Conectado")
-                self.cfocus_status_label.setStyleSheet("color: #27AE60; font-weight: bold;")
-                
-                self.parent_gui.initialize_autofocus()
-    
-    def _disconnect_cfocus(self):
-        """Desconecta el piezo C-Focus."""
-        if self.parent_gui and self.parent_gui.cfocus_controller:
-            self.parent_gui.disconnect_cfocus()
-            self.cfocus_connect_btn.setEnabled(True)
-            self.cfocus_disconnect_btn.setEnabled(False)
-            self.cfocus_status_label.setText("C-Focus: No conectado")
-            self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
-            self.log_message("C-Focus desconectado")
+        if folder and self.camera_service:
+            img_format = self.image_format_combo.currentText().lower()
+            self.camera_service.capture_image(folder, img_format)

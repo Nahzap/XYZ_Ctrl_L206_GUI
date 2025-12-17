@@ -26,6 +26,7 @@ from gui.windows import MatplotlibWindow
 from core.controllers.hinf_controller import (
     HInfController, SynthesisConfig, SynthesisResult
 )
+from config.constants import um_to_adc, DEADZONE_ADC, CALIBRATION_X
 
 logger = logging.getLogger("MotorControl_L206")
 
@@ -633,10 +634,9 @@ def execute_hinf_control(tab):
             logger.warning(f"Sensor {sensor_key} retornó None")
             return
 
-        # Convertir referencia a ADC
-        # Calibración: pendiente=-12.22 µm/ADC, intercepto=21601 µm
-        ref_adc = (21601.0 - tab.reference_um) / 12.22
-        ref_adc = max(0, min(1023, ref_adc))
+        # Convertir referencia a ADC usando calibración dinámica
+        axis = 'x' if tab.control_motor == 'A' else 'y'
+        ref_adc = um_to_adc(tab.reference_um, axis=axis)
 
         # Error en ADC
         error = ref_adc - sensor_adc
@@ -645,8 +645,8 @@ def execute_hinf_control(tab):
         if not hasattr(tab, '_log_counter'):
             tab._log_counter = 0
 
-        # Zona muerta (±3 ADC ≈ ±37µm)
-        if abs(error) <= 3:
+        # Zona muerta configurable desde constants.py
+        if abs(error) <= DEADZONE_ADC:
             tab.send_command_callback('A,0,0')
             tab.control_integral = 0
             tab._log_counter += 1

@@ -3,6 +3,10 @@ Análisis de función de transferencia a partir de datos experimentales.
 
 Este módulo identifica los parámetros K y τ de funciones de transferencia
 a partir de respuestas al escalón.
+
+MEJORAS 2025-12-17:
+- Guarda automáticamente la calibración en calibration.json
+- Calibración separada por eje (X/Y)
 """
 
 import logging
@@ -11,6 +15,8 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from matplotlib.figure import Figure
+
+from config.constants import save_calibration, reload_calibration, CALIBRATION_X, CALIBRATION_Y
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +252,9 @@ class TransferFunctionAnalyzer:
                         'sensor': sensor
                     }
                     
+                    # MEJORA 2025-12-17: Guardar automáticamente en calibration.json
+                    self._save_calibration_to_json(motor, sensor, intercepto, pendiente)
+                    
                     logger.info(f"✅ Calibración global guardada")
                     
                 else:
@@ -462,3 +471,45 @@ class TransferFunctionAnalyzer:
         """Limpia la lista de funciones de transferencia."""
         self.identified_functions = []
         logger.info("Lista de funciones de transferencia limpiada")
+    
+    def _save_calibration_to_json(self, motor: str, sensor: str, intercepto: float, pendiente: float):
+        """
+        Guarda automáticamente la calibración medida en calibration.json.
+        
+        Motor A + Sensor 2 → Eje X
+        Motor B + Sensor 1 → Eje Y
+        
+        Args:
+            motor: 'A' o 'B'
+            sensor: '1' o '2'
+            intercepto: Intercepto en µm (valor cuando ADC=0)
+            pendiente: Pendiente en µm/ADC
+        """
+        try:
+            # Determinar qué eje actualizar basado en motor/sensor
+            # Motor A con Sensor 2 = Eje X
+            # Motor B con Sensor 1 = Eje Y
+            is_x_axis = (motor == 'A' and sensor == '2') or (motor == 'A')
+            is_y_axis = (motor == 'B' and sensor == '1') or (motor == 'B')
+            
+            # Obtener calibración actual
+            cal_x = CALIBRATION_X.copy()
+            cal_y = CALIBRATION_Y.copy()
+            
+            # Actualizar el eje correspondiente
+            if is_x_axis:
+                cal_x = {'intercept': intercepto, 'slope': abs(pendiente)}
+                logger.info(f"📐 Actualizando calibración EJE X: intercept={intercepto:.2f}µm, slope={abs(pendiente):.4f}µm/ADC")
+            
+            if is_y_axis:
+                cal_y = {'intercept': intercepto, 'slope': abs(pendiente)}
+                logger.info(f"📐 Actualizando calibración EJE Y: intercept={intercepto:.2f}µm, slope={abs(pendiente):.4f}µm/ADC")
+            
+            # Guardar en JSON
+            if save_calibration(cal_x, cal_y):
+                logger.info(f"✅ Calibración guardada automáticamente en calibration.json")
+            else:
+                logger.warning(f"⚠️ No se pudo guardar la calibración en JSON")
+                
+        except Exception as e:
+            logger.error(f"❌ Error guardando calibración: {e}")
