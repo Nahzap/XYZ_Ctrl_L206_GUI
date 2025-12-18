@@ -95,7 +95,8 @@ class CameraService(QObject):
             self.worker.buffer_size = 2
         logger.info(f"[CameraService] Buffer inicial: {self.worker.buffer_size} frames")
 
-        self.status_changed.emit("🔌 Conectando cámara Thorlabs...")
+        # CameraWorker emite status_update que está conectado a status_changed
+        # No emitir aquí para evitar duplicación
         logger.info("[CameraService] Conectando cámara Thorlabs...")
         self.worker.connect_camera()
 
@@ -112,7 +113,7 @@ class CameraService(QObject):
         finally:
             self.worker = None
             self.disconnected.emit()
-            self.status_changed.emit("🔌 Cámara desconectada")
+            # CameraWorker ya emite "Camara cerrada." via status_update
             logger.info("[CameraService] Cámara desconectada")
 
     def start_live(self, exposure_s: float, fps: int, buffer_size: int) -> None:
@@ -127,14 +128,10 @@ class CameraService(QObject):
         self.worker.fps = fps
         self.worker.buffer_size = buffer_size
 
-        self.status_changed.emit(
-            f"▶️ Iniciando vista en vivo (exp={exposure_s}s, fps={fps}, buffer={buffer_size})"
-        )
+        # CameraWorker emite "Iniciando vista en vivo..." via status_update
         logger.info(
             f"[CameraService] Iniciando live view: exp={exposure_s}s, fps={fps}, buffer={buffer_size}"
         )
-
-        # Ejecutar run() de CameraWorker en su propio thread
         self.worker.start()
 
     def stop_live(self) -> None:
@@ -144,7 +141,7 @@ class CameraService(QObject):
 
         try:
             self.worker.stop_live_view()
-            self.status_changed.emit("⏹️ Vista en vivo detenida")
+            # CameraWorker emite "Vista en vivo detenida." via status_update
             logger.info("[CameraService] Vista en vivo detenida")
         except Exception as e:
             logger.error(f"[CameraService] Error al detener live view: {e}")
@@ -223,8 +220,7 @@ class CameraService(QObject):
         
         try:
             self.worker.change_exposure(exposure_s)
-            exposure_ms = exposure_s * 1000
-            self.status_changed.emit(f"✅ Exposición configurada: {exposure_s}s ({exposure_ms:.1f}ms)")
+            # CameraWorker emite mensaje via status_update
             logger.info(f"[CameraService] Exposición: {exposure_s}s")
             return True
         except Exception as e:
@@ -248,7 +244,7 @@ class CameraService(QObject):
         
         try:
             self.worker.change_fps(fps)
-            self.status_changed.emit(f"✅ FPS configurado: {fps}")
+            # CameraWorker emite mensaje via status_update
             logger.info(f"[CameraService] FPS: {fps}")
             return True
         except Exception as e:
@@ -276,7 +272,7 @@ class CameraService(QObject):
         
         try:
             self.worker.change_buffer_size(buffer_size)
-            self.status_changed.emit(f"✅ Buffer configurado: {buffer_size} frames")
+            # CameraWorker emite mensaje via status_update
             logger.info(f"[CameraService] Buffer: {buffer_size}")
             return True
         except Exception as e:

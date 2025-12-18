@@ -11,8 +11,8 @@ en un diccionario 'widgets' que se pasa como parámetro.
 
 import logging
 from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QLabel, QLineEdit, QPushButton, QTextEdit,
-                             QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox)
+                             QLabel, QLineEdit, QPushButton, QTextEdit, QWidget,
+                             QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QRadioButton)
 from PyQt5.QtCore import Qt
 
 logger = logging.getLogger('MotorControl_L206')
@@ -222,6 +222,78 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     
     format_layout.addStretch()
     layout.addLayout(format_layout)
+    
+    # === Método de Captura (Volumetría) ===
+    method_group = QGroupBox("Método de Captura")
+    method_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+    method_layout = QVBoxLayout()
+    
+    # Radio buttons para selección de método
+    widgets['capture_simple_radio'] = QRadioButton("Captura Simple (1 imagen)")
+    widgets['capture_simple_radio'].setChecked(True)
+    widgets['capture_simple_radio'].setToolTip("Captura una sola imagen del frame actual")
+    method_layout.addWidget(widgets['capture_simple_radio'])
+    
+    widgets['capture_volumetry_radio'] = QRadioButton("Volumetría (múltiples planos Z)")
+    widgets['capture_volumetry_radio'].setToolTip("Detecta objeto, encuentra BPoF, y captura X imágenes\nen diferentes planos Z para análisis volumétrico")
+    method_layout.addWidget(widgets['capture_volumetry_radio'])
+    
+    # Parámetros de volumetría (inicialmente ocultos)
+    volumetry_params = QWidget()
+    volumetry_params_layout = QGridLayout()
+    volumetry_params_layout.setContentsMargins(20, 5, 5, 5)
+    
+    # Número de imágenes
+    volumetry_params_layout.addWidget(QLabel("Imágenes:"), 0, 0)
+    widgets['volumetry_n_images_spin'] = QSpinBox()
+    widgets['volumetry_n_images_spin'].setRange(3, 50)
+    widgets['volumetry_n_images_spin'].setValue(10)
+    widgets['volumetry_n_images_spin'].setToolTip("Número total de imágenes a capturar en el rango Z")
+    widgets['volumetry_n_images_spin'].setFixedWidth(70)
+    volumetry_params_layout.addWidget(widgets['volumetry_n_images_spin'], 0, 1)
+    
+    # Paso Z para el scan
+    volumetry_params_layout.addWidget(QLabel("Paso Z (µm):"), 0, 2)
+    widgets['volumetry_z_step_spin'] = QDoubleSpinBox()
+    widgets['volumetry_z_step_spin'].setRange(0.01, 10.0)
+    widgets['volumetry_z_step_spin'].setValue(1.0)
+    widgets['volumetry_z_step_spin'].setDecimals(2)
+    widgets['volumetry_z_step_spin'].setSingleStep(0.1)
+    widgets['volumetry_z_step_spin'].setToolTip("Resolución del Z-scan (C-Focus soporta hasta 0.01µm)")
+    widgets['volumetry_z_step_spin'].setFixedWidth(70)
+    volumetry_params_layout.addWidget(widgets['volumetry_z_step_spin'], 0, 3)
+    
+    # Distribución (segunda fila)
+    volumetry_params_layout.addWidget(QLabel("Distribución:"), 1, 0)
+    widgets['volumetry_distribution_combo'] = QComboBox()
+    widgets['volumetry_distribution_combo'].addItems(["Uniforme", "Centrada (más cerca BPoF)"])
+    widgets['volumetry_distribution_combo'].setToolTip("Uniforme: espaciado igual entre imágenes\nCentrada: más imágenes cerca del BPoF")
+    widgets['volumetry_distribution_combo'].setFixedWidth(150)
+    volumetry_params_layout.addWidget(widgets['volumetry_distribution_combo'], 1, 1, 1, 2)
+    
+    # Checkboxes (tercera fila)
+    widgets['volumetry_include_bpof_check'] = QCheckBox("Incluir BPoF exacto")
+    widgets['volumetry_include_bpof_check'].setChecked(True)
+    widgets['volumetry_include_bpof_check'].setToolTip("Asegura que una imagen se capture exactamente en el BPoF")
+    volumetry_params_layout.addWidget(widgets['volumetry_include_bpof_check'], 2, 0, 1, 2)
+    
+    widgets['volumetry_save_json_check'] = QCheckBox("Guardar JSON con metadatos")
+    widgets['volumetry_save_json_check'].setChecked(True)
+    widgets['volumetry_save_json_check'].setToolTip("Guarda archivo JSON con información de Z, scores y parámetros")
+    volumetry_params_layout.addWidget(widgets['volumetry_save_json_check'], 2, 2, 1, 2)
+    
+    volumetry_params.setLayout(volumetry_params_layout)
+    widgets['volumetry_params_widget'] = volumetry_params
+    volumetry_params.setVisible(False)  # Oculto por defecto
+    method_layout.addWidget(volumetry_params)
+    
+    # Conectar radio button para mostrar/ocultar parámetros
+    widgets['capture_volumetry_radio'].toggled.connect(
+        lambda checked: volumetry_params.setVisible(checked)
+    )
+    
+    method_group.setLayout(method_layout)
+    layout.addWidget(method_group)
     
     # Botones de captura
     btn_layout = QHBoxLayout()

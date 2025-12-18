@@ -1,5 +1,5 @@
 # Auditoría del Proyecto XYZ_Ctrl_L206_GUI
-## Fecha: 2025-12-17 17:15 (Actualizado)
+## Fecha: 2025-12-17 17:45 (Actualizado)
 
 ---
 
@@ -234,14 +234,19 @@ Funcionalidades a extraer:
 | 2025-12-17 | Expandir CameraService | +342 líneas |
 | 2025-12-17 | Crear camera_tab_ui_builder | +578 líneas (nuevo) |
 | 2025-12-17 | Consolidar backups | Organización |
+| 2025-12-17 | Corregir autofoco (restaurar lógica) | Funcionalidad restaurada |
+| 2025-12-17 | Agregar soporte PNG/TIFF 16-bit | Calidad de imagen |
+| 2025-12-17 | Agregar checkbox 16-bit en UI | Control de usuario |
 
 ---
 
 ## 8. Próximos Pasos
 
 1. **[COMPLETADO]** ~~Refactorizar `camera_tab.py`~~ ✅
-2. **[MEDIO]** Revisar `hinf_controller.py` (1171 líneas)
-3. **[BAJO]** Optimizar servicios de visión
+2. **[COMPLETADO]** ~~Corregir autofoco~~ ✅
+3. **[COMPLETADO]** ~~Soporte PNG 16-bit~~ ✅
+4. **[EN PROGRESO]** Optimizar rutinas de autoenfoque (Volumetría)
+5. **[MEDIO]** Revisar `hinf_controller.py` (1171 líneas)
 
 ---
 

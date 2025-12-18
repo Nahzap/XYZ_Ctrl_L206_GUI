@@ -11,6 +11,8 @@ Reducción: 1472 → ~450 líneas
 
 import os
 import logging
+import numpy as np
+import cv2
 from datetime import datetime
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QScrollArea,
@@ -195,6 +197,16 @@ class CameraTab(QWidget):
         self.capture_btn = self._widgets.get('capture_btn')
         self.focus_btn = self._widgets.get('focus_btn')
         
+        # Volumetría
+        self.capture_simple_radio = self._widgets.get('capture_simple_radio')
+        self.capture_volumetry_radio = self._widgets.get('capture_volumetry_radio')
+        self.volumetry_n_images_spin = self._widgets.get('volumetry_n_images_spin')
+        self.volumetry_z_step_spin = self._widgets.get('volumetry_z_step_spin')
+        self.volumetry_distribution_combo = self._widgets.get('volumetry_distribution_combo')
+        self.volumetry_include_bpof_check = self._widgets.get('volumetry_include_bpof_check')
+        self.volumetry_save_json_check = self._widgets.get('volumetry_save_json_check')
+        self.volumetry_params_widget = self._widgets.get('volumetry_params_widget')
+        
         # Microscopía
         self.trajectory_status = self._widgets.get('trajectory_status')
         self.class_name_input = self._widgets.get('class_name_input')
@@ -229,14 +241,15 @@ class CameraTab(QWidget):
         self.camera_terminal = self._widgets.get('camera_terminal')
     
     def _connect_service_signals(self):
-        """Conecta señales del CameraService con handlers de UI."""
+        """Conecta señales del CameraService con handlers de UI.
+        
+        NOTA: Las conexiones principales se hacen en main.py para evitar duplicación.
+        Este método solo conecta señales que NO están en main.py.
+        """
         if self.camera_service is None:
             return
         
-        self.camera_service.status_changed.connect(self.log_message)
-        self.camera_service.connected.connect(self._on_camera_connected)
-        self.camera_service.disconnected.connect(lambda: self.set_connected(False))
-        self.camera_service.frame_ready.connect(self._on_camera_frame)
+        # Solo conectar error_occurred que no está en main.py
         self.camera_service.error_occurred.connect(self._on_error)
     
     # ==================================================================
@@ -254,7 +267,7 @@ class CameraTab(QWidget):
         except ValueError:
             buffer_size = 2
         
-        self.log_message("🔌 Conectando cámara Thorlabs...")
+        # CameraService emite status_changed con el mensaje apropiado
         self.camera_service.connect_camera(buffer_size=buffer_size)
     
     def _on_disconnect_clicked(self):
@@ -389,6 +402,11 @@ class CameraTab(QWidget):
             self.log_message("❌ Error: CameraService no disponible")
             return
         
+        # Verificar si es volumetría
+        if self.capture_volumetry_radio and self.capture_volumetry_radio.isChecked():
+            self._start_volumetry_capture()
+            return
+        
         # Si autofoco está habilitado, ejecutar autofoco primero
         if (self.autofocus_enabled_cb.isChecked() and 
             self.parent_gui and getattr(self.parent_gui, 'cfocus_enabled', False)):
@@ -396,7 +414,7 @@ class CameraTab(QWidget):
             self._run_autofocus(capture_after=True)
             return
         
-        # Captura normal
+        # Captura simple
         folder = self.save_folder_input.text()
         if not folder:
             folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta")
@@ -406,6 +424,174 @@ class CameraTab(QWidget):
         if folder:
             img_format = self.image_format_combo.currentText().lower()
             self.camera_service.capture_image(folder, img_format)
+    
+    def _start_volumetry_capture(self):
+        """Inicia captura volumétrica (Método 1: múltiples planos Z)."""
+        # Verificar C-Focus conectado
+        if not self.parent_gui or not getattr(self.parent_gui, 'cfocus_enabled', False):
+            self.log_message("❌ Error: C-Focus no conectado (requerido para volumetría)")
+            QMessageBox.warning(self.parent_gui, "Error", 
+                              "Volumetría requiere C-Focus conectado para control de Z")
+            return
+        
+        # Verificar SmartFocusScorer disponible
+        if not hasattr(self.parent_gui, 'smart_focus_scorer') or self.parent_gui.smart_focus_scorer is None:
+            self.log_message("❌ Error: SmartFocusScorer no disponible")
+            return
+        
+        # Obtener carpeta
+        folder = self.save_folder_input.text()
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta para Volumetría")
+            if folder:
+                self.save_folder_input.setText(folder)
+            else:
+                return
+        
+        # Construir configuración de volumetría
+        z_step = self.volumetry_z_step_spin.value() if self.volumetry_z_step_spin else 1.0
+        config = {
+            'n_images': self.volumetry_n_images_spin.value() if self.volumetry_n_images_spin else 10,
+            'distribution': self.volumetry_distribution_combo.currentText() if self.volumetry_distribution_combo else 'uniform',
+            'include_bpof': self.volumetry_include_bpof_check.isChecked() if self.volumetry_include_bpof_check else True,
+            'save_json': self.volumetry_save_json_check.isChecked() if self.volumetry_save_json_check else True,
+            'save_folder': folder,
+            'img_format': self.image_format_combo.currentText().lower(),
+            'use_16bit': self.use_16bit_check.isChecked() if self.use_16bit_check else True,
+            'z_range': self.z_range_spin.value() if self.z_range_spin else 50.0,
+            'z_step': z_step,  # Paso configurable (0.01 - 10.0 µm)
+            'min_area': self.min_pixels_spin.value() if self.min_pixels_spin else 5000,
+            'max_area': self.max_pixels_spin.value() if self.max_pixels_spin else 50000,
+            'score_threshold': 0.3,
+            'class_name': 'volumetry',
+            'exposure_ms': float(self.exposure_input.text()) if self.exposure_input else 50.0
+        }
+        
+        self.log_message("=" * 40)
+        self.log_message("🔬 INICIANDO VOLUMETRÍA")
+        self.log_message(f"   Imágenes: {config['n_images']}")
+        self.log_message(f"   Distribución: {config['distribution']}")
+        self.log_message(f"   Formato: {config['img_format'].upper()} ({'16-bit' if config['use_16bit'] else '8-bit'})")
+        self.log_message(f"   Rango Z: ±{config['z_range']}µm, paso: {config['z_step']}µm")
+        self.log_message("=" * 40)
+        
+        # Ejecutar volumetría en thread separado
+        import threading
+        thread = threading.Thread(target=self._execute_volumetry, args=(config,))
+        thread.daemon = True
+        thread.start()
+    
+    def _execute_volumetry(self, config: dict):
+        """Ejecuta la volumetría (en thread separado)."""
+        from core.services.volumetry_service import VolumetryService
+        
+        # Crear servicio de volumetría
+        volumetry_service = VolumetryService(
+            get_current_frame=lambda: self.camera_service.current_frame if self.camera_service else None,
+            smart_focus_scorer=self.parent_gui.smart_focus_scorer,
+            move_z=self._volumetry_move_z,
+            get_z_position=self._volumetry_get_z,
+            capture_image=self._volumetry_capture_image,
+            parent=None
+        )
+        
+        # Conectar señales
+        volumetry_service.volumetry_progress.connect(self._on_volumetry_progress)
+        volumetry_service.volumetry_image_captured.connect(self._on_volumetry_image)
+        volumetry_service.volumetry_complete.connect(self._on_volumetry_complete)
+        volumetry_service.volumetry_error.connect(self._on_volumetry_error)
+        
+        # Ejecutar
+        volumetry_service.start_volumetry(config)
+    
+    def _volumetry_move_z(self, z_position: float):
+        """Mueve el eje Z a la posición especificada (para volumetría)."""
+        if self.parent_gui and hasattr(self.parent_gui, 'cfocus_controller'):
+            cfocus = self.parent_gui.cfocus_controller
+            if cfocus is not None:
+                cfocus.move_z(z_position)
+    
+    def _volumetry_get_z(self) -> float:
+        """Obtiene la posición Z actual (para volumetría)."""
+        if self.parent_gui and hasattr(self.parent_gui, 'cfocus_controller'):
+            cfocus = self.parent_gui.cfocus_controller
+            if cfocus is not None:
+                z = cfocus.read_z()
+                return z if z is not None else 0.0
+        return 0.0
+    
+    def _volumetry_capture_image(self, filepath: str, config: dict) -> bool:
+        """Captura y guarda una imagen usando EXACTAMENTE la misma lógica de capture_image."""
+        if not self.camera_service or not self.camera_service.worker:
+            logger.error("[CameraTab] No hay camera_service o worker disponible")
+            return False
+        
+        if self.camera_service.worker.current_frame is None:
+            logger.error("[CameraTab] current_frame es None")
+            return False
+        
+        try:
+            # Obtener frame actual - COPIA
+            frame = self.camera_service.worker.current_frame.copy()
+            img_format = config.get('img_format', 'png')
+            
+            # EXACTAMENTE la misma lógica de CameraService.capture_image
+            if frame.dtype == np.uint16:
+                frame_min, frame_max = frame.min(), frame.max()
+                logger.debug(f"[Volumetry] Frame: [{frame_min}, {frame_max}]")
+                
+                if img_format == 'tiff':
+                    # TIFF: mantener 16 bits original
+                    success = cv2.imwrite(filepath, frame)
+                else:
+                    # PNG/JPG: normalizar a 8 bits (IGUAL que capture_image)
+                    if frame_max > 0:
+                        frame_norm = (frame / frame_max * 255).astype(np.uint8)
+                    else:
+                        frame_norm = np.zeros_like(frame, dtype=np.uint8)
+                    
+                    if img_format == 'jpg':
+                        success = cv2.imwrite(filepath, frame_norm, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    else:  # png
+                        success = cv2.imwrite(filepath, frame_norm, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+            else:
+                # Frame ya es uint8
+                if img_format == 'jpg':
+                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                elif img_format == 'png':
+                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+                else:
+                    success = cv2.imwrite(filepath, frame)
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"[CameraTab] Error en _volumetry_capture_image: {e}")
+            return False
+    
+    def _on_volumetry_progress(self, current: int, total: int, z: float):
+        """Callback de progreso de volumetría."""
+        self.log_message(f"   📸 Capturando {current}/{total} (Z={z:.1f}µm)")
+    
+    def _on_volumetry_image(self, z: float, score: float, filepath: str):
+        """Callback cuando se captura una imagen de volumetría."""
+        import os
+        filename = os.path.basename(filepath)
+        self.log_message(f"   ✅ {filename} (score={score:.2f})")
+    
+    def _on_volumetry_complete(self, result):
+        """Callback cuando termina la volumetría."""
+        self.log_message("=" * 40)
+        self.log_message("✅ VOLUMETRÍA COMPLETADA")
+        self.log_message(f"   Imágenes: {len(result.images)}")
+        self.log_message(f"   BPoF: Z={result.z_bpof:.1f}µm (score={result.score_bpof:.2f})")
+        self.log_message(f"   Rango detectado: [{result.z_min_detected:.1f}, {result.z_max_detected:.1f}]µm")
+        self.log_message(f"   Carpeta: {result.folder_path}")
+        self.log_message("=" * 40)
+    
+    def _on_volumetry_error(self, error_msg: str):
+        """Callback de error en volumetría."""
+        self.log_message(f"❌ Error en volumetría: {error_msg}")
     
     def _on_focus_clicked(self):
         """Handler para botón Enfocar."""
@@ -487,6 +673,12 @@ class CameraTab(QWidget):
         self._microscopy_image_counter = 0
         self.set_microscopy_progress(0, config['n_points'])
         
+        # Deshabilitar volumetría durante microscopía (Método 2 es el único disponible)
+        if self.capture_volumetry_radio:
+            self.capture_simple_radio.setChecked(True)  # Forzar captura simple
+            self.capture_volumetry_radio.setEnabled(False)
+            self.capture_simple_radio.setEnabled(False)
+        
         if self.camera_view_window:
             self.camera_view_window.set_microscopy_active(True, 0)
         
@@ -497,6 +689,11 @@ class CameraTab(QWidget):
         self.log_message("⏹️ DETENIENDO MICROSCOPÍA...")
         self.microscopy_start_btn.setEnabled(True)
         self.microscopy_stop_btn.setEnabled(False)
+        
+        # Rehabilitar selección de método de captura
+        if self.capture_volumetry_radio:
+            self.capture_volumetry_radio.setEnabled(True)
+            self.capture_simple_radio.setEnabled(True)
         
         if self.camera_view_window:
             self.camera_view_window.set_microscopy_active(False)
