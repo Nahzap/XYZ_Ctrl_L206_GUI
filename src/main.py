@@ -295,6 +295,10 @@ class ArduinoGUI(QMainWindow):
         self.microscopy_service = MicroscopyService(
             parent=self,
             get_trajectory=lambda: getattr(self.test_tab, 'current_trajectory', None),
+            get_trajectory_params=lambda: {
+                'tolerance_um': getattr(self.test_tab, 'trajectory_tolerance', 25.0),
+                'pause_s': getattr(self.test_tab, 'trajectory_pause', 2.0)
+            },
             set_dual_refs=lambda x, y: (
                 self.test_tab.ref_a_input.setText(f"{x:.0f}"),
                 self.test_tab.ref_b_input.setText(f"{y:.0f}")
@@ -318,6 +322,7 @@ class ArduinoGUI(QMainWindow):
                 getattr(self.test_tab, 'controller_a', None) is not None
                 and getattr(self.test_tab, 'controller_b', None) is not None
             ),
+            test_service=self.test_tab.test_service,
         )
 
         # Conectar señales de microscopía
@@ -328,6 +333,12 @@ class ArduinoGUI(QMainWindow):
         # Conectar señales de máscaras de autofoco con CameraViewWindow
         self.microscopy_service.show_masks.connect(self._on_show_autofocus_masks)
         self.microscopy_service.clear_masks.connect(self._on_clear_autofocus_masks)
+
+        # Aprendizaje asistido: popup de confirmación
+        if hasattr(self.microscopy_service, 'learning_confirmation_requested'):
+            self.microscopy_service.learning_confirmation_requested.connect(
+                self._on_learning_confirmation_requested
+            )
 
         # Conectar señales de microscopia desde CameraTab hacia el servicio
         self.camera_tab.microscopy_start_requested.connect(
@@ -349,6 +360,40 @@ class ArduinoGUI(QMainWindow):
         
         # Actualizar estado inicial de conexión en ControlTab
         self._update_connection_status()
+
+    def _on_learning_confirmation_requested(self, frame_bgr, obj, class_name, confidence, count, target):
+        """Muestra popup de confirmación de ROI y retorna la respuesta al servicio."""
+        try:
+            from gui.dialogs import LearningConfirmationDialog
+
+            dialog = LearningConfirmationDialog(self)
+            roi_bbox = getattr(obj, 'bounding_box', (0, 0, 0, 0))
+            roi_mask = getattr(obj, 'mask', None)
+            area = int(getattr(obj, 'area', 0))
+            score = float(getattr(obj, 'focus_score', 0.0))
+
+            response = dialog.show_roi_for_confirmation(
+                frame_bgr,
+                roi_bbox,
+                roi_mask,
+                area,
+                score,
+                count,
+                target,
+            )
+
+            # Enviar respuesta de usuario de vuelta al servicio
+            # Permitir respuesta enriquecida (dict) con ROIs manuales
+            if isinstance(response, dict):
+                self.microscopy_service.confirm_learning_step(response, class_name)
+            else:
+                self.microscopy_service.confirm_learning_step(bool(response), class_name)
+        except Exception as e:
+            logging.getLogger('MotorControl_L206').error(
+                f"Error en _on_learning_confirmation_requested: {e}\n{traceback.format_exc()}"
+            )
+            # Auto-aceptar en caso de error para no bloquear el flujo
+            self.microscopy_service.confirm_learning_step(True, class_name)
     
     def open_signal_window(self):
         """Abre la ventana de señales en tiempo real."""
@@ -594,6 +639,7 @@ class ArduinoGUI(QMainWindow):
         
         # Conectar señales del servicio de autofoco
         self.autofocus_service.scan_started.connect(self.camera_tab.on_autofocus_started)
+        self.autofocus_service.scan_started.connect(self._on_autofocus_started)
         self.autofocus_service.z_changed.connect(self.camera_tab.on_autofocus_z_changed)
         self.autofocus_service.object_focused.connect(self.camera_tab.on_object_focused)
         self.autofocus_service.scan_complete.connect(self._on_autofocus_complete)
@@ -602,10 +648,53 @@ class ArduinoGUI(QMainWindow):
             lambda msg: self.camera_tab.log_message(f"❌ Autofoco: {msg}")
         )
         
+        # Conectar señales para overlay de score en ventana de cámara
+        self.autofocus_service.score_updated.connect(self._on_autofocus_score_updated)
+        self.autofocus_service.status_message.connect(self._on_autofocus_status_message)
+        
+        # Conectar señal de progreso
+        self.autofocus_service.progress_updated.connect(self._on_autofocus_progress)
+        
         logger.info("Servicios de detección configurados")
+    
+    def _on_autofocus_started(self, obj_index: int, total_objects: int):
+        """Callback cuando inicia el autofoco - activa overlay en ventana de cámara."""
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.set_autofocus_active(True)
+        logger.info(f"[Main] Autofoco iniciado: objeto {obj_index+1}/{total_objects}")
+    
+    def _on_autofocus_score_updated(self, z_position: float, score: float):
+        """Callback para actualizar overlay de score en ventana de cámara."""
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.update_autofocus_score(z_position, score)
+    
+    def _on_autofocus_status_message(self, message: str):
+        """Callback para mensajes de estado del autofoco."""
+        # Mostrar en ventana de cámara
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.set_autofocus_status(message)
+        # También mostrar en log de CameraTab
+        self.camera_tab.log_message(message)
+    
+    def _on_autofocus_progress(self, current_step: int, total_steps: int, phase_name: str):
+        """Callback para actualizar progreso del autofoco."""
+        percentage = int((current_step / total_steps) * 100) if total_steps > 0 else 0
+        progress_msg = f"⏳ {phase_name}: {current_step}/{total_steps} ({percentage}%)"
+        
+        # Actualizar en ventana de cámara
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.set_autofocus_status(progress_msg)
+        
+        # Log cada 10% para no saturar
+        if current_step == 1 or percentage % 10 == 0 or current_step == total_steps:
+            self.camera_tab.log_message(progress_msg)
     
     def _on_autofocus_complete(self, results):
         """Callback cuando termina todo el proceso de autofoco."""
+        # Desactivar overlay de score
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.set_autofocus_active(False)
+        
         n_results = len(results)
         
         # Mostrar resultados de cada objeto
@@ -687,6 +776,10 @@ class ArduinoGUI(QMainWindow):
             self.cfocus_enabled = True
             self.camera_tab.log_message(f"✅ C-Focus: {message}")
             logger.info(f"C-Focus conectado: {message}")
+            
+            # Configurar C-Focus en ventana de cámara para lectura Z en tiempo real
+            if self.camera_tab.camera_view_window:
+                self.camera_tab.camera_view_window.set_cfocus_controller(self.cfocus_controller)
         else:
             self.cfocus_enabled = False
             self.camera_tab.log_message(f"❌ C-Focus: {message}")
@@ -701,6 +794,36 @@ class ArduinoGUI(QMainWindow):
             self.cfocus_enabled = False
             self.cfocus_controller = None
             logger.info("C-Focus desconectado")
+    
+    def calibrate_cfocus(self):
+        """Ejecuta calibración de límites del C-Focus."""
+        if not self.cfocus_enabled or not self.cfocus_controller:
+            self.camera_tab.log_message("⚠️ C-Focus no conectado")
+            return
+        
+        self.camera_tab.log_message("🔧 Iniciando calibración de C-Focus...")
+        logger.info("[Main] Iniciando calibración de C-Focus")
+        
+        try:
+            result = self.cfocus_controller.calibrate_limits()
+            
+            if result:
+                msg = (f"✅ Calibración completada:\n"
+                       f"   Mín: {result['z_min']:.2f} µm\n"
+                       f"   Máx: {result['z_max']:.2f} µm\n"
+                       f"   Centro: {result['z_center']:.2f} µm\n"
+                       f"   Rango: {result['z_range']:.2f} µm")
+                self.camera_tab.log_message(msg)
+                logger.info(f"[Main] Calibración exitosa: {result}")
+                
+                # CRÍTICO: Configurar AutofocusService después de calibrar
+                self.initialize_autofocus()
+            else:
+                self.camera_tab.log_message("❌ Error en calibración")
+                
+        except Exception as e:
+            self.camera_tab.log_message(f"❌ Error: {e}")
+            logger.error(f"[Main] Error en calibración: {e}", exc_info=True)
     
     def initialize_autofocus(self):
         """Inicializa el servicio de autofoco con C-Focus y cámara."""

@@ -223,7 +223,7 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     format_layout.addStretch()
     layout.addLayout(format_layout)
     
-    # === Método de Captura (Volumetría) ===
+    # === Método de Captura (Z-Stack) ===
     method_group = QGroupBox("Método de Captura")
     method_group.setStyleSheet("QGroupBox { font-weight: bold; }")
     method_layout = QVBoxLayout()
@@ -234,62 +234,56 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     widgets['capture_simple_radio'].setToolTip("Captura una sola imagen del frame actual")
     method_layout.addWidget(widgets['capture_simple_radio'])
     
-    widgets['capture_volumetry_radio'] = QRadioButton("Volumetría (múltiples planos Z)")
-    widgets['capture_volumetry_radio'].setToolTip("Detecta objeto, encuentra BPoF, y captura X imágenes\nen diferentes planos Z para análisis volumétrico")
-    method_layout.addWidget(widgets['capture_volumetry_radio'])
+    widgets['capture_zstack_radio'] = QRadioButton("Capturar Z-Stack (múltiples planos Z)")
+    widgets['capture_zstack_radio'].setToolTip("Captura múltiples imágenes en diferentes planos Z\ncontrolado por el Paso Z que tú defines")
+    method_layout.addWidget(widgets['capture_zstack_radio'])
     
-    # Parámetros de volumetría (inicialmente ocultos)
-    volumetry_params = QWidget()
-    volumetry_params_layout = QGridLayout()
-    volumetry_params_layout.setContentsMargins(20, 5, 5, 5)
+    # Parámetros de Z-Stack (inicialmente ocultos)
+    zstack_params = QWidget()
+    zstack_params_layout = QGridLayout()
+    zstack_params_layout.setContentsMargins(20, 5, 5, 5)
     
     # Número de imágenes
-    volumetry_params_layout.addWidget(QLabel("Imágenes:"), 0, 0)
-    widgets['volumetry_n_images_spin'] = QSpinBox()
-    widgets['volumetry_n_images_spin'].setRange(3, 50)
-    widgets['volumetry_n_images_spin'].setValue(10)
-    widgets['volumetry_n_images_spin'].setToolTip("Número total de imágenes a capturar en el rango Z")
-    widgets['volumetry_n_images_spin'].setFixedWidth(70)
-    volumetry_params_layout.addWidget(widgets['volumetry_n_images_spin'], 0, 1)
+    zstack_params_layout.addWidget(QLabel("Imágenes:"), 0, 0)
+    widgets['zstack_n_images_spin'] = QSpinBox()
+    widgets['zstack_n_images_spin'].setRange(3, 10000)
+    widgets['zstack_n_images_spin'].setValue(200)
+    widgets['zstack_n_images_spin'].setToolTip("Número total de imágenes a capturar en el Z-Stack (sin límite)")
+    widgets['zstack_n_images_spin'].setFixedWidth(70)
+    zstack_params_layout.addWidget(widgets['zstack_n_images_spin'], 0, 1)
     
-    # Paso Z para el scan
-    volumetry_params_layout.addWidget(QLabel("Paso Z (µm):"), 0, 2)
-    widgets['volumetry_z_step_spin'] = QDoubleSpinBox()
-    widgets['volumetry_z_step_spin'].setRange(0.01, 10.0)
-    widgets['volumetry_z_step_spin'].setValue(1.0)
-    widgets['volumetry_z_step_spin'].setDecimals(2)
-    widgets['volumetry_z_step_spin'].setSingleStep(0.1)
-    widgets['volumetry_z_step_spin'].setToolTip("Resolución del Z-scan (C-Focus soporta hasta 0.01µm)")
-    widgets['volumetry_z_step_spin'].setFixedWidth(70)
-    volumetry_params_layout.addWidget(widgets['volumetry_z_step_spin'], 0, 3)
+    # Paso Z para el scan (COMANDA las slices)
+    zstack_params_layout.addWidget(QLabel("Paso Z (µm):"), 0, 2)
+    widgets['zstack_z_step_spin'] = QDoubleSpinBox()
+    widgets['zstack_z_step_spin'].setRange(0.001, 10.0)
+    widgets['zstack_z_step_spin'].setValue(0.05)
+    widgets['zstack_z_step_spin'].setDecimals(3)
+    widgets['zstack_z_step_spin'].setSingleStep(0.01)
+    widgets['zstack_z_step_spin'].setToolTip("Paso Z que COMANDA las slices del Z-Stack (C-Focus soporta hasta 0.001µm)")
+    widgets['zstack_z_step_spin'].setFixedWidth(80)
+    zstack_params_layout.addWidget(widgets['zstack_z_step_spin'], 0, 3)
     
-    # Distribución (segunda fila)
-    volumetry_params_layout.addWidget(QLabel("Distribución:"), 1, 0)
-    widgets['volumetry_distribution_combo'] = QComboBox()
-    widgets['volumetry_distribution_combo'].addItems(["Uniforme", "Centrada (más cerca BPoF)"])
-    widgets['volumetry_distribution_combo'].setToolTip("Uniforme: espaciado igual entre imágenes\nCentrada: más imágenes cerca del BPoF")
-    widgets['volumetry_distribution_combo'].setFixedWidth(150)
-    volumetry_params_layout.addWidget(widgets['volumetry_distribution_combo'], 1, 1, 1, 2)
+    # Indicador de rango Z del C-Focus (segunda fila)
+    zstack_params_layout.addWidget(QLabel("Rango C-Focus:"), 1, 0)
+    widgets['zstack_cfocus_range_label'] = QLabel("0.0 - 0.0 µm")
+    widgets['zstack_cfocus_range_label'].setStyleSheet("color: #888; font-style: italic;")
+    widgets['zstack_cfocus_range_label'].setToolTip("Rango calibrado del C-Focus (min - max)")
+    zstack_params_layout.addWidget(widgets['zstack_cfocus_range_label'], 1, 1, 1, 3)
     
-    # Checkboxes (tercera fila)
-    widgets['volumetry_include_bpof_check'] = QCheckBox("Incluir BPoF exacto")
-    widgets['volumetry_include_bpof_check'].setChecked(True)
-    widgets['volumetry_include_bpof_check'].setToolTip("Asegura que una imagen se capture exactamente en el BPoF")
-    volumetry_params_layout.addWidget(widgets['volumetry_include_bpof_check'], 2, 0, 1, 2)
+    # Checkboxes
+    widgets['zstack_save_json_check'] = QCheckBox("Guardar JSON con metadatos")
+    widgets['zstack_save_json_check'].setChecked(True)
+    widgets['zstack_save_json_check'].setToolTip("Guarda archivo JSON con información de Z, scores y parámetros")
+    zstack_params_layout.addWidget(widgets['zstack_save_json_check'], 2, 0, 1, 2)
     
-    widgets['volumetry_save_json_check'] = QCheckBox("Guardar JSON con metadatos")
-    widgets['volumetry_save_json_check'].setChecked(True)
-    widgets['volumetry_save_json_check'].setToolTip("Guarda archivo JSON con información de Z, scores y parámetros")
-    volumetry_params_layout.addWidget(widgets['volumetry_save_json_check'], 2, 2, 1, 2)
-    
-    volumetry_params.setLayout(volumetry_params_layout)
-    widgets['volumetry_params_widget'] = volumetry_params
-    volumetry_params.setVisible(False)  # Oculto por defecto
-    method_layout.addWidget(volumetry_params)
+    zstack_params.setLayout(zstack_params_layout)
+    widgets['zstack_params_widget'] = zstack_params
+    zstack_params.setVisible(False)  # Oculto por defecto
+    method_layout.addWidget(zstack_params)
     
     # Conectar radio button para mostrar/ocultar parámetros
-    widgets['capture_volumetry_radio'].toggled.connect(
-        lambda checked: volumetry_params.setVisible(checked)
+    widgets['capture_zstack_radio'].toggled.connect(
+        lambda checked: zstack_params.setVisible(checked)
     )
     
     method_group.setLayout(method_layout)
@@ -297,7 +291,7 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     
     # Botones de captura
     btn_layout = QHBoxLayout()
-    widgets['capture_btn'] = QPushButton("📸 Capturar Imagen")
+    widgets['capture_btn'] = QPushButton("📸 Capturar Z-Stack")
     widgets['capture_btn'].setStyleSheet("""
         QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #E67E22; }
         QPushButton:hover { background-color: #F39C12; }
@@ -351,6 +345,23 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     info_label.setStyleSheet("padding: 8px; background-color: #34495E; border-radius: 5px;")
     layout.addWidget(info_label)
     
+    # Modo de ejecución (XY solo vs XY + AF Z)
+    mode_layout = QHBoxLayout()
+    widgets['xy_only_cb'] = QCheckBox("Trayectoria XY + Auto foco Z")
+    widgets['xy_only_cb'].setToolTip(
+        "Activado: Sólo trayectoria XY (captura sin segmentación / sin AF Z)\n"
+        "Desactivado: Trayectoria XY + Auto foco Z (detección y enfoque por objeto)"
+    )
+    widgets['xy_only_cb'].setChecked(False)  # Por defecto: XY + AF Z
+    def _update_xy_label(checked: bool):
+        widgets['xy_only_cb'].setText("Sólo trayectoria XY" if checked else "Trayectoria XY + Auto foco Z")
+    widgets['xy_only_cb'].toggled.connect(_update_xy_label)
+    # Inicializar texto acorde al estado inicial
+    _update_xy_label(widgets['xy_only_cb'].isChecked())
+    mode_layout.addWidget(widgets['xy_only_cb'])
+    mode_layout.addStretch()
+    layout.addLayout(mode_layout)
+
     # Estado de trayectoria
     traj_layout = QHBoxLayout()
     traj_layout.addWidget(QLabel("<b>Estado:</b>"))
@@ -519,6 +530,17 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['cfocus_disconnect_btn'].clicked.connect(disconnect_cb)
     btn_layout.addWidget(widgets['cfocus_disconnect_btn'])
     
+    # Botón de calibración C-Focus
+    widgets['cfocus_calibrate_btn'] = QPushButton("🔧 Calibrar")
+    widgets['cfocus_calibrate_btn'].setEnabled(False)
+    widgets['cfocus_calibrate_btn'].setToolTip("Calibra límites del C-Focus (detecta min/max/centro)")
+    widgets['cfocus_calibrate_btn'].setStyleSheet("""
+        QPushButton { font-size: 12px; font-weight: bold; padding: 6px; background-color: #E67E22; }
+        QPushButton:hover { background-color: #D35400; }
+        QPushButton:disabled { background-color: #505050; color: #808080; }
+    """)
+    btn_layout.addWidget(widgets['cfocus_calibrate_btn'])
+    
     widgets['test_detection_btn'] = QPushButton("🔍 Test Detección")
     widgets['test_detection_btn'].setToolTip("Muestra visualización de detección de objetos en tiempo real")
     widgets['test_detection_btn'].clicked.connect(test_detection_cb)
@@ -589,24 +611,86 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     detection_form.addWidget(widgets['aspect_ratio_spin'], 1, 3)
     
     # Parámetros de búsqueda Z
-    detection_form.addWidget(QLabel("Rango Z:"), 2, 0)
-    widgets['z_range_spin'] = QDoubleSpinBox()
-    widgets['z_range_spin'].setRange(5.0, 200.0)
-    widgets['z_range_spin'].setValue(50.0)
-    widgets['z_range_spin'].setSuffix(" µm")
-    widgets['z_range_spin'].setToolTip("Rango total de búsqueda de foco")
-    widgets['z_range_spin'].setFixedWidth(100)
-    detection_form.addWidget(widgets['z_range_spin'], 2, 1)
+    # Fila 2: Distancia total de escaneo
+    detection_form.addWidget(QLabel("Distancia escaneo:"), 2, 0)
+    widgets['z_scan_range_spin'] = QDoubleSpinBox()
+    widgets['z_scan_range_spin'].setRange(1.0, 50.0)
+    widgets['z_scan_range_spin'].setValue(20.0)
+    widgets['z_scan_range_spin'].setSuffix(" µm")
+    widgets['z_scan_range_spin'].setDecimals(1)
+    widgets['z_scan_range_spin'].setSingleStep(1.0)
+    widgets['z_scan_range_spin'].setToolTip("Distancia de búsqueda desde posición ACTUAL del C-Focus (±valor)\nEjemplo: Si C-Focus está en 40µm y distancia=20µm, buscará entre 20-60µm")
+    widgets['z_scan_range_spin'].setFixedWidth(100)
+    widgets['z_scan_range_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_scan_range_spin'], 2, 1)
     
-    detection_form.addWidget(QLabel("Tolerancia:"), 2, 2)
-    widgets['z_tolerance_spin'] = QDoubleSpinBox()
-    widgets['z_tolerance_spin'].setRange(0.1, 5.0)
-    widgets['z_tolerance_spin'].setValue(0.5)
-    widgets['z_tolerance_spin'].setSuffix(" µm")
-    widgets['z_tolerance_spin'].setDecimals(2)
-    widgets['z_tolerance_spin'].setToolTip("Tolerancia de convergencia")
-    widgets['z_tolerance_spin'].setFixedWidth(100)
-    detection_form.addWidget(widgets['z_tolerance_spin'], 2, 3)
+    # Label de rango de búsqueda
+    detection_form.addWidget(QLabel("Rango búsqueda:"), 2, 2)
+    widgets['estimated_images_label'] = QLabel("±20.0µm")
+    widgets['estimated_images_label'].setStyleSheet("color: #3498DB; font-weight: bold;")
+    widgets['estimated_images_label'].setToolTip(
+        "Distancia de búsqueda desde centro\n"
+        "Autofoco busca BPoF con algoritmo adaptativo,\n"
+        "NO captura volumen (usar Z-Stack para eso)"
+    )
+    detection_form.addWidget(widgets['estimated_images_label'], 2, 3)
+    
+    # Fila 3: Pasos Z
+    detection_form.addWidget(QLabel("Paso grueso:"), 3, 0)
+    widgets['z_step_coarse_spin'] = QDoubleSpinBox()
+    widgets['z_step_coarse_spin'].setRange(0.01, 10.0)
+    widgets['z_step_coarse_spin'].setValue(0.5)
+    widgets['z_step_coarse_spin'].setSuffix(" µm")
+    widgets['z_step_coarse_spin'].setDecimals(3)
+    widgets['z_step_coarse_spin'].setSingleStep(0.01)
+    widgets['z_step_coarse_spin'].setToolTip("Paso grueso para escaneo inicial (debe ser > Paso fino)")
+    widgets['z_step_coarse_spin'].setFixedWidth(100)
+    widgets['z_step_coarse_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_step_coarse_spin'], 3, 1)
+    
+    detection_form.addWidget(QLabel("Paso fino:"), 3, 2)
+    widgets['z_step_fine_spin'] = QDoubleSpinBox()
+    widgets['z_step_fine_spin'].setRange(0.001, 5.0)
+    widgets['z_step_fine_spin'].setValue(0.1)
+    widgets['z_step_fine_spin'].setSuffix(" µm")
+    widgets['z_step_fine_spin'].setDecimals(3)
+    widgets['z_step_fine_spin'].setSingleStep(0.01)
+    widgets['z_step_fine_spin'].setToolTip("Paso fino para refinamiento (debe ser < Paso grueso)")
+    widgets['z_step_fine_spin'].setFixedWidth(100)
+    widgets['z_step_fine_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_step_fine_spin'], 3, 3)
+    
+    # Fila 4: N° capturas multi-focales y settle time
+    detection_form.addWidget(QLabel("N° capturas:"), 4, 0)
+    widgets['n_captures_spin'] = QSpinBox()
+    widgets['n_captures_spin'].setRange(1, 11)
+    widgets['n_captures_spin'].setValue(3)
+    widgets['n_captures_spin'].setSingleStep(2)  # Solo impares
+    widgets['n_captures_spin'].setToolTip("Número de capturas multi-focales (siempre impar: 1, 3, 5, 7...)\nBPoF en el centro, ±coarse arriba/abajo")
+    widgets['n_captures_spin'].setFixedWidth(100)
+    widgets['n_captures_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['n_captures_spin'], 4, 1)
+    
+    detection_form.addWidget(QLabel("Settle (ms):"), 4, 2)
+    widgets['z_settle_spin'] = QSpinBox()
+    widgets['z_settle_spin'].setRange(10, 1000)
+    widgets['z_settle_spin'].setValue(100)
+    widgets['z_settle_spin'].setSuffix(" ms")
+    widgets['z_settle_spin'].setToolTip("Tiempo de estabilización después de cada movimiento Z")
+    widgets['z_settle_spin'].setFixedWidth(100)
+    widgets['z_settle_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_settle_spin'], 4, 3)
+    
+    # Fila 5: ROI margin
+    detection_form.addWidget(QLabel("ROI Margin:"), 5, 0)
+    widgets['roi_margin_spin'] = QSpinBox()
+    widgets['roi_margin_spin'].setRange(0, 9999)
+    widgets['roi_margin_spin'].setValue(20)
+    widgets['roi_margin_spin'].setSuffix(" px")
+    widgets['roi_margin_spin'].setToolTip("Margen adicional alrededor del bbox para cálculo de sharpness (sin límite)")
+    widgets['roi_margin_spin'].setFixedWidth(100)
+    widgets['roi_margin_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['roi_margin_spin'], 5, 1)
     
     layout.addLayout(detection_form)
     

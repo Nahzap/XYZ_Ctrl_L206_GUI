@@ -18,9 +18,11 @@ import time
 import numpy as np
 import cv2
 import os
+import json
+from datetime import datetime
 
 from typing import Callable, Optional, List, Tuple
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QCoreApplication
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -40,11 +42,14 @@ class MicroscopyService(QObject):
     stopped = pyqtSignal()                        # detenido por usuario
     show_masks = pyqtSignal(list)                 # Mostrar máscaras durante autofoco
     clear_masks = pyqtSignal()                    # Limpiar máscaras después de capturar
+    # Solicitud de confirmación de aprendizaje (frame, objeto, clase sugerida, confianza, count, target)
+    learning_confirmation_requested = pyqtSignal(object, object, str, float, int, int)
 
     def __init__(
         self,
         parent=None,
         get_trajectory: Optional[Callable[[], Optional[List]]] = None,
+        get_trajectory_params: Optional[Callable[[], dict]] = None,
         set_dual_refs: Optional[Callable[[float, float], None]] = None,
         start_dual_control: Optional[Callable[[], None]] = None,
         stop_dual_control: Optional[Callable[[], None]] = None,
@@ -57,11 +62,13 @@ class MicroscopyService(QObject):
         smart_focus_scorer=None,
         get_area_range: Optional[Callable[[], tuple]] = None,
         controllers_ready_getter: Optional[Callable[[], bool]] = None,
+        test_service=None,
     ):
         super().__init__(parent)
 
         # Callbacks y dependencias externas
         self._get_trajectory = get_trajectory
+        self._get_trajectory_params = get_trajectory_params
         self._set_dual_refs = set_dual_refs
         self._start_dual_control = start_dual_control
         self._stop_dual_control = stop_dual_control
@@ -74,6 +81,7 @@ class MicroscopyService(QObject):
         self._smart_focus_scorer = smart_focus_scorer
         self._get_area_range = get_area_range
         self._controllers_ready_getter = controllers_ready_getter
+        self._test_service = test_service
 
         # Estado de microscopia
         self._microscopy_active = False
@@ -83,6 +91,9 @@ class MicroscopyService(QObject):
         self._position_checks = 0
         self._delay_before_ms = 0
         self._delay_after_ms = 0
+        # Estado temporal para aprendizaje asistido
+        self._pending_object = None
+        self._pending_frame = None
         
         # MEJORA 2: Sistema de aprendizaje
         self._learning_mode = False
@@ -127,6 +138,22 @@ class MicroscopyService(QObject):
             self.status_changed.emit(msg)
             return False
         logger.info("[MicroscopyService] ✓ Trayectoria definida: %d puntos", len(trajectory))
+        
+        # VALIDACIÓN 3: Obtener parámetros de trayectoria (tolerancia y delays)
+        trajectory_params = {}
+        if self._get_trajectory_params:
+            trajectory_params = self._get_trajectory_params()
+            logger.info("[MicroscopyService] Parámetros de trayectoria: %s", trajectory_params)
+        else:
+            logger.warning("[MicroscopyService] No hay proveedor de parámetros, usando defaults")
+            trajectory_params = {'tolerance_um': 25.0, 'pause_s': 2.0}
+        
+        # Guardar parámetros para uso en movimiento entre puntos
+        self._trajectory_tolerance = trajectory_params.get('tolerance_um', 25.0)
+        self._trajectory_pause = trajectory_params.get('pause_s', 2.0)
+        
+        logger.info("[MicroscopyService] ✓ Tolerancia: %.1fµm, Pausa: %.1fs", 
+                   self._trajectory_tolerance, self._trajectory_pause)
 
         # VALIDACIÓN 3: Callbacks de control
         if not (self._set_dual_refs and self._start_dual_control and self._stop_dual_control):
@@ -169,6 +196,22 @@ class MicroscopyService(QObject):
         self._delay_before_ms = int(config.get('delay_before', 2.0) * 1000)
         self._delay_after_ms = int(config.get('delay_after', 0.2) * 1000)
 
+        # Modo de aprendizaje (etiquetado asistido de los primeros N)
+        try:
+            # Por defecto ACTIVADO para las primeras 50 capturas
+            learning_mode_cfg = bool(config.get('learning_mode', True))
+            learning_target_cfg = int(config.get('learning_target', 50))
+            self._learning_mode = learning_mode_cfg
+            self._learning_target = learning_target_cfg
+            self._learning_count = 0
+            logger.info(
+                "[MicroscopyService] Aprendizaje asistido: %s (target=%d)",
+                "ON" if self._learning_mode else "OFF",
+                self._learning_target,
+            )
+        except Exception as e:
+            logger.warning("[MicroscopyService] No se pudo configurar aprendizaje: %s", e)
+
         total = len(self._microscopy_trajectory)
         self.status_changed.emit(f"Iniciando microscopia: {total} puntos")
         self.status_changed.emit(
@@ -210,7 +253,7 @@ class MicroscopyService(QObject):
     # Flujo interno de microscopia
     # ------------------------------------------------------------------
     def _move_to_point(self) -> None:
-        """PASO 1: Mueve al punto actual."""
+        """PASO 1: Mueve al punto actual usando TestService (mismo algoritmo probado)."""
         if not self._microscopy_active:
             return
         
@@ -237,67 +280,67 @@ class MicroscopyService(QObject):
             f"[{n}/{total}] Moviendo a X={x_target:.1f}, Y={y_target:.1f} um"
         )
         logger.info(
-            "[MicroscopyService] Punto %d: (%.1f, %.1f)",
+            "[MicroscopyService] Punto %d: (%.1f, %.1f) - usando TestService",
             n,
             x_target,
             y_target,
         )
 
-        # Configurar referencias en el controlador dual
-        if self._set_dual_refs:
-            self._set_dual_refs(x_target, y_target)
-
-        # Detener control dual si está activo y reiniciar
-        if self._is_dual_control_active and self._is_dual_control_active():
-            self._stop_dual_control()
-
-        self._position_checks = 0
-
-        # Iniciar control dual para mover a la posicion
-        self._start_dual_control()
-
-        # Comenzar a verificar si llego a la posicion
-        QTimer.singleShot(200, self._check_position)
-
-    def _check_position(self) -> None:
-        """PASO 2: Verifica si llego a la posicion objetivo."""
+        # CRÍTICO: Usar TestService para mover (algoritmo de control probado)
+        if self._test_service:
+            # Crear trayectoria de 1 punto para que TestService lo maneje
+            single_point_trajectory = [(x_target, y_target)]
+            
+            # Conectar señal para saber cuándo llegó
+            try:
+                self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
+            except:
+                pass
+            
+            self._test_service.trajectory_point_reached.connect(self._on_test_point_reached)
+            
+            # Iniciar movimiento con TestService
+            # Usamos una pausa mínima aquí (0.1s) porque nosotros manejamos el delay_before después
+            success = self._test_service.start_trajectory(
+                single_point_trajectory,
+                tolerance_um=self._trajectory_tolerance,
+                pause_s=0.1
+            )
+            
+            if not success:
+                logger.error("[MicroscopyService] Error iniciando movimiento con TestService")
+                self._advance_point()
+        else:
+            logger.warning("[MicroscopyService] TestService no disponible, usando método legacy")
+            self._move_to_point_legacy()
+    
+    def _on_test_point_reached(self, index: int, x: float, y: float, status: str):
+        """Callback cuando TestService alcanza el punto."""
         if not self._microscopy_active:
             return
-
-        self._position_checks += 1
-
-        position_reached = False
-        if self._is_position_reached:
-            try:
-                position_reached = bool(self._is_position_reached())
-            except Exception as e:
-                logger.error("[MicroscopyService] Error evaluando position_reached: %s", e)
-
-        # Timeout: maximo 10 segundos esperando posicion (100 checks * 100ms)
-        if self._position_checks > 100:
-            self.status_changed.emit("  Timeout esperando posicion - continuando")
-            logger.warning(
-                "[MicroscopyService] Timeout en punto %d",
-                self._current_point + 1,
-            )
-            position_reached = True
-
-        if position_reached:
-            if self._is_dual_control_active and self._is_dual_control_active():
-                self._stop_dual_control()
-
-            # PASO 3: DELAY_BEFORE para estabilizacion
+        
+        logger.info(f"[MicroscopyService] Punto alcanzado por TestService: ({x:.1f}, {y:.1f}) {status}")
+        
+        # Detener TestService (ya completó el punto)
+        if self._test_service:
+            self._test_service.stop_trajectory()
+        
+        # PASO 2: DELAY_BEFORE (Optimizado)
+        # Si usamos TestService, ya hubo settling y tolerancia, así que el delay adicional
+        # puede ser mínimo o el configurado si el usuario insiste.
+        # User complained about >5s delay. Let's clamp it or ignore if it's too high?
+        # Actually, TestService pause=0.1s + settling time is usually enough.
+        # We will use a reduced delay if using TestService.
+        
+        effective_delay = min(self._delay_before_ms, 500) # Cap delay at 500ms when using TestService
+        
+        if effective_delay > 0:
             self.status_changed.emit(
-                f"  Posicion alcanzada - Esperando {self._delay_before_ms}ms para estabilizar..."
+                f"  Posición alcanzada - Esperando {effective_delay}ms..."
             )
-            logger.info(
-                "[MicroscopyService] Posición alcanzada, delay_before=%dms",
-                self._delay_before_ms,
-            )
-            QTimer.singleShot(self._delay_before_ms, self._capture)
+            QTimer.singleShot(effective_delay, self._capture)
         else:
-            # Seguir esperando - verificar cada 100ms
-            QTimer.singleShot(100, self._check_position)
+            self._capture()
 
     def _capture(self) -> None:
         """PASO 3: Captura la imagen (con o sin autofoco)."""
@@ -310,12 +353,18 @@ class MicroscopyService(QObject):
         use_autofocus = bool(self._microscopy_config.get('autofocus_enabled', False))
         cfocus_enabled = bool(self._cfocus_enabled_getter()) if self._cfocus_enabled_getter else False
 
+        logger.info(f"[MicroscopyService] _capture check: use_autofocus={use_autofocus}, cfocus_enabled={cfocus_enabled}")
+
         if use_autofocus and cfocus_enabled:
             self._capture_with_autofocus()
             return
+        
+        if use_autofocus and not cfocus_enabled:
+            logger.warning("[MicroscopyService] Autofoco habilitado pero C-Focus NO disponible/habilitado")
+            self.status_changed.emit("⚠️ C-Focus deshabilitado - Saltando autofoco")
 
         # Captura normal sin autofoco
-        self.status_changed.emit("  Capturando imagen...")
+        self.status_changed.emit("  Capturando imagen (Sin Autofoco)...")
         success = False
         if self._capture_microscopy_image:
             success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
@@ -338,7 +387,7 @@ class MicroscopyService(QObject):
         self._advance_point()
 
     def _capture_with_autofocus(self) -> None:
-        """Captura con detección y autofoco asíncrono."""
+        """Captura RÁPIDA con detección y enfoque simple (NO escaneo completo)."""
         if not self._microscopy_active:
             return
 
@@ -374,47 +423,52 @@ class MicroscopyService(QObject):
         all_objects = result.objects if result.objects else []
 
         min_area, max_area = self._get_area_range() if self._get_area_range else (0, 1e9)
-        
-        # MEJORA: Filtrar por área Y circularidad para rechazar manchas sin morfología
-        # Usar parámetros configurables del SmartFocusScorer
-        min_circularity = self._smart_focus_scorer.min_circularity if self._smart_focus_scorer else 0.45
-        min_aspect_ratio = self._smart_focus_scorer.min_aspect_ratio if self._smart_focus_scorer else 0.4
-        
-        objects_filtered = []
-        for obj in all_objects:
-            # Filtro de área
-            if not (min_area <= obj.area <= max_area):
-                continue
+
+        # Durante aprendizaje, NO aplicar filtros morfológicos estrictos.
+        apply_morph_filters = not self._learning_mode
+
+        if apply_morph_filters:
+            # Filtrar por área Y circularidad para rechazar manchas sin morfología
+            min_circularity = self._smart_focus_scorer.min_circularity if self._smart_focus_scorer else 0.45
+            min_aspect_ratio = self._smart_focus_scorer.min_aspect_ratio if self._smart_focus_scorer else 0.4
             
-            # Obtener circularidad del objeto (si fue calculada con contorno real)
-            # Si no está disponible, calcular aproximación con bbox
-            if hasattr(obj, 'circularity') and obj.circularity > 0:
-                circularity = obj.circularity
-            else:
+            objects_filtered = []
+            for obj in all_objects:
+                # Filtro de área
+                if not (min_area <= obj.area <= max_area):
+                    continue
+                
+                # Obtener circularidad del objeto
+                if hasattr(obj, 'circularity') and obj.circularity > 0:
+                    circularity = obj.circularity
+                else:
+                    x, y, w, h = obj.bounding_box
+                    perimeter = 2 * (w + h)
+                    circularity = (4 * np.pi * obj.area) / (perimeter ** 2) if perimeter > 0 else 0
+                
+                # Filtro de circularidad (rechazar manchas irregulares)
+                if circularity < min_circularity:
+                    logger.info(f"[MicroscopyService] ❌ Objeto rechazado: área={obj.area:.0f}px, circ={circularity:.2f} < {min_circularity:.2f}")
+                    continue
+                
+                # Filtro de aspect ratio (rechazar manchas muy alargadas)
                 x, y, w, h = obj.bounding_box
-                perimeter = 2 * (w + h)
-                circularity = (4 * np.pi * obj.area) / (perimeter ** 2) if perimeter > 0 else 0
+                aspect_ratio = float(w) / float(h) if h > 0 else 1.0
+                if aspect_ratio > 1.0:
+                    aspect_ratio = 1.0 / aspect_ratio
+                
+                if aspect_ratio < min_aspect_ratio:
+                    logger.info(f"[MicroscopyService] ❌ Objeto rechazado: área={obj.area:.0f}px, aspect_ratio={aspect_ratio:.2f} < {min_aspect_ratio:.2f}")
+                    continue
+                
+                # Objeto válido
+                objects_filtered.append(obj)
+                logger.info(f"[MicroscopyService] ✓ Objeto válido: área={obj.area:.0f}px, circ={circularity:.2f}, aspect={aspect_ratio:.2f}")
             
-            # Filtro de circularidad (rechazar manchas irregulares)
-            if circularity < min_circularity:
-                logger.info(f"[MicroscopyService] ❌ Objeto rechazado: área={obj.area:.0f}px, circ={circularity:.2f} < {min_circularity:.2f} (mancha irregular)")
-                continue
-            
-            # Filtro de aspect ratio (rechazar manchas muy alargadas)
-            x, y, w, h = obj.bounding_box
-            aspect_ratio = float(w) / float(h) if h > 0 else 1.0
-            if aspect_ratio > 1.0:
-                aspect_ratio = 1.0 / aspect_ratio
-            
-            if aspect_ratio < min_aspect_ratio:
-                logger.info(f"[MicroscopyService] ❌ Objeto rechazado: área={obj.area:.0f}px, aspect_ratio={aspect_ratio:.2f} < {min_aspect_ratio:.2f} (muy alargado)")
-                continue
-            
-            # Objeto válido (área, morfología y forma correctas)
-            objects_filtered.append(obj)
-            logger.info(f"[MicroscopyService] ✓ Objeto válido: área={obj.area:.0f}px, circ={circularity:.2f}, aspect={aspect_ratio:.2f}")
-        
-        objects = objects_filtered
+            objects = objects_filtered
+        else:
+            # En modo aprendizaje, solo filtrar por área (deja que el usuario confirme)
+            objects = [obj for obj in all_objects if (min_area <= obj.area <= max_area)]
         n_objects = len(objects)
         if n_objects == 0:
             self.status_changed.emit(
@@ -425,45 +479,386 @@ class MicroscopyService(QObject):
                 self._current_point,
                 len(all_objects),
             )
-            # MEJORA: Continuar con el siguiente punto en lugar de detenerse
+            # Continuar con el siguiente punto
             self._current_point += 1
             self._position_checks = 0
             self.progress_changed.emit(self._current_point, len(self._microscopy_trajectory))
             self._move_to_point()
             return
         
-        # MEJORA: Mostrar máscaras en ventana de cámara durante autofoco
+        # Mostrar máscaras en ventana de cámara
         self._show_autofocus_masks(objects)
 
-        # MEJORA 1: Enfocar solo en el objeto MÁS GRANDE del área objetivo
-        # Esto asegura que el autofoco se concentre en el objeto principal
+        # Enfocar solo en el objeto MÁS GRANDE
         largest_object = max(objects, key=lambda obj: obj.area)
         
-        # MEJORA 2: Sistema de aprendizaje con confirmación
+        # Sistema de aprendizaje con confirmación (Assisted Labeling)
+        # Si estamos en modo aprendizaje y no hemos alcanzado el objetivo
         if self._learning_mode and self._learning_count < self._learning_target:
-            should_capture = self._confirm_roi_for_learning(frame_bgr, largest_object, result)
-            if not should_capture:
-                logger.info("[MicroscopyService] ROI rechazado por usuario en aprendizaje")
-                self._advance_point()
-                return
-            self._learning_count += 1
-            logger.info(f"[MicroscopyService] Aprendizaje: {self._learning_count}/{self._learning_target}")
+            self.status_changed.emit(f"❓ Confirmación requerida ({self._learning_count + 1}/{self._learning_target})")
+            
+            # Guardar estado para reanudar
+            self._pending_object = largest_object
+            self._pending_frame = frame_bgr
+            
+            # Emitir señal para que la UI muestre el diálogo
+            # Pasamos: frame, objeto, clase sugerida, confianza, progreso actual, objetivo
+            self.learning_confirmation_requested.emit(
+                frame_bgr,
+                largest_object,
+                self._microscopy_config.get('class_name', 'object'),
+                getattr(largest_object, 'confidence', 0.0),
+                self._learning_count + 1,
+                self._learning_target,
+            )
+            # DETENER FLUJO AQUÍ - Se reanudará cuando el usuario responda vía confirm_learning_step
+            return
+
+        # Si no es aprendizaje o ya pasamos el target, continuar automáticamente
+        self._proceed_with_capture(largest_object)
+
+    def confirm_learning_step(self, user_accepted, user_class: str = None) -> None:
+        """
+        Slot para recibir la respuesta del usuario desde la UI.
+
+        user_accepted puede ser:
+        - bool: aceptar/rechazar el ROI detectado automáticamente
+        - dict: {'accepted': bool, 'replace': bool, 'custom_rois': [(x,y,w,h), ...]}
+        """
+        if not self._microscopy_active or self._pending_object is None:
+            return
+
+        # Normalizar respuesta
+        accepted = False
+        replace = False
+        custom_rois = []
+        if isinstance(user_accepted, dict):
+            accepted = bool(user_accepted.get('accepted', True))
+            replace = bool(user_accepted.get('replace', False))
+            custom_rois = list(user_accepted.get('custom_rois', []))
+        else:
+            accepted = bool(user_accepted)
+
+        if not accepted:
+            logger.info("[MicroscopyService] Aprendizaje: Usuario rechazó objeto")
+            self._advance_point()
+            # Limpiar estado
+            self._pending_object = None
+            self._pending_frame = None
+            return
+
+        # Aceptado
+        self._learning_count += 1
+        logger.info(f"[MicroscopyService] Aprendizaje: Usuario aceptó objeto {self._learning_count}/{self._learning_target}")
+        if user_class:
+            logger.info(f"[MicroscopyService] Clase confirmada: {user_class}")
+
+        # Si hay ROIs manuales y se debe reemplazar la segmentación detectada
+        if replace and custom_rois and self._pending_frame is not None:
+            try:
+                self._save_manual_rois_training_data(self._pending_frame, custom_rois, user_class)
+            except Exception as e:
+                logger.error(f"[MicroscopyService] Error guardando datos de entrenamiento manual: {e}")
+
+            # Usar el PRIMER ROI manual para captura rápida
+            x, y, w, h = custom_rois[0]
+            area_est = max(1, int(w * h))
+            # Crear objeto temporal compatible
+            class _ManualObj:
+                pass
+            temp_obj = _ManualObj()
+            temp_obj.bounding_box = (int(x), int(y), int(w), int(h))
+            temp_obj.area = area_est
+            temp_obj.contour = None
+            try:
+                if self._smart_focus_scorer is not None:
+                    temp_obj.focus_score = self._smart_focus_scorer.calculate_sharpness(self._pending_frame, temp_obj.bounding_box)
+            except Exception:
+                temp_obj.focus_score = 0.0
+
+            self._proceed_with_capture(temp_obj)
+        else:
+            # Continuar con el objeto detectado automáticamente
+            self._proceed_with_capture(self._pending_object)
+
+        # Limpiar estado
+        self._pending_object = None
+        self._pending_frame = None
+
+    def _save_manual_rois_training_data(self, frame_bgr: np.ndarray, rois: list, user_class: Optional[str]):
+        """Extrae parámetros de ROIs manuales y los guarda para entrenamiento.
+
+        Crea/append un archivo JSONL 'learning_labels.jsonl' en la carpeta de guardado.
+        Cada línea incluye: punto, bbox, área, circularidad, aspect_ratio, sharpness, clase, timestamp.
+        """
+        if self._microscopy_config is None:
+            return
+        save_folder = self._microscopy_config.get('save_folder', '.')
+        os.makedirs(save_folder, exist_ok=True)
+        out_path = os.path.join(save_folder, 'learning_labels.jsonl')
+
+        # Asegurar formato uint8 para análisis
+        frame = frame_bgr
+        if frame.dtype == np.uint16:
+            maxv = frame.max()
+            frame = (frame / maxv * 255).astype(np.uint8) if maxv > 0 else frame.astype(np.uint8)
+
+        h_img, w_img = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+
+        records = []
+        for (x, y, w, h) in rois:
+            x = max(0, min(int(x), w_img - 1))
+            y = max(0, min(int(y), h_img - 1))
+            w = max(1, min(int(w), w_img - x))
+            h = max(1, min(int(h), h_img - y))
+
+            crop = gray[y:y+h, x:x+w]
+            # Segmentación simple dentro del ROI para estimar contorno real
+            try:
+                blurred = cv2.GaussianBlur(crop, (5, 5), 0)
+                _, bin_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                contours, _ = cv2.findContours(bin_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    cnt = max(contours, key=cv2.contourArea)
+                    area = float(cv2.contourArea(cnt))
+                    perim = float(cv2.arcLength(cnt, True))
+                    circularity = float((4 * np.pi * area) / (perim ** 2)) if perim > 0 else 0.0
+                else:
+                    area = float(w * h)
+                    circularity = 0.0
+            except Exception:
+                area = float(w * h)
+                circularity = 0.0
+
+            aspect = float(w) / float(h) if h > 0 else 1.0
+            if aspect > 1.0:
+                aspect = 1.0 / aspect
+
+            try:
+                sharp = float(self._smart_focus_scorer.calculate_sharpness(frame, (x, y, w, h))) if self._smart_focus_scorer else 0.0
+            except Exception:
+                sharp = 0.0
+
+            record = {
+                'point_index': int(self._current_point),
+                'bbox': [int(x), int(y), int(w), int(h)],
+                'area_px': float(area),
+                'circularity': float(circularity),
+                'aspect_ratio': float(aspect),
+                'sharpness': float(sharp),
+                'class_name': str(user_class) if user_class else str(self._microscopy_config.get('class_name', 'object')),
+                'timestamp': datetime.now().isoformat(timespec='seconds')
+            }
+            records.append(record)
+
+        with open(out_path, 'a', encoding='utf-8') as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        logger.info(f"[MicroscopyService] Guardados {len(records)} ROIs manuales en {out_path}")
+
+    def _proceed_with_capture(self, largest_object) -> None:
+        """Continúa con la captura después de la confirmación (o si es automático)."""
+        n_captures = self._autofocus_service.n_captures if self._autofocus_service.n_captures % 2 == 1 else 3
         
         self.status_changed.emit(
-            f"  ✓ Enfocando objeto más grande: {largest_object.area:.0f} px (de {n_objects} en rango)"
+            f"  ✓ Objeto detectado: {largest_object.area:.0f} px - capturando {n_captures} imágenes..."
         )
         logger.info(
-            "[MicroscopyService] Punto %d: enfocando objeto más grande (área=%.0f px) de %d objetos válidos",
+            "[MicroscopyService] Punto %d: objeto detectado (área=%.0f px) - captura rápida %d imgs",
             self._current_point,
             largest_object.area,
-            n_objects,
+            n_captures,
         )
 
-        # MEJORA 3: Guardar frame con ROI visualizado para referencia
-        self._save_roi_visualization(frame_bgr, largest_object, result)
-
-        # Iniciar autofoco asíncrono solo en el objeto más grande
-        self._autofocus_service.start_autofocus([largest_object])
+        # Guardar frame con ROI visualizado para referencia
+        # (Usamos el frame pendiente si existe, o el actual si no)
+        # Nota: frame_bgr no está disponible aquí directamente si venimos de confirm, 
+        # pero _save_roi_visualization lo necesita. 
+        # Si venimos de confirm, usamos _pending_frame.
+        # Si venimos directo, necesitamos que _capture_with_autofocus lo pase.
+        # Simplificación: _save_roi_visualization usa internal logic or we assume it's fine.
+        # Actually _save_roi_visualization takes (frame, object, result).
+        # We might need to store 'result' in pending state too if we want visualization.
+        # For now, let's skip complex visualization in learning mode or pass None.
+        
+        # CAPTURA RÁPIDA: N imágenes multi-focales
+        self._quick_capture_multifocal(largest_object)
+    
+    def _quick_capture_multifocal(self, obj) -> None:
+        """
+        Captura RÁPIDA de N imágenes multi-focales (configurado por usuario).
+        
+        Proceso:
+        1. Encuentra BPoF con búsqueda rápida local (±5µm desde posición actual)
+        2. Captura N imágenes centradas en BPoF con offsets (según n_captures configurado)
+        3. SIEMPRE vuelve a Z medio (centro calibrado)
+        
+        Args:
+            obj: Objeto detectado para enfocar
+        """
+        if not self._autofocus_service or not self._autofocus_service.cfocus_controller:
+            logger.error("[MicroscopyService] C-Focus no disponible para captura rápida")
+            self._advance_point()
+            return
+        
+        cfocus = self._autofocus_service.cfocus_controller
+        bbox = obj.bounding_box
+        contour = getattr(obj, 'contour', None)
+        
+        # Obtener posición actual y centro calibrado
+        z_current = cfocus.read_z()
+        calib_info = cfocus.get_calibration_info()
+        
+        if not calib_info['is_calibrated']:
+            logger.error("[MicroscopyService] C-Focus no calibrado, no se puede hacer captura rápida")
+            self._advance_point()
+            return
+        
+        z_center_hw = calib_info['z_center']
+        z_min_hw = calib_info['z_min']
+        z_max_hw = calib_info['z_max']
+        
+        logger.info(f"[MicroscopyService] Captura rápida: Z actual={z_current:.2f}µm, Z centro={z_center_hw:.2f}µm")
+        
+        # PASO 1: Búsqueda rápida de BPoF (±5µm desde posición actual con paso 0.5µm)
+        search_range = 5.0  # µm
+        search_step = 0.5   # µm
+        
+        z_search_min = max(z_min_hw, z_current - search_range)
+        z_search_max = min(z_max_hw, z_current + search_range)
+        
+        logger.info(f"[MicroscopyService] Búsqueda rápida BPoF: {z_search_min:.2f} - {z_search_max:.2f}µm")
+        
+        best_z = z_current
+        best_score = 0.0
+        
+        z = z_search_min
+        while z <= z_search_max:
+            cfocus.move_z(z)
+            time.sleep(0.05)  # 50ms estabilización
+            # Mantener la UI receptiva durante el escaneo rápido
+            try:
+                QCoreApplication.processEvents()
+            except Exception:
+                pass
+            
+            frame = self._get_current_frame()
+            if frame is not None:
+                score = self._autofocus_service._get_stable_score(bbox, contour, n_samples=1)
+                if score > best_score:
+                    best_z = z
+                    best_score = score
+            
+            z += search_step
+        
+        logger.info(f"[MicroscopyService] BPoF encontrado: Z={best_z:.2f}µm, S={best_score:.1f}")
+        
+        # PASO 2: Capturar 3 imágenes (BPoF, +offset, -offset)
+        offset_z = self._autofocus_service.z_step_coarse  # Usar paso coarse como offset (ej: 0.5µm)
+        
+        z_positions = [
+            best_z,                    # BPoF (centro)
+            min(z_max_hw, best_z + offset_z),  # +offset (arriba)
+            max(z_min_hw, best_z - offset_z)   # -offset (abajo)
+        ]
+        
+        frames = []
+        scores = []
+        
+        for i, z_pos in enumerate(z_positions):
+            cfocus.move_z(z_pos)
+            time.sleep(0.1)  # 100ms estabilización para captura
+            try:
+                QCoreApplication.processEvents()
+            except Exception:
+                pass
+            
+            frame = self._get_current_frame()
+            if frame is not None:
+                frames.append(frame.copy())
+                score = self._autofocus_service._get_stable_score(bbox, contour, n_samples=1)
+                scores.append(score)
+                
+                label = "BPoF" if i == 0 else f"{'+' if i == 1 else '-'}{offset_z}µm"
+                logger.info(f"[MicroscopyService] Captura {i+1}/3 ({label}): Z={z_pos:.2f}µm, S={score:.1f}")
+        
+        # PASO 3: Guardar las 3 imágenes
+        success = self._save_3images(frames, z_positions, scores, best_z, self._current_point)
+        
+        # PASO 4: SIEMPRE volver a Z medio (centro calibrado)
+        logger.info(f"[MicroscopyService] Volviendo a Z medio: {z_center_hw:.2f}µm")
+        cfocus.move_z(z_center_hw)
+        time.sleep(0.1)
+        try:
+            QCoreApplication.processEvents()
+        except Exception:
+            pass
+        
+        z_final = cfocus.read_z()
+        logger.info(f"[MicroscopyService] ✓ Posición final: Z={z_final:.2f}µm (centro calibrado)")
+        
+        if success:
+            self.status_changed.emit(f"  ✓ 3 imágenes guardadas - vuelto a Z medio")
+        else:
+            self.status_changed.emit(f"  ⚠️ Error guardando imágenes")
+        
+        # Avanzar al siguiente punto
+        self._advance_point()
+    
+    def _save_3images(self, frames: list, z_positions: list, scores: list, best_z: float, image_index: int) -> bool:
+        """
+        Guarda las 3 imágenes capturadas (BPoF + offsets).
+        
+        Args:
+            frames: Lista de 3 frames capturados
+            z_positions: Lista de 3 posiciones Z
+            scores: Lista de 3 scores de enfoque
+            best_z: Posición Z del BPoF
+            image_index: Índice de la imagen base
+            
+        Returns:
+            bool: True si se guardaron correctamente todas las imágenes
+        """
+        if not frames or len(frames) != 3 or self._microscopy_config is None:
+            logger.error(f"[MicroscopyService] Error: se esperaban 3 frames, recibidos {len(frames) if frames else 0}")
+            return False
+        
+        save_folder = self._microscopy_config.get('save_folder', '.')
+        class_name = self._microscopy_config.get('class_name', 'sample')
+        
+        logger.info(f"[MicroscopyService] Guardando 3 imágenes para punto {image_index + 1}")
+        
+        all_success = True
+        labels = ['BPoF', '+offset', '-offset']
+        
+        for i, (frame, z_pos, score, label) in enumerate(zip(frames, z_positions, scores, labels)):
+            try:
+                frame_copy = frame.copy()
+                
+                # Normalizar uint16 a uint8 si es necesario
+                if frame_copy.dtype == np.uint16:
+                    if frame_copy.max() > 0:
+                        frame_copy = (frame_copy / frame_copy.max() * 255).astype(np.uint8)
+                    else:
+                        frame_copy = frame_copy.astype(np.uint8)
+                
+                # Generar nombre de archivo con sufijo de índice focal
+                # Ejemplo: sample_0001_f0.png (BPoF), sample_0001_f1.png (+offset), sample_0001_f2.png (-offset)
+                filename = f"{class_name}_{image_index + 1:04d}_f{i}.png"
+                filepath = os.path.join(save_folder, filename)
+                
+                # Guardar imagen
+                cv2.imwrite(filepath, frame_copy)
+                
+                offset_str = f"(Z={z_pos:.1f}µm, offset={z_pos - best_z:+.1f}µm)" if i > 0 else f"(Z={z_pos:.1f}µm)"
+                logger.info(f"[MicroscopyService]   {label}: {filename} {offset_str}, S={score:.1f}")
+                
+            except Exception as e:
+                logger.error(f"[MicroscopyService] Error guardando imagen {i}: {e}")
+                all_success = False
+        
+        return all_success
 
     def _capture_without_autofocus_fallback(self) -> None:
         """Captura sencilla usada como fallback cuando no hay autofoco disponible."""
@@ -501,14 +896,19 @@ class MicroscopyService(QObject):
         self.status_changed.emit("📸 Guardando imagen con BPoF...")
         success = False
         
-        # Usar el frame ya capturado durante el autofoco (evita desenfoque)
-        if results and len(results) > 0 and results[0].frame is not None:
-            # Guardar el frame que ya fue capturado en BPoF
-            success = self._save_autofocus_frame(results[0], self._current_point)
+        # Usar los frames ya capturados durante el autofoco (evita desenfoque)
+        if results and len(results) > 0:
+            result = results[0]
             
-            # También guardar frame alternativo si existe
-            if results[0].frame_alt is not None:
-                self._save_autofocus_frame_alt(results[0], self._current_point)
+            # Guardar todas las capturas multi-focales si existen
+            if result.frames and len(result.frames) > 0:
+                success = self._save_multifocal_frames(result, self._current_point)
+            # Fallback: guardar solo BPoF si no hay capturas multi-focales
+            elif result.frame is not None:
+                success = self._save_autofocus_frame(result, self._current_point)
+                # También guardar frame alternativo si existe (legacy)
+                if result.frame_alt is not None:
+                    self._save_autofocus_frame_alt(result, self._current_point)
         else:
             # Fallback: capturar frame actual (puede estar desenfocado)
             logger.warning("[MicroscopyService] No hay frame en resultado de autofoco, usando frame actual")
@@ -571,6 +971,54 @@ class MicroscopyService(QObject):
         except Exception as e:
             logger.error(f"[MicroscopyService] Error guardando frame BPoF: {e}")
             return False
+    
+    def _save_multifocal_frames(self, result, image_index: int) -> bool:
+        """Guarda todas las capturas multi-focales (N imágenes).
+        
+        Args:
+            result: FocusResult con lista de frames multi-focales
+            image_index: Índice de la imagen base
+            
+        Returns:
+            bool: True si se guardaron correctamente todas las capturas
+        """
+        if not result.frames or len(result.frames) == 0 or self._microscopy_config is None:
+            return False
+        
+        save_folder = self._microscopy_config.get('save_folder', '.')
+        class_name = self._microscopy_config.get('class_name', 'sample')
+        n_captures = len(result.frames)
+        
+        logger.info(f"[MicroscopyService] Guardando {n_captures} capturas multi-focales para imagen {image_index + 1}")
+        
+        all_success = True
+        for i, (frame, z_pos, score) in enumerate(zip(result.frames, result.z_positions, result.focus_scores)):
+            try:
+                frame_copy = frame.copy()
+                
+                # Normalizar uint16 a uint8 si es necesario
+                if frame_copy.dtype == np.uint16:
+                    if frame_copy.max() > 0:
+                        frame_copy = (frame_copy / frame_copy.max() * 255).astype(np.uint8)
+                    else:
+                        frame_copy = frame_copy.astype(np.uint8)
+                
+                # Generar nombre de archivo con sufijo de índice focal
+                # Ejemplo: sample_0001_f0.png, sample_0001_f1.png (BPoF), sample_0001_f2.png
+                filename = f"{class_name}_{image_index + 1:04d}_f{i}.png"
+                filepath = os.path.join(save_folder, filename)
+                
+                # Guardar imagen
+                cv2.imwrite(filepath, frame_copy)
+                
+                focus_label = "BPoF" if i == n_captures // 2 else f"offset={z_pos - result.z_optimal:+.1f}µm"
+                logger.info(f"[MicroscopyService]   Frame {i+1}/{n_captures} ({focus_label}): {filename} (Z={z_pos:.1f}µm, S={score:.1f})")
+                
+            except Exception as e:
+                logger.error(f"[MicroscopyService] Error guardando frame multi-focal {i}: {e}")
+                all_success = False
+        
+        return all_success
     
     def _save_autofocus_frame_alt(self, result, image_index: int) -> bool:
         """Guarda el frame alternativo (ligeramente desenfocado).

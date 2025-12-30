@@ -40,19 +40,26 @@ class AutofocusResult:
     Usado por AutofocusService para almacenar el resultado
     del escaneo Z de un objeto específico.
     
-    Incluye 2 capturas:
-    - frame: Imagen en BPoF (máximo enfoque)
-    - frame_alt: Imagen en foco alternativo (ligeramente desenfocada)
+    Incluye N capturas multi-focales (configurable, siempre impar):
+    - frames: Lista de imágenes [desenfoque_abajo, ..., BPoF, ..., desenfoque_arriba]
+    - z_positions: Posiciones Z correspondientes a cada frame
+    - focus_scores: Scores de enfoque para cada frame
+    
+    El BPoF siempre está en el centro de la lista (índice n//2).
     """
     object_index: int
     z_optimal: float
     focus_score: float
     bbox: Tuple[int, int, int, int]
-    frame: Optional[np.ndarray] = None
-    # Captura alternativa (foco diferente)
+    frame: Optional[np.ndarray] = None  # Frame principal (BPoF) - para compatibilidad
+    # Capturas multi-focales
+    frames: List[np.ndarray] = field(default_factory=list)  # Lista de N frames
+    z_positions: List[float] = field(default_factory=list)  # Posiciones Z de cada frame
+    focus_scores: List[float] = field(default_factory=list)  # Scores de cada frame
+    # Campos legacy para compatibilidad
     frame_alt: Optional[np.ndarray] = None
-    z_alt: float = 0.0  # Posición Z de la captura alternativa
-    score_alt: float = 0.0  # Score de la captura alternativa
+    z_alt: float = 0.0
+    score_alt: float = 0.0
     
     @property
     def bounding_box(self) -> Tuple[int, int, int, int]:

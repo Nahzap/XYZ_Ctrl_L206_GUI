@@ -6,12 +6,141 @@ Permite al usuario confirmar si el ROI detectado es válido o no.
 import logging
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QWidget)
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRect
+from PyQt5.QtGui import QPixmap, QImage, QCursor, QPainter, QPen, QColor
 import numpy as np
 import cv2
 
 logger = logging.getLogger(__name__)
+
+
+class InteractiveImageLabel(QLabel):
+    """QLabel interactivo para dibujar rectángulos (ROIs manuales)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._drawing_enabled = False
+        self._start_pos = None
+        self._current_rect = None
+        self._scaled_pixmap = None
+        self._base_pixmap = None
+        self._scale_x = 1.0
+        self._scale_y = 1.0
+        self._offset_x = 0
+        self._offset_y = 0
+        self._image_w = 0
+        self._image_h = 0
+        # ROIs en coordenadas ORIGINALES (x, y, w, h)
+        self._custom_rois = []
+
+    def set_image_geometry(self, image_w: int, image_h: int, scaled_w: int, scaled_h: int, offset_x: int, offset_y: int):
+        self._image_w = image_w
+        self._image_h = image_h
+        self._scale_x = float(scaled_w) / float(image_w) if image_w > 0 else 1.0
+        self._scale_y = float(scaled_h) / float(image_h) if image_h > 0 else 1.0
+        self._offset_x = offset_x
+        self._offset_y = offset_y
+
+    def setPixmap(self, pixmap: QPixmap):
+        super().setPixmap(pixmap)
+        # Guardar copias para overlay
+        self._scaled_pixmap = pixmap
+        self._base_pixmap = QPixmap(pixmap)
+        # Redibujar overlays existentes
+        self._redraw_overlays()
+
+    def set_drawing_enabled(self, enabled: bool):
+        self._drawing_enabled = enabled
+
+    def clear_rois(self):
+        self._custom_rois = []
+        self._redraw_overlays()
+
+    def get_custom_rois(self):
+        return list(self._custom_rois)
+
+    def mousePressEvent(self, event):
+        if not self._drawing_enabled:
+            return super().mousePressEvent(event)
+        if event.button() == 1:  # Left button
+            pos = event.pos()
+            if not self._point_in_image_area(pos):
+                return
+            self._start_pos = pos
+            self._current_rect = None
+
+    def mouseMoveEvent(self, event):
+        if not self._drawing_enabled or self._start_pos is None:
+            return super().mouseMoveEvent(event)
+        end_pos = event.pos()
+        self._current_rect = self._make_rect(self._start_pos, end_pos)
+        self._redraw_overlays(temp_rect=self._current_rect)
+
+    def mouseReleaseEvent(self, event):
+        if not self._drawing_enabled or self._start_pos is None:
+            return super().mouseReleaseEvent(event)
+        end_pos = event.pos()
+        rect = self._make_rect(self._start_pos, end_pos)
+        self._start_pos = None
+        self._current_rect = None
+        # Convertir a coordenadas ORIGINALES
+        if rect is not None:
+            x = max(0, int((rect.x() - self._offset_x) / self._scale_x))
+            y = max(0, int((rect.y() - self._offset_y) / self._scale_y))
+            w = int(rect.width() / self._scale_x)
+            h = int(rect.height() / self._scale_y)
+            # Clampear a imagen
+            if x + w > self._image_w:
+                w = self._image_w - x
+            if y + h > self._image_h:
+                h = self._image_h - y
+            if w > 2 and h > 2:
+                self._custom_rois.append((x, y, w, h))
+        self._redraw_overlays()
+
+    def _point_in_image_area(self, pt: QPoint) -> bool:
+        if self._scaled_pixmap is None:
+            return False
+        rect = self.contentsRect()
+        img_rect = rect.adjusted(self._offset_x, self._offset_y, -self._offset_x, -self._offset_y)
+        return img_rect.contains(pt)
+
+    def _make_rect(self, p1: QPoint, p2: QPoint):
+        x1, y1 = p1.x(), p1.y()
+        x2, y2 = p2.x(), p2.y()
+        x = min(x1, x2)
+        y = min(y1, y2)
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+        # Restringir a área visible de la imagen
+        x = max(self._offset_x, min(x, self.width() - self._offset_x))
+        y = max(self._offset_y, min(y, self.height() - self._offset_y))
+        return QRect(x, y, w, h)
+
+    def _redraw_overlays(self, temp_rect=None):
+        if self._base_pixmap is None:
+            return
+        pix = QPixmap(self._base_pixmap)
+        painter = QPainter(pix)
+        pen_saved = QPen(QColor(255, 255, 0))  # Amarillo para existentes
+        pen_saved.setWidth(3)
+        painter.setPen(pen_saved)
+        # Dibujar ROIs existentes (convertir a coords escaladas)
+        for (x, y, w, h) in self._custom_rois:
+            sx = int(x * self._scale_x) + self._offset_x
+            sy = int(y * self._scale_y) + self._offset_y
+            sw = int(w * self._scale_x)
+            sh = int(h * self._scale_y)
+            painter.drawRect(sx, sy, sw, sh)
+
+        # Rectángulo temporal (naranja)
+        if temp_rect is not None:
+            pen_temp = QPen(QColor(255, 165, 0))
+            pen_temp.setWidth(2)
+            painter.setPen(pen_temp)
+            painter.drawRect(temp_rect)
+        painter.end()
+        super().setPixmap(pix)
 
 
 class LearningConfirmationDialog(QDialog):
@@ -86,7 +215,7 @@ class LearningConfirmationDialog(QDialog):
         layout.addWidget(self.progress_bar)
         
         # Imagen con ROI
-        self.image_label = QLabel("Cargando imagen...")
+        self.image_label = InteractiveImageLabel("Cargando imagen...")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: #000; border: 2px solid #505050;")
         self.image_label.setMinimumSize(640, 480)
@@ -136,6 +265,22 @@ class LearningConfirmationDialog(QDialog):
         """)
         self.accept_btn.clicked.connect(self._on_accept)
         buttons_layout.addWidget(self.accept_btn)
+
+        # Botones para segmentación manual
+        self.add_roi_btn = QPushButton("✎ Añadir ROI manual")
+        self.add_roi_btn.setToolTip("Activa modo dibujo: arrastra sobre la imagen para añadir un ROI")
+        self.add_roi_btn.clicked.connect(self._toggle_draw_mode)
+        buttons_layout.addWidget(self.add_roi_btn)
+
+        self.clear_rois_btn = QPushButton("🧹 Limpiar ROIs")
+        self.clear_rois_btn.setToolTip("Elimina todos los ROIs manuales dibujados")
+        self.clear_rois_btn.clicked.connect(self._on_clear_rois)
+        buttons_layout.addWidget(self.clear_rois_btn)
+
+        self.use_manual_btn = QPushButton("✅ Usar ROIs manuales")
+        self.use_manual_btn.setToolTip("Reemplaza la segmentación detectada por tus ROIs manuales")
+        self.use_manual_btn.clicked.connect(self._on_use_manual_rois)
+        buttons_layout.addWidget(self.use_manual_btn)
         
         layout.addLayout(buttons_layout)
         
@@ -182,16 +327,63 @@ class LearningConfirmationDialog(QDialog):
         pixmap = QPixmap.fromImage(q_image)
         scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.image_label.setPixmap(scaled)
+        # Configurar geometría para convertir coord. dibujo -> imagen original
+        lw, lh = self.image_label.width(), self.image_label.height()
+        sw, sh = scaled.width(), scaled.height()
+        off_x = int((lw - sw) / 2)
+        off_y = int((lh - sh) / 2)
+        self.image_label.set_image_geometry(frame.shape[1], frame.shape[0], sw, sh, off_x, off_y)
         
         # Reiniciar cuenta regresiva
         self.countdown_seconds = 10
         self.user_response = None
         self.countdown_timer.start(1000)  # 1 segundo
         
+        # Mover el cursor automáticamente al botón de Aceptar para acelerar el flujo
+        try:
+            QTimer.singleShot(150, self._move_cursor_to_accept)
+        except Exception:
+            pass
+        
         # Mostrar diálogo modal
         self.exec_()
         
         return self.user_response
+
+    def _move_cursor_to_accept(self):
+        """Mueve el cursor al centro del botón de Aceptar (no hace click)."""
+        try:
+            center = self.accept_btn.rect().center()
+            global_pos = self.accept_btn.mapToGlobal(center)
+            QCursor.setPos(global_pos)
+        except Exception:
+            pass
+    
+    def _toggle_draw_mode(self):
+        """Activa/desactiva modo de dibujo de ROIs manuales."""
+        enabled = not getattr(self, '_draw_mode', False)
+        self._draw_mode = enabled
+        self.image_label.set_drawing_enabled(enabled)
+        self.add_roi_btn.setText("✎ Añadir ROI (ON)" if enabled else "✎ Añadir ROI manual")
+    
+    def _on_clear_rois(self):
+        self.image_label.clear_rois()
+    
+    def _on_use_manual_rois(self):
+        """Devuelve respuesta con ROIs manuales para reemplazar segmentación detectada."""
+        rois = self.image_label.get_custom_rois()
+        if not rois:
+            # No hay ROIs; no hacemos nada
+            return
+        # Construir respuesta enriquecida
+        self.countdown_timer.stop()
+        self.user_response = {
+            'accepted': True,
+            'replace': True,
+            'custom_rois': rois,
+        }
+        logger.info(f"Usuario definió {len(rois)} ROIs manuales (reemplazar segmentación)")
+        self.accept()
     
     def _draw_roi_on_frame(self, frame, bbox, mask):
         """Dibuja el ROI y la máscara sobre el frame."""

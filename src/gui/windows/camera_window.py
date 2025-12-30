@@ -193,15 +193,48 @@ class CameraViewWindow(QWidget):
         objects_title.setStyleSheet("font-weight: bold; color: #3498DB;")
         objects_layout.addWidget(objects_title)
         
-        self.objects_list = QListWidget()
-        self.objects_list.setStyleSheet("""
-            QListWidget { background-color: #2C2C2C; border: 1px solid #505050; }
-            QListWidget::item { padding: 3px; }
-            QListWidget::item:selected { background-color: #3498DB; }
+        # Tabla profesional de objetos
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        self.objects_table = QTableWidget()
+        self.objects_table.setColumnCount(3)
+        self.objects_table.setHorizontalHeaderLabels(["Nº", "Score", "Área (px)"])
+        self.objects_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #2C2C2C;
+                border: 1px solid #505050;
+                gridline-color: #404040;
+            }
+            QTableWidget::item {
+                padding: 5px;
+                color: #FFFFFF;
+            }
+            QTableWidget::item:selected {
+                background-color: #3498DB;
+                color: white;
+            }
+            QHeaderView::section {
+                background-color: #1E1E1E;
+                color: #3498DB;
+                padding: 5px;
+                border: 1px solid #404040;
+                font-weight: bold;
+            }
         """)
-        self.objects_list.setMinimumWidth(180)
-        self.objects_list.setMaximumWidth(250)
-        objects_layout.addWidget(self.objects_list)
+        self.objects_table.horizontalHeader().setStretchLastSection(False)
+        self.objects_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.objects_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.objects_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.objects_table.setColumnWidth(0, 40)  # Nº
+        self.objects_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.objects_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.objects_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.objects_table.setMinimumWidth(180)
+        self.objects_table.setMaximumWidth(250)
+        self.objects_table.itemSelectionChanged.connect(self._on_object_selected)
+        objects_layout.addWidget(self.objects_table)
+        
+        # Mantener referencia a lista antigua para compatibilidad (deprecada)
+        self.objects_list = self.objects_table
         
         splitter.addWidget(objects_panel)
         splitter.setSizes([700, 200])
@@ -227,6 +260,22 @@ class CameraViewWindow(QWidget):
         self.is_paused = False
         self.microscopy_active = False
         self.current_point_number = 0
+        
+        # Estado de autofoco para overlay de score (SIEMPRE VISIBLE)
+        self.autofocus_active = False
+        self.current_z_position = 0.0
+        self.current_focus_score = 0.0
+        self.autofocus_status_msg = ""
+        
+        # Referencia al controlador C-Focus para leer Z en tiempo real
+        self.cfocus_controller = None
+        
+        # Throttling para cálculo de score (evita congelar UI)
+        self._last_score_update = 0
+        self._score_update_interval = 0.2  # Actualizar score cada 200ms (5 Hz)
+        
+        # Selección de objeto para resaltar ROI
+        self.selected_object_index = None
     
     def _on_detection_done(self, prob_map, objects, time_ms, frame_bgr):
         """Guarda resultado de detección - PRE-CALCULA contornos para overlay liviano."""
@@ -276,54 +325,70 @@ class CameraViewWindow(QWidget):
         logger.info(f"Detección: {len(objects)} objetos, {n_in_range} en rango [{min_area}-{max_area}]")
     
     def _update_objects_list(self, boxes, min_area=0, max_area=999999):
-        """Actualiza la lista de objetos detectados con sus áreas."""
-        self.objects_list.clear()
+        """Actualiza la tabla de objetos detectados con sus datos."""
+        from PyQt5.QtWidgets import QTableWidgetItem
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QColor
+        
+        self.objects_table.setRowCount(0)  # Limpiar tabla
         
         if not boxes:
-            item = QListWidgetItem("Sin objetos detectados")
-            item.setForeground(Qt.gray)
-            self.objects_list.addItem(item)
             return
         
-        # Header con rango de filtro
-        header = QListWidgetItem(f"Filtro: [{min_area}-{max_area}] px")
-        header.setForeground(Qt.cyan)
-        self.objects_list.addItem(header)
-        
+        # Llenar tabla con datos de objetos
         for i, box in enumerate(boxes):
             area = box.get('area', 0)
             score = box.get('score', 0)
             in_range = box.get('in_filter_range', False)
             
-            # Formato: #N | XXXXX px | S:XX.X [✓ si en rango]
-            text = f"#{i+1} | {area:.0f} px | S:{score:.1f}"
-            if in_range:
-                text += " ✓"
+            self.objects_table.insertRow(i)
             
-            item = QListWidgetItem(text)
+            # Columna 0: Número
+            num_item = QTableWidgetItem(f"{i+1}")
+            num_item.setTextAlignment(Qt.AlignCenter)
             if in_range:
-                item.setForeground(Qt.green)  # Verde si está en rango
+                num_item.setForeground(QColor(0, 255, 0))  # Verde
             else:
-                item.setForeground(Qt.yellow)  # Amarillo si fuera de rango
-            self.objects_list.addItem(item)
+                num_item.setForeground(QColor(255, 200, 100))  # Amarillo
+            self.objects_table.setItem(i, 0, num_item)
+            
+            # Columna 1: Score
+            score_item = QTableWidgetItem(f"{score:.1f}")
+            score_item.setTextAlignment(Qt.AlignCenter)
+            self.objects_table.setItem(i, 1, score_item)
+            
+            # Columna 2: Área
+            area_item = QTableWidgetItem(f"{area:.0f}")
+            area_item.setTextAlignment(Qt.AlignCenter)
+            self.objects_table.setItem(i, 2, area_item)
+    
+    def _on_object_selected(self):
+        """Handler cuando se selecciona un objeto en la tabla."""
+        selected_rows = self.objects_table.selectedIndexes()
+        if selected_rows:
+            row = selected_rows[0].row()
+            self.selected_object_index = row
+            logger.info(f"[CameraWindow] Objeto #{row+1} seleccionado para resaltar")
+        else:
+            self.selected_object_index = None
     
     # === ACTUALIZACIÓN DE FRAME ===
     
     def update_frame(self, q_image, raw_frame=None):
-        """Actualiza visualización - frame EN VIVO con overlay LIVIANO."""
+        """Actualiza visualización - frame EN VIVO con overlay LIVIANO.
+        
+        El overlay de Z y Score SIEMPRE se muestra y se actualiza en cada frame.
+        """
         try:
             self.frame_count += 1
             
             if raw_frame is not None:
                 self.last_frame = raw_frame
+                # Calcular score en tiempo real si hay scorer configurado
+                self._update_realtime_score(raw_frame)
             
-            # ¿Hay overlay disponible?
-            has_overlay = (self.show_contours_cb.isChecked() or self.show_boxes_cb.isChecked()) \
-                          and self.detection_result is not None
-            
-            # Aplicar overlay LIVIANO directamente sobre QImage (sin conversión numpy)
-            if has_overlay:
-                q_image = self._draw_overlay_on_qimage(q_image)
+            # SIEMPRE dibujar overlay (Z y Score siempre visibles)
+            q_image = self._draw_overlay_on_qimage(q_image)
             
             # Mostrar frame
             pixmap = QPixmap.fromImage(q_image)
@@ -331,18 +396,59 @@ class CameraViewWindow(QWidget):
             self.video_label.setPixmap(scaled)
             
             n_obj = self.detection_result.get('n_objects', 0) if self.detection_result else 0
-            mode = "🔍" if has_overlay else "🎥"
-            self.info_label.setText(f"{mode} LIVE | Frame: {self.frame_count} | {n_obj} obj")
+            mode = "🔴 AF" if self.autofocus_active else "🎥"
+            self.info_label.setText(f"{mode} LIVE | Frame: {self.frame_count} | S:{self.current_focus_score:.0f}")
             
         except Exception as e:
             logger.error(f"Error update_frame: {e}")
     
-    def _draw_overlay_on_qimage(self, q_image):
-        """Dibuja overlay A COLOR sobre QImage usando QPainter."""
-        from PyQt5.QtGui import QPainter, QPen, QColor, QFont
+    def _update_realtime_score(self, raw_frame):
+        """Calcula el score de enfoque con THROTTLING para no bloquear UI.
         
-        if self.detection_result is None:
-            return q_image
+        Solo actualiza cada _score_update_interval segundos (default 200ms).
+        También actualiza la posición Z si el C-Focus está conectado.
+        """
+        import time as time_module
+        
+        current_time = time_module.time()
+        
+        # Throttling: solo actualizar si pasó suficiente tiempo
+        if current_time - self._last_score_update < self._score_update_interval:
+            return
+        
+        self._last_score_update = current_time
+        
+        # Actualizar posición Z si C-Focus está disponible (lectura rápida)
+        if self.cfocus_controller is not None and self.cfocus_controller.is_connected:
+            try:
+                z_pos = self.cfocus_controller.read_z()
+                if z_pos is not None:
+                    self.current_z_position = z_pos
+            except Exception:
+                pass  # Silenciar errores de lectura Z
+        
+        # Calcular sharpness si hay scorer (operación costosa, por eso el throttling)
+        if self.scorer is None:
+            return
+        
+        try:
+            # Calcular sharpness global del frame
+            score = self.scorer.calculate_sharpness(raw_frame)
+            self.current_focus_score = score
+        except Exception as e:
+            logger.debug(f"Error calculando score en tiempo real: {e}")
+    
+    def set_cfocus_controller(self, controller):
+        """Configura el controlador C-Focus para lectura de Z en tiempo real."""
+        self.cfocus_controller = controller
+        logger.info("[CameraWindow] C-Focus controller configurado para lectura Z en tiempo real")
+    
+    def _draw_overlay_on_qimage(self, q_image):
+        """Dibuja overlay A COLOR sobre QImage usando QPainter.
+        
+        El overlay de Z y Score SIEMPRE se dibuja.
+        """
+        from PyQt5.QtGui import QPainter, QPen, QColor, QFont
         
         try:
             # Convertir a RGB32 para poder dibujar colores (grayscale no soporta colores)
@@ -353,56 +459,86 @@ class CameraViewWindow(QWidget):
             
             painter = QPainter(result)
             
-            # Escala entre frame original y QImage
-            orig_w, orig_h = self.detection_result.get('frame_size', (1920, 1200))
-            scale_x = result.width() / orig_w
-            scale_y = result.height() / orig_h
-            
-            # Dibujar contornos pre-calculados (AMARILLO)
-            if self.show_contours_cb.isChecked():
-                contours = self.detection_result.get('contours', [])
-                pen = QPen(QColor(255, 255, 0), 2)  # Amarillo
-                painter.setPen(pen)
-                for contour in contours:
-                    if len(contour) > 1:
-                        points = [(int(pt[0][0] * scale_x), int(pt[0][1] * scale_y)) for pt in contour]
-                        for i in range(len(points) - 1):
-                            painter.drawLine(points[i][0], points[i][1], points[i+1][0], points[i+1][1])
-                        painter.drawLine(points[-1][0], points[-1][1], points[0][0], points[0][1])
-            
-            # Dibujar boxes con color según si está en rango de filtro
-            if self.show_boxes_cb.isChecked():
-                boxes = self.detection_result.get('boxes', [])
-                font = QFont("Arial", 10, QFont.Bold)
-                painter.setFont(font)
+            # Dibujar overlays de detección solo si hay detection_result
+            if self.detection_result is not None:
+                # Escala entre frame original y QImage
+                orig_w, orig_h = self.detection_result.get('frame_size', (1920, 1200))
+                scale_x = result.width() / orig_w
+                scale_y = result.height() / orig_h
                 
-                for i, box in enumerate(boxes):
-                    x, y, bw, bh = box['bbox']
-                    x, y = int(x * scale_x), int(y * scale_y)
-                    bw, bh = int(bw * scale_x), int(bh * scale_y)
-                    
-                    # Color según si está en rango: Verde=en rango, Rojo=fuera
-                    in_range = box.get('in_filter_range', False)
-                    if in_range:
-                        pen = QPen(QColor(0, 255, 0), 2)  # Verde
-                    else:
-                        pen = QPen(QColor(255, 100, 100), 2)  # Rojo claro
+                # Dibujar contornos pre-calculados (AMARILLO)
+                if self.show_contours_cb.isChecked():
+                    contours = self.detection_result.get('contours', [])
+                    pen = QPen(QColor(255, 255, 0), 2)  # Amarillo
                     painter.setPen(pen)
-                    painter.drawRect(x, y, bw, bh)
+                    for contour in contours:
+                        if len(contour) > 1:
+                            points = [(int(pt[0][0] * scale_x), int(pt[0][1] * scale_y)) for pt in contour]
+                            for i in range(len(points) - 1):
+                                painter.drawLine(points[i][0], points[i][1], points[i+1][0], points[i+1][1])
+                            painter.drawLine(points[-1][0], points[-1][1], points[0][0], points[0][1])
+                
+                # Dibujar boxes con color según si está en rango de filtro
+                if self.show_boxes_cb.isChecked():
+                    boxes = self.detection_result.get('boxes', [])
+                    font = QFont("Arial", 10, QFont.Bold)
+                    painter.setFont(font)
                     
-                    # Mostrar número, área y score
-                    area = box.get('area', 0)
-                    score = box.get('score', 0)
-                    label = f"#{i+1} {area:.0f}px"
-                    if in_range:
-                        label += " ✓"
-                    painter.drawText(x + 2, y - 5, label)
+                    for i, box in enumerate(boxes):
+                        x, y, bw, bh = box['bbox']
+                        x, y = int(x * scale_x), int(y * scale_y)
+                        bw, bh = int(bw * scale_x), int(bh * scale_y)
+                        
+                        # AZUL si está seleccionado, sino color según filtro
+                        if self.selected_object_index is not None and i == self.selected_object_index:
+                            pen = QPen(QColor(50, 150, 255), 4)  # AZUL BRILLANTE, grosor 4
+                        else:
+                            # Color según si está en rango: Verde=en rango, Rojo=fuera
+                            in_range = box.get('in_filter_range', False)
+                            if in_range:
+                                pen = QPen(QColor(0, 255, 0), 2)  # Verde
+                            else:
+                                pen = QPen(QColor(255, 100, 100), 2)  # Rojo claro
+                        
+                        painter.setPen(pen)
+                        painter.drawRect(x, y, bw, bh)
+                        
+                        # Mostrar número, área y score
+                        area = box.get('area', 0)
+                        score = box.get('score', 0)
+                        label = f"#{i+1} {area:.0f}px"
+                        in_range = box.get('in_filter_range', False)
+                        if in_range:
+                            label += " ✓"
+                        painter.drawText(x + 2, y - 5, label)
+                
+                # Mostrar info general en esquina
+                n_obj = self.detection_result.get('n_objects', 0)
+                if n_obj > 0:
+                    painter.setPen(QPen(QColor(255, 255, 255)))
+                    painter.drawText(10, 20, f"Objetos: {n_obj}")
             
-            # Mostrar info general en esquina
-            n_obj = self.detection_result.get('n_objects', 0)
-            if n_obj > 0:
-                painter.setPen(QPen(QColor(255, 255, 255)))
-                painter.drawText(10, 20, f"Objetos: {n_obj}")
+            # OVERLAY DE SCORE SIEMPRE VISIBLE (esquina superior izquierda, ROJO)
+            # Fondo semi-transparente para mejor legibilidad
+            painter.setBrush(QColor(0, 0, 0, 200))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(5, 5, 280, 75)
+            
+            # Texto en ROJO GRANDE para Z y Score
+            font_large = QFont("Arial", 22, QFont.Bold)
+            painter.setFont(font_large)
+            painter.setPen(QPen(QColor(255, 50, 50)))  # Rojo brillante
+            
+            # Mostrar Z y Score (siempre actualizados)
+            painter.drawText(12, 35, f"Z: {self.current_z_position:.1f} µm")
+            painter.drawText(12, 65, f"S: {self.current_focus_score:.1f}")
+            
+            # Indicador de estado de autofoco (pequeño, a la derecha)
+            if self.autofocus_active:
+                font_small = QFont("Arial", 10, QFont.Bold)
+                painter.setFont(font_small)
+                painter.setPen(QPen(QColor(50, 255, 50)))  # Verde
+                painter.drawText(200, 20, "● AF")
             
             painter.end()
             return result
@@ -533,6 +669,36 @@ class CameraViewWindow(QWidget):
         if not active:
             self.is_paused = False
             self.pause_btn.setText("⏸️ Pausar")
+    
+    # === MÉTODOS PARA OVERLAY DE AUTOFOCO ===
+    
+    def set_autofocus_active(self, active: bool):
+        """Activa/desactiva el overlay de autofoco."""
+        self.autofocus_active = active
+        if not active:
+            self.current_z_position = 0.0
+            self.current_focus_score = 0.0
+            self.autofocus_status_msg = ""
+        logger.info(f"[CameraWindow] Autofocus overlay: {'ACTIVO' if active else 'INACTIVO'}")
+    
+    def update_autofocus_score(self, z_position: float, score: float):
+        """Actualiza el score de autofoco mostrado en el overlay.
+        
+        Args:
+            z_position: Posición Z actual en µm
+            score: Score de enfoque actual
+        """
+        self.current_z_position = z_position
+        self.current_focus_score = score
+        # No necesita forzar repaint - se actualiza en el próximo frame
+    
+    def set_autofocus_status(self, message: str):
+        """Establece mensaje de estado del autofoco.
+        
+        Args:
+            message: Mensaje corto de estado (se trunca a 30 chars)
+        """
+        self.autofocus_status_msg = message[:30] if message else ""
     
     def closeEvent(self, event):
         super().closeEvent(event)

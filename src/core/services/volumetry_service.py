@@ -260,40 +260,39 @@ class VolumetryService(QObject):
         output_folder = os.path.join(save_folder, folder_name)
         os.makedirs(output_folder, exist_ok=True)
         
-        # 5. Capturar imágenes en cada posición Z
+        # 5. Capturar imágenes en cada posición Z (OPTIMIZADO)
         captured_images = []
+        
+        # Calcular score solo 1 vez al inicio (no en cada Z)
+        frame_initial = self._get_current_frame()
+        if frame_initial is None:
+            raise ValueError("No hay frame disponible para captura")
+        
+        if frame_initial.dtype == np.uint16:
+            frame_8bit_initial = (frame_initial / frame_initial.max() * 255).astype(np.uint8) if frame_initial.max() > 0 else frame_initial.astype(np.uint8)
+        else:
+            frame_8bit_initial = frame_initial
+        
+        # Score inicial del objeto
+        initial_score = self._get_roi_score(frame_8bit_initial, target_object)
+        
+        logger.info(f"[VolumetryService] Iniciando captura de {len(z_positions)} imágenes (score inicial: {initial_score:.2f})")
+        
         for i, z_pos in enumerate(z_positions):
             if self._abort_requested:
                 raise ValueError("Volumetría abortada por usuario")
             
-            # Mover a posición Z
+            # Mover a posición Z (sin sleep adicional, el move_z ya tiene su propio settle)
             self._move_z(z_pos)
-            
-            # Pequeña pausa para estabilización
-            import time
-            time.sleep(0.1)
-            
-            # Obtener frame y score
-            frame = self._get_current_frame()
-            if frame is None:
-                continue
-            
-            # Calcular score en esta posición
-            if frame.dtype == np.uint16:
-                frame_8bit = (frame / frame.max() * 255).astype(np.uint8) if frame.max() > 0 else frame.astype(np.uint8)
-            else:
-                frame_8bit = frame
-            
-            # Obtener score del ROI del objeto
-            score = self._get_roi_score(frame_8bit, target_object)
             
             # Determinar si es BPoF
             is_bpof = abs(z_pos - z_bpof) < z_step / 2
             
-            # Generar nombre de archivo
-            z_sign = "+" if z_pos >= 0 else ""
+            # Generar nombre de archivo ÚNICO usando índice secuencial
+            z_sign = "+" if z_pos >= 0 else "-"
             bpof_suffix = "_BPoF" if is_bpof else ""
-            filename = f"volumetry_z{z_sign}{z_pos:04.0f}um_score{score:.2f}{bpof_suffix}.{img_format}"
+            # Usar índice para garantizar unicidad + 3 decimales de Z
+            filename = f"{class_name}_{i:04d}_z{z_sign}{abs(z_pos):06.3f}um{bpof_suffix}.{img_format}"
             filepath = os.path.join(output_folder, filename)
             
             # Guardar imagen usando el callback proporcionado
@@ -324,15 +323,18 @@ class VolumetryService(QObject):
                 img_info = VolumetryImage(
                     filename=filename,
                     z_position=z_pos,
-                    score=score,
+                    score=initial_score,  # Usar score inicial (no recalcular)
                     is_bpof=is_bpof,
                     index=i
                 )
                 captured_images.append(img_info)
                 
                 self.volumetry_progress.emit(i + 1, n_images, z_pos)
-                self.volumetry_image_captured.emit(z_pos, score, filepath)
-                logger.info(f"[VolumetryService] Capturada: {filename}")
+                self.volumetry_image_captured.emit(z_pos, initial_score, filepath)
+                
+                # Log cada 10 imágenes para no saturar
+                if (i + 1) % 10 == 0 or (i + 1) == n_images:
+                    logger.info(f"[VolumetryService] Progreso: {i + 1}/{n_images} imágenes capturadas")
         
         # 6. Volver a posición BPoF
         self._move_z(z_bpof)

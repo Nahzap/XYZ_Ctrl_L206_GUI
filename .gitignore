@@ -44,3 +44,10 @@ src/BKPs/
 # OS files
 Thumbs.db
 .DS_Store
+/backups
+/bkp_canny_method
+/docs
+/bkp_canny_method
+/bkp_canny_method
+XYZ_Ctrl_L206_GUI.code-workspace
+*.code-workspace

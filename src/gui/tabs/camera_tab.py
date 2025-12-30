@@ -159,8 +159,11 @@ class CameraTab(QWidget):
             lambda: self._widgets['camera_terminal'].clear()
         ))
         
-        # Mapear widgets al objeto
+        # Mapear widgets al objeto PRIMERO
         self._map_widgets()
+        
+        # Conectar botón de calibración DESPUÉS del mapeo
+        self.cfocus_calibrate_btn.clicked.connect(self._on_calibrate_cfocus)
         
         main_layout.addStretch()
         scroll_area.setWidget(content_widget)
@@ -210,6 +213,7 @@ class CameraTab(QWidget):
         # Microscopía
         self.trajectory_status = self._widgets.get('trajectory_status')
         self.class_name_input = self._widgets.get('class_name_input')
+        self.xy_only_cb = self._widgets.get('xy_only_cb')
         self.img_width_input = self._widgets.get('img_width_input')
         self.img_height_input = self._widgets.get('img_height_input')
         self.channel_r_check = self._widgets.get('channel_r_check')
@@ -227,15 +231,28 @@ class CameraTab(QWidget):
         self.autofocus_enabled_cb = self._widgets.get('autofocus_enabled_cb')
         self.cfocus_connect_btn = self._widgets.get('cfocus_connect_btn')
         self.cfocus_disconnect_btn = self._widgets.get('cfocus_disconnect_btn')
+        self.cfocus_calibrate_btn = self._widgets.get('cfocus_calibrate_btn')  # NUEVO
         self.test_detection_btn = self._widgets.get('test_detection_btn')
         self.full_scan_cb = self._widgets.get('full_scan_cb')
         self.min_pixels_spin = self._widgets.get('min_pixels_spin')
         self.max_pixels_spin = self._widgets.get('max_pixels_spin')
         self.circularity_spin = self._widgets.get('circularity_spin')
         self.aspect_ratio_spin = self._widgets.get('aspect_ratio_spin')
-        self.z_range_spin = self._widgets.get('z_range_spin')
-        self.z_tolerance_spin = self._widgets.get('z_tolerance_spin')
+        self.z_scan_range_spin = self._widgets.get('z_scan_range_spin')
+        self.z_step_coarse_spin = self._widgets.get('z_step_coarse_spin')
+        self.z_step_fine_spin = self._widgets.get('z_step_fine_spin')
+        self.n_captures_spin = self._widgets.get('n_captures_spin')
+        self.z_settle_spin = self._widgets.get('z_settle_spin')
+        self.roi_margin_spin = self._widgets.get('roi_margin_spin')
+        self.estimated_images_label = self._widgets.get('estimated_images_label')
         self.cfocus_status_label = self._widgets.get('cfocus_status_label')
+        
+        # Z-Stack widgets
+        self.capture_zstack_radio = self._widgets.get('capture_zstack_radio')
+        self.zstack_n_images_spin = self._widgets.get('zstack_n_images_spin')
+        self.zstack_z_step_spin = self._widgets.get('zstack_z_step_spin')
+        self.zstack_save_json_check = self._widgets.get('zstack_save_json_check')
+        self.zstack_cfocus_range_label = self._widgets.get('zstack_cfocus_range_label')
         
         # Log
         self.camera_terminal = self._widgets.get('camera_terminal')
@@ -402,9 +419,9 @@ class CameraTab(QWidget):
             self.log_message("❌ Error: CameraService no disponible")
             return
         
-        # Verificar si es volumetría
-        if self.capture_volumetry_radio and self.capture_volumetry_radio.isChecked():
-            self._start_volumetry_capture()
+        # Verificar si es Z-Stack
+        if self.capture_zstack_radio and self.capture_zstack_radio.isChecked():
+            self._start_zstack_capture()
             return
         
         # Si autofoco está habilitado, ejecutar autofoco primero
@@ -425,13 +442,13 @@ class CameraTab(QWidget):
             img_format = self.image_format_combo.currentText().lower()
             self.camera_service.capture_image(folder, img_format)
     
-    def _start_volumetry_capture(self):
-        """Inicia captura volumétrica (Método 1: múltiples planos Z)."""
+    def _start_zstack_capture(self):
+        """Inicia captura de Z-Stack (múltiples planos Z comandados por Paso Z)."""
         # Verificar C-Focus conectado
         if not self.parent_gui or not getattr(self.parent_gui, 'cfocus_enabled', False):
-            self.log_message("❌ Error: C-Focus no conectado (requerido para volumetría)")
+            self.log_message("❌ Error: C-Focus no conectado (requerido para Z-Stack)")
             QMessageBox.warning(self.parent_gui, "Error", 
-                              "Volumetría requiere C-Focus conectado para control de Z")
+                              "Z-Stack requiere C-Focus conectado para control de Z")
             return
         
         # Verificar SmartFocusScorer disponible
@@ -442,37 +459,43 @@ class CameraTab(QWidget):
         # Obtener carpeta
         folder = self.save_folder_input.text()
         if not folder:
-            folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta para Volumetría")
+            folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta para Z-Stack")
             if folder:
                 self.save_folder_input.setText(folder)
-            else:
-                return
         
-        # Construir configuración de volumetría
-        z_step = self.volumetry_z_step_spin.value() if self.volumetry_z_step_spin else 1.0
+        if not folder:
+            self.log_message("❌ Error: No se seleccionó carpeta")
+            return
+        
+        # Preparar configuración de Z-Stack
+        # Paso Z COMANDA las slices
+        z_step = self.zstack_z_step_spin.value() if self.zstack_z_step_spin else 0.05
+        n_images = self.zstack_n_images_spin.value() if self.zstack_n_images_spin else 200
+        
+        # Calcular rango Z basado en número de imágenes y paso
+        z_range_total = (n_images - 1) * z_step
+        
         config = {
-            'n_images': self.volumetry_n_images_spin.value() if self.volumetry_n_images_spin else 10,
-            'distribution': self.volumetry_distribution_combo.currentText() if self.volumetry_distribution_combo else 'uniform',
-            'include_bpof': self.volumetry_include_bpof_check.isChecked() if self.volumetry_include_bpof_check else True,
-            'save_json': self.volumetry_save_json_check.isChecked() if self.volumetry_save_json_check else True,
+            'n_images': n_images,
+            'z_step': z_step,  # Paso Z que COMANDA las slices
+            'z_range': z_range_total,  # Calculado automáticamente
+            'save_json': self.zstack_save_json_check.isChecked() if self.zstack_save_json_check else True,
             'save_folder': folder,
             'img_format': self.image_format_combo.currentText().lower(),
             'use_16bit': self.use_16bit_check.isChecked() if self.use_16bit_check else True,
-            'z_range': self.z_range_spin.value() if self.z_range_spin else 50.0,
-            'z_step': z_step,  # Paso configurable (0.01 - 10.0 µm)
             'min_area': self.min_pixels_spin.value() if self.min_pixels_spin else 5000,
             'max_area': self.max_pixels_spin.value() if self.max_pixels_spin else 50000,
             'score_threshold': 0.3,
-            'class_name': 'volumetry',
+            'class_name': 'zstack',
             'exposure_ms': float(self.exposure_input.text()) if self.exposure_input else 50.0
         }
         
         self.log_message("=" * 40)
-        self.log_message("🔬 INICIANDO VOLUMETRÍA")
+        self.log_message("🔬 INICIANDO Z-STACK")
         self.log_message(f"   Imágenes: {config['n_images']}")
-        self.log_message(f"   Distribución: {config['distribution']}")
+        self.log_message(f"   Paso Z: {config['z_step']}µm (COMANDA las slices)")
+        self.log_message(f"   Rango Z total: {config['z_range']:.2f}µm")
         self.log_message(f"   Formato: {config['img_format'].upper()} ({'16-bit' if config['use_16bit'] else '8-bit'})")
-        self.log_message(f"   Rango Z: ±{config['z_range']}µm, paso: {config['z_step']}µm")
         self.log_message("=" * 40)
         
         # Ejecutar volumetría en thread separado
@@ -620,6 +643,11 @@ class CameraTab(QWidget):
             return
         
         try:
+            # Forzar delay mínimo si el usuario se queja de lentitud
+            delay_before_val = float(self.delay_before_input.text())
+            if delay_before_val > 0.5:
+                self.log_message(f"⚠️ Aviso: Delay antes ({delay_before_val}s) se sumará a la pausa de trayectoria.")
+            
             config = {
                 'class_name': self.class_name_input.text().strip().replace(' ', '_'),
                 'save_folder': self.microscopy_folder_input.text(),
@@ -632,14 +660,15 @@ class CameraTab(QWidget):
                     'G': self.channel_g_check.isChecked(),
                     'B': self.channel_b_check.isChecked()
                 },
-                'delay_before': float(self.delay_before_input.text()),
+                'delay_before': delay_before_val,
                 'delay_after': float(self.delay_after_input.text()),
                 'n_points': self._trajectory_n_points,
-                'autofocus_enabled': self.autofocus_enabled_cb.isChecked(),
+                # Si el usuario activa "Sólo trayectoria XY", forzamos autofoco en False
+                'autofocus_enabled': False if (self.xy_only_cb and self.xy_only_cb.isChecked()) else self.autofocus_enabled_cb.isChecked(),
                 'min_pixels': self.min_pixels_spin.value(),
                 'max_pixels': self.max_pixels_spin.value(),
-                'z_range': self.z_range_spin.value(),
-                'z_tolerance': self.z_tolerance_spin.value()
+                'z_step_coarse': self.z_step_coarse_spin.value(),
+                'z_step_fine': self.z_step_fine_spin.value()
             }
         except ValueError as e:
             self.log_message(f"❌ Error en parámetros: {e}")
@@ -657,6 +686,10 @@ class CameraTab(QWidget):
         self.log_message("INICIANDO MICROSCOPÍA AUTOMATIZADA")
         self.log_message(f"   Clase: {config['class_name']}")
         self.log_message(f"   Puntos: {config['n_points']}")
+        self.log_message(f"   Autofoco: {'ACTIVADO' if config['autofocus_enabled'] else 'DESACTIVADO'}")
+        if config['autofocus_enabled']:
+             self.log_message(f"   Rango AF: {config['min_pixels']}-{config['max_pixels']} px")
+        
         channels_str = ''.join([c for c in ['R', 'G', 'B'] if config['channels'][c]])
         self.log_message(f"   Canales: {channels_str}")
         fmt = config['img_format'].upper()
@@ -711,9 +744,8 @@ class CameraTab(QWidget):
             if success:
                 self.cfocus_connect_btn.setEnabled(False)
                 self.cfocus_disconnect_btn.setEnabled(True)
-                self.cfocus_status_label.setText("C-Focus: ✅ Conectado")
-                self.cfocus_status_label.setStyleSheet("color: #27AE60; font-weight: bold;")
-                self.parent_gui.initialize_autofocus()
+                self.cfocus_calibrate_btn.setEnabled(True)  # Habilitar calibración
+                self.update_cfocus_status(True, "Conectado")
     
     def _on_disconnect_cfocus(self):
         """Handler para desconectar C-Focus."""
@@ -721,9 +753,41 @@ class CameraTab(QWidget):
             self.parent_gui.disconnect_cfocus()
             self.cfocus_connect_btn.setEnabled(True)
             self.cfocus_disconnect_btn.setEnabled(False)
-            self.cfocus_status_label.setText("C-Focus: No conectado")
-            self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
+            self.cfocus_calibrate_btn.setEnabled(False)  # Deshabilitar calibración
+            self.update_cfocus_status(False)
             self.log_message("C-Focus desconectado")
+    
+    def _on_calibrate_cfocus(self):
+        """Handler para calibrar C-Focus."""
+        if self.parent_gui:
+            self.parent_gui.calibrate_cfocus()
+            self.update_cfocus_status(True, "Calibrado")
+    
+    def update_cfocus_status(self, connected: bool, info: str = ""):
+        """Actualiza el estado del C-Focus en la UI."""
+        if self.cfocus_status_label:
+            if connected:
+                self.cfocus_status_label.setText(f"C-Focus: {info}")
+                self.cfocus_status_label.setStyleSheet("color: #27AE60; font-weight: bold;")
+                self.log_message(f"C-Focus conectado: {info}")
+                
+                # Actualizar rango en Z-Stack UI si está calibrado
+                if self.parent_gui and hasattr(self.parent_gui, 'cfocus_controller'):
+                    calib_info = self.parent_gui.cfocus_controller.get_calibration_info()
+                    if calib_info['is_calibrated'] and self.zstack_cfocus_range_label:
+                        z_min = calib_info['z_min']
+                        z_max = calib_info['z_max']
+                        self.zstack_cfocus_range_label.setText(f"{z_min:.2f} - {z_max:.2f} µm")
+                        self.zstack_cfocus_range_label.setStyleSheet("color: #27AE60; font-weight: bold;")
+            else:
+                self.cfocus_status_label.setText("C-Focus: No conectado")
+                self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
+                self.log_message("C-Focus desconectado")
+                
+                # Resetear rango en Z-Stack UI
+                if self.zstack_cfocus_range_label:
+                    self.zstack_cfocus_range_label.setText("0.0 - 0.0 µm")
+                    self.zstack_cfocus_range_label.setStyleSheet("color: #888; font-style: italic;")
     
     def _on_test_detection(self):
         """Handler para test de detección."""
@@ -745,7 +809,7 @@ class CameraTab(QWidget):
         self.log_message(f"🔍 TEST Detección - Área: [{self.min_pixels_spin.value()}-{self.max_pixels_spin.value()}] px")
     
     def _update_detection_params(self):
-        """Actualiza parámetros de detección."""
+        """Actualiza parámetros de detección y autofocus."""
         if self.camera_view_window:
             min_area = self.min_pixels_spin.value()
             max_area = self.max_pixels_spin.value()
@@ -761,6 +825,62 @@ class CameraTab(QWidget):
                 min_circularity=min_circ,
                 min_aspect_ratio=min_aspect
             )
+        
+        # Actualizar parámetros de autofocus (distancia, pasos Z, settle time, ROI margin)
+        if (self.parent_gui and 
+            hasattr(self.parent_gui, 'autofocus_service') and 
+            self.parent_gui.autofocus_service is not None):
+            z_scan_range = self.z_scan_range_spin.value()  # µm
+            z_step_coarse = self.z_step_coarse_spin.value()  # µm
+            z_step_fine = self.z_step_fine_spin.value()  # µm
+            settle_ms = self.z_settle_spin.value()  # ms
+            settle_s = settle_ms / 1000.0  # convertir a segundos
+            roi_margin = self.roi_margin_spin.value()  # px
+            
+            # Validar que coarse > fine
+            if z_step_coarse <= z_step_fine:
+                self.log_message(f"⚠️ Paso grueso ({z_step_coarse}µm) debe ser > Paso fino ({z_step_fine}µm)")
+                z_step_coarse = z_step_fine * 2  # Auto-corregir
+                self.z_step_coarse_spin.setValue(z_step_coarse)
+            
+            
+            # Obtener n_captures y asegurar que sea impar
+            n_captures = self.n_captures_spin.value()
+            if n_captures % 2 == 0:
+                n_captures += 1
+                self.n_captures_spin.setValue(n_captures)
+            # Actualizar parámetros en servicio
+            self.parent_gui.autofocus_service.z_scan_range = z_scan_range
+            self.parent_gui.autofocus_service.z_step_coarse = z_step_coarse
+            self.parent_gui.autofocus_service.z_step_fine = z_step_fine
+            self.parent_gui.autofocus_service.settle_time = settle_s
+            self.parent_gui.autofocus_service.roi_margin = roi_margin
+            
+            # Mostrar información de búsqueda (NO es conteo de imágenes)
+            search_info = self.parent_gui.autofocus_service.get_search_info()
+            self.parent_gui.autofocus_service.n_captures = n_captures
+            if self.estimated_images_label:
+                # Validar rango contra límites del C-Focus
+                is_valid, msg = self.parent_gui.autofocus_service.validate_scan_range()
+                
+                if not is_valid:
+                    self.estimated_images_label.setText("⚠️ Rango inválido")
+                    self.estimated_images_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
+                    self.estimated_images_label.setToolTip(f"⚠️ {msg}")
+                else:
+                    # Mostrar distancia de búsqueda y número de capturas multi-focales
+                    search_dist = search_info['search_distance_um']
+                    self.estimated_images_label.setText(f"±{z_scan_range:.1f}µm ({n_captures} imgs)")
+                    self.estimated_images_label.setStyleSheet("color: #3498DB; font-weight: bold;")
+                    self.estimated_images_label.setToolTip(
+                        f"Distancia de búsqueda: ±{z_scan_range}µm ({search_dist}µm total)\n"
+                        f"Algoritmo: Hill climbing (pasos adaptativos)\n"
+                        f"Paso grueso: {z_step_coarse}µm, Paso fino: {z_step_fine}µm\n\n"
+                        f"Capturas multi-focales: {n_captures} imágenes\n"
+                        f"BPoF en el centro ± {z_step_coarse}µm (coarse step)\n\n"
+                        f"NOTA: Autofoco busca 1 posición óptima (BPoF).\n"
+                        f"Las {n_captures} capturas son para trayectoria XY."
+                    )
     
     def _run_autofocus(self, capture_after=False):
         """Ejecuta detección + autofoco. Opcionalmente captura después."""
