@@ -1,6 +1,6 @@
 {
     "_comment": "Archivo de calibración del sistema XYZ. Editar según mediciones reales.",
-    "_updated": "2025-12-23 10:47:11",
+    "_updated": "2025-12-30 00:13:47",
     "calibration": {
         "x_axis": {
             "description": "Motor A, Sensor 2 - Eje X",

@@ -30,6 +30,8 @@ from gui.utils.camera_tab_ui_builder import (
     create_autofocus_section,
     create_log_section
 )
+from core.services import CameraOrchestrator
+from core.models import AutofocusConfig
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -58,7 +60,7 @@ class CameraTab(QWidget):
     microscopy_start_requested = pyqtSignal(dict)
     microscopy_stop_requested = pyqtSignal()
     
-    def __init__(self, thorlabs_available=False, parent=None, camera_service=None):
+    def __init__(self, thorlabs_available=False, parent=None, camera_service=None, camera_orchestrator=None):
         """
         Inicializa la pestaña de cámara.
         
@@ -66,11 +68,13 @@ class CameraTab(QWidget):
             thorlabs_available: Si pylablib está disponible
             parent: Widget padre (ArduinoGUI)
             camera_service: Instancia de CameraService
+            camera_orchestrator: Instancia de CameraOrchestrator (NUEVO)
         """
         super().__init__(parent)
         self.thorlabs_available = thorlabs_available
         self.parent_gui = parent
         self.camera_service = camera_service
+        self.orchestrator = camera_orchestrator
         
         # Configurar disponibilidad en el servicio
         if self.camera_service is not None:
@@ -94,6 +98,10 @@ class CameraTab(QWidget):
         
         # Conectar señales del servicio
         self._connect_service_signals()
+        
+        # Conectar señales del orchestrator
+        if self.orchestrator:
+            self._connect_orchestrator_signals()
         
         logger.debug("CameraTab inicializado (refactorizado)")
     
@@ -258,16 +266,38 @@ class CameraTab(QWidget):
         self.camera_terminal = self._widgets.get('camera_terminal')
     
     def _connect_service_signals(self):
-        """Conecta señales del CameraService con handlers de UI.
-        
-        NOTA: Las conexiones principales se hacen en main.py para evitar duplicación.
-        Este método solo conecta señales que NO están en main.py.
-        """
+        """Conecta señales del CameraService con handlers de UI."""
         if self.camera_service is None:
             return
         
         # Solo conectar error_occurred que no está en main.py
         self.camera_service.error_occurred.connect(self._on_error)
+    
+    def _connect_orchestrator_signals(self):
+        """Conecta señales del CameraOrchestrator con handlers de UI."""
+        if not self.orchestrator:
+            return
+        
+        # Conectar señales de estado
+        self.orchestrator.status_message.connect(self.log_message)
+        self.orchestrator.validation_error.connect(lambda msg: self.log_message(f"❌ {msg}"))
+        
+        # Conectar señales de autofoco
+        self.orchestrator.autofocus_complete.connect(self._on_orchestrator_autofocus_complete)
+        self.orchestrator.detection_complete.connect(self._on_orchestrator_detection_complete)
+    
+    def _on_orchestrator_autofocus_complete(self, results):
+        """Handler cuando el orchestrator completa autofoco."""
+        # Si hay captura pendiente, ejecutarla
+        if self.orchestrator.is_pending_capture():
+            self.log_message("📸 Capturando imagen post-autofoco...")
+            self._do_capture_image()
+            self.orchestrator.clear_pending_capture()
+    
+    def _on_orchestrator_detection_complete(self, objects):
+        """Handler cuando el orchestrator completa detección."""
+        # Actualizar UI si es necesario
+        pass
     
     # ==================================================================
     # HANDLERS DE BOTONES (delegan a CameraService)
@@ -329,9 +359,9 @@ class CameraTab(QWidget):
         if self.camera_view_window is None:
             self.camera_view_window = CameraViewWindow(self.parent_gui)
             
-            # Configurar SmartFocusScorer
-            if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
-                self.camera_view_window.set_scorer(self.parent_gui.smart_focus_scorer)
+            # Configurar SmartFocusScorer desde orchestrator
+            if self.orchestrator and self.orchestrator.scorer:
+                self.camera_view_window.set_scorer(self.orchestrator.scorer)
                 self.log_message("🔍 SmartFocusScorer configurado")
             
             # Conectar señales con MicroscopyService
@@ -452,7 +482,7 @@ class CameraTab(QWidget):
             return
         
         # Verificar SmartFocusScorer disponible
-        if not hasattr(self.parent_gui, 'smart_focus_scorer') or self.parent_gui.smart_focus_scorer is None:
+        if not self.orchestrator or not self.orchestrator.scorer:
             self.log_message("❌ Error: SmartFocusScorer no disponible")
             return
         
@@ -511,7 +541,7 @@ class CameraTab(QWidget):
         # Crear servicio de volumetría
         volumetry_service = VolumetryService(
             get_current_frame=lambda: self.camera_service.current_frame if self.camera_service else None,
-            smart_focus_scorer=self.parent_gui.smart_focus_scorer,
+            smart_focus_scorer=self.orchestrator.scorer if self.orchestrator else None,
             move_z=self._volumetry_move_z,
             get_z_position=self._volumetry_get_z,
             capture_image=self._volumetry_capture_image,
@@ -815,21 +845,19 @@ class CameraTab(QWidget):
             max_area = self.max_pixels_spin.value()
             self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
         
-        if (self.parent_gui and 
-            hasattr(self.parent_gui, 'smart_focus_scorer') and 
-            self.parent_gui.smart_focus_scorer is not None and
-            hasattr(self.parent_gui.smart_focus_scorer, 'set_morphology_params')):
+        # Actualizar parámetros morfológicos usando orchestrator
+        if self.orchestrator:
             min_circ = self.circularity_spin.value()
             min_aspect = self.aspect_ratio_spin.value()
-            self.parent_gui.smart_focus_scorer.set_morphology_params(
+            self.orchestrator.update_scorer_morphology_params(
                 min_circularity=min_circ,
                 min_aspect_ratio=min_aspect
             )
         
-        # Actualizar parámetros de autofocus (distancia, pasos Z, settle time, ROI margin)
-        if (self.parent_gui and 
-            hasattr(self.parent_gui, 'autofocus_service') and 
-            self.parent_gui.autofocus_service is not None):
+        # Actualizar parámetros de autofocus usando orchestrator
+        if self.orchestrator:
+            from core.models import AutofocusConfig
+            
             z_scan_range = self.z_scan_range_spin.value()  # µm
             z_step_coarse = self.z_step_coarse_spin.value()  # µm
             z_step_fine = self.z_step_fine_spin.value()  # µm
@@ -843,25 +871,39 @@ class CameraTab(QWidget):
                 z_step_coarse = z_step_fine * 2  # Auto-corregir
                 self.z_step_coarse_spin.setValue(z_step_coarse)
             
-            
             # Obtener n_captures y asegurar que sea impar
             n_captures = self.n_captures_spin.value()
             if n_captures % 2 == 0:
                 n_captures += 1
                 self.n_captures_spin.setValue(n_captures)
-            # Actualizar parámetros en servicio
-            self.parent_gui.autofocus_service.z_scan_range = z_scan_range
-            self.parent_gui.autofocus_service.z_step_coarse = z_step_coarse
-            self.parent_gui.autofocus_service.z_step_fine = z_step_fine
-            self.parent_gui.autofocus_service.settle_time = settle_s
-            self.parent_gui.autofocus_service.roi_margin = roi_margin
             
-            # Mostrar información de búsqueda (NO es conteo de imágenes)
-            search_info = self.parent_gui.autofocus_service.get_search_info()
-            self.parent_gui.autofocus_service.n_captures = n_captures
-            if self.estimated_images_label:
+            # Crear config y actualizar usando orchestrator
+            config = AutofocusConfig(
+                z_scan_range=z_scan_range,
+                z_step_coarse=z_step_coarse,
+                z_step_fine=z_step_fine,
+                settle_time=settle_s,
+                roi_margin=roi_margin,
+                n_captures=n_captures
+            )
+            
+            self.orchestrator.update_autofocus_params(config)
+            
+            # Mostrar información de búsqueda
+            search_info = self.orchestrator.get_autofocus_search_info()
+            if self.estimated_images_label and search_info:
                 # Validar rango contra límites del C-Focus
-                is_valid, msg = self.parent_gui.autofocus_service.validate_scan_range()
+                cfocus_limits = None
+                if self.parent_gui and hasattr(self.parent_gui, 'cfocus_enabled') and self.parent_gui.cfocus_enabled:
+                    cfocus = getattr(self.parent_gui, 'cfocus', None)
+                    if cfocus:
+                        cfocus_limits = {
+                            'z_min': cfocus.z_min,
+                            'z_max': cfocus.z_max,
+                            'current_z': cfocus.get_position()
+                        }
+                
+                is_valid, msg = self.orchestrator.validate_autofocus_params(config, cfocus_limits)
                 
                 if not is_valid:
                     self.estimated_images_label.setText("⚠️ Rango inválido")
@@ -883,10 +925,7 @@ class CameraTab(QWidget):
                     )
     
     def _run_autofocus(self, capture_after=False):
-        """Ejecuta detección + autofoco. Opcionalmente captura después."""
-        import numpy as np
-        import cv2
-        
+        """Ejecuta detección + autofoco usando CameraOrchestrator."""
         # Obtener frame actual
         current_frame = None
         if self.camera_service and self.camera_service.current_frame is not None:
@@ -898,64 +937,28 @@ class CameraTab(QWidget):
             self.log_message("❌ No hay frame disponible")
             return
         
+        # Validar orchestrator
+        if self.orchestrator is None:
+            self.log_message("❌ CameraOrchestrator no disponible")
+            if capture_after:
+                self._do_capture_image()
+            return
+        
         # Actualizar parámetros de detección
         self._update_detection_params()
         min_area = self.min_pixels_spin.value()
         max_area = self.max_pixels_spin.value()
         self.log_message(f"🔍 Detectando objetos (área: {min_area}-{max_area} px)...")
         
-        # Usar el scorer directamente para detección síncrona
-        if self.parent_gui and hasattr(self.parent_gui, 'smart_focus_scorer'):
-            scorer = self.parent_gui.smart_focus_scorer
-            frame = current_frame.copy()
-            
-            # Convertir frame uint16 -> uint8
-            if frame.dtype == np.uint16:
-                frame_max = frame.max()
-                if frame_max > 0:
-                    frame_uint8 = (frame / frame_max * 255).astype(np.uint8)
-                else:
-                    frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
-            else:
-                frame_uint8 = frame.astype(np.uint8)
-            
-            if len(frame_uint8.shape) == 2:
-                frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
-            else:
-                frame_bgr = frame_uint8
-            
-            # Detectar objetos
-            result = scorer.assess_image(frame_bgr)
-            all_objects = result.objects if result.objects else []
-            
-            # Filtrar por rango de área del usuario
-            objects = [obj for obj in all_objects if min_area <= obj.area <= max_area]
-            
-            if not objects:
-                self.log_message(f"⚠️ No hay objetos en rango [{min_area}-{max_area}] px")
-                self.log_message(f"   (Detectados {len(all_objects)} objetos totales)")
-                if capture_after:
-                    self.log_message("   Capturando sin autofoco...")
-                    self._do_capture_image()
-                return
-            
-            self.log_message(f"✅ {len(objects)} objeto(s) en rango (de {len(all_objects)} detectados)")
-            for i, obj in enumerate(objects):
-                self.log_message(f"   #{i+1}: área={obj.area:.0f}px, score={obj.focus_score:.1f}")
-            
-            # Iniciar autofoco asíncrono
-            if hasattr(self.parent_gui, 'autofocus_service') and self.parent_gui.autofocus_service:
-                self.log_message("🎯 Iniciando Z-scan autofoco...")
-                self.parent_gui.autofocus_service.start_autofocus(objects)
-                self._pending_capture = capture_after
-            else:
-                self.log_message("⚠️ AutofocusService no disponible")
-                if capture_after:
-                    self._do_capture_image()
-        else:
-            self.log_message("⚠️ Scorer no disponible")
-            if capture_after:
-                self._do_capture_image()
+        # Actualizar frame en orchestrator
+        self.orchestrator.set_current_frame(current_frame)
+        
+        # Delegar a orchestrator
+        self.orchestrator.run_autofocus(
+            capture_after=capture_after,
+            min_area=min_area,
+            max_area=max_area
+        )
     
     # ==================================================================
     # CALLBACKS DE SERVICIO

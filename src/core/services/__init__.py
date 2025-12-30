@@ -13,7 +13,8 @@ Todos los servicios ejecutan en threads separados (QThread) para no bloquear la 
 from .detection_service import DetectionService
 from .autofocus_service import AutofocusService
 from .camera_service import CameraService
+from .camera_orchestrator import CameraOrchestrator
 from .test_service import TestService, ControllerConfig, TrajectoryConfig
 
 __all__ = ['DetectionService', 'AutofocusService', 'CameraService', 
-           'TestService', 'ControllerConfig', 'TrajectoryConfig']
+           'TestService', 'CameraOrchestrator', 'ControllerConfig', 'TrajectoryConfig']

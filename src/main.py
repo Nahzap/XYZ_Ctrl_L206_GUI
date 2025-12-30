@@ -266,11 +266,30 @@ class ArduinoGUI(QMainWindow):
         self.tabs.addTab(self.hinf_tab, "🎛️ H∞ Synthesis")
         self.tabs.addTab(self.test_tab, "🧪 Prueba")
         
+        # Pestaña 7: Análisis de Imagen (ImgAnalysisTab - Índice de Nitidez)
+        # DEBE CREARSE ANTES de CameraOrchestrator porque necesita smart_focus_scorer
+        self.img_analysis_tab = ImgAnalysisTab(parent=self)
+        self.tabs.addTab(self.img_analysis_tab, "🔬 Img Analysis")
+        
+        # Exponer SmartFocusScorer para CameraViewWindow (usa el mismo que ImgAnalysisTab)
+        self.smart_focus_scorer = self.img_analysis_tab.scorer
+        
+        # Crear CameraOrchestrator (coordina cámara + detección + autofoco)
+        # AHORA smart_focus_scorer ya existe
+        from core.services import CameraOrchestrator
+        self.camera_orchestrator = CameraOrchestrator(
+            camera_service=self.camera_service,
+            detection_service=self.detection_service,
+            autofocus_service=self.autofocus_service,
+            smart_focus_scorer=self.smart_focus_scorer
+        )
+        
         # Pestaña 6: Cámara (CameraTab modular - auto-contenida)
         self.camera_tab = CameraTab(
             thorlabs_available=THORLABS_AVAILABLE,
             parent=self,
             camera_service=self.camera_service,
+            camera_orchestrator=self.camera_orchestrator,
         )
         # Conectar CameraService con CameraTab (solo orquestación desde main)
         self.camera_service.connected.connect(self.camera_tab._on_camera_connected)
@@ -283,13 +302,6 @@ class ArduinoGUI(QMainWindow):
         
         # Conectar servicios de detección con CameraTab
         self._setup_detection_services()
-        
-        # Pestaña 7: Análisis de Imagen (ImgAnalysisTab - Índice de Nitidez)
-        self.img_analysis_tab = ImgAnalysisTab(parent=self)
-        self.tabs.addTab(self.img_analysis_tab, "🔬 Img Analysis")
-        
-        # Exponer SmartFocusScorer para CameraViewWindow (usa el mismo que ImgAnalysisTab)
-        self.smart_focus_scorer = self.img_analysis_tab.scorer
 
         # Servicio de microscopia (orquesta trayectoria, captura y autofoco)
         self.microscopy_service = MicroscopyService(

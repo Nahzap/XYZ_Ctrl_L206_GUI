@@ -9,6 +9,11 @@ Orquesta la ejecución de trayectorias de microscopía con:
 - Progreso en tiempo real
 - Sistema de aprendizaje de ROIs (50 imágenes)
 
+REFACTORIZACIÓN 2025-12-29:
+- Usa MicroscopyStateManager para gestión de estado
+- Usa MicroscopyValidator para validaciones
+- Reducción de código duplicado
+
 Autor: Sistema de Control L206
 Fecha: 2025-12-13
 """
@@ -23,6 +28,9 @@ from datetime import datetime
 
 from typing import Callable, Optional, List, Tuple
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QCoreApplication
+
+from core.services.microscopy_state import MicroscopyStateManager, MicroscopyState
+from core.validators import MicroscopyValidator, MicroscopyConfig, ValidationResult
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -83,26 +91,21 @@ class MicroscopyService(QObject):
         self._controllers_ready_getter = controllers_ready_getter
         self._test_service = test_service
 
-        # Estado de microscopia
-        self._microscopy_active = False
+        # REFACTORIZACIÓN: Usar StateManager y Validator
+        self._state_manager = MicroscopyStateManager()
+        self._validator = MicroscopyValidator()
+        
+        # Configuración y parámetros
         self._microscopy_config: Optional[dict] = None
-        self._microscopy_trajectory: Optional[List] = None
-        self._current_point = 0
-        self._position_checks = 0
         self._delay_before_ms = 0
         self._delay_after_ms = 0
+        self._trajectory_tolerance = 25.0
+        self._trajectory_pause = 2.0
+        
         # Estado temporal para aprendizaje asistido
         self._pending_object = None
         self._pending_frame = None
-        
-        # MEJORA 2: Sistema de aprendizaje
-        self._learning_mode = False
-        self._learning_count = 0
-        self._learning_target = 50
         self._learning_dialog = None
-        
-        # MEJORA 4: Control de pausa
-        self._is_paused = False
 
     # ------------------------------------------------------------------
     # API pública
@@ -185,34 +188,25 @@ class MicroscopyService(QObject):
         else:
             logger.info("[MicroscopyService] ⚠️ No hay getter de controladores (opcional)")
 
-        # Guardar configuracion y estado
+        # Guardar configuración
         self._microscopy_config = config
-        self._microscopy_trajectory = list(trajectory)
-        self._microscopy_active = True
-        self._current_point = 0
-        self._position_checks = 0
-
+        
         # Delays
         self._delay_before_ms = int(config.get('delay_before', 2.0) * 1000)
         self._delay_after_ms = int(config.get('delay_after', 0.2) * 1000)
 
-        # Modo de aprendizaje (etiquetado asistido de los primeros N)
-        try:
-            # Por defecto ACTIVADO para las primeras 50 capturas
-            learning_mode_cfg = bool(config.get('learning_mode', True))
-            learning_target_cfg = int(config.get('learning_target', 50))
-            self._learning_mode = learning_mode_cfg
-            self._learning_target = learning_target_cfg
-            self._learning_count = 0
-            logger.info(
-                "[MicroscopyService] Aprendizaje asistido: %s (target=%d)",
-                "ON" if self._learning_mode else "OFF",
-                self._learning_target,
-            )
-        except Exception as e:
-            logger.warning("[MicroscopyService] No se pudo configurar aprendizaje: %s", e)
+        # Modo de aprendizaje
+        learning_mode = bool(config.get('learning_mode', True))
+        learning_target = int(config.get('learning_target', 50))
 
-        total = len(self._microscopy_trajectory)
+        # Iniciar estado usando StateManager
+        self._state_manager.start(
+            trajectory=list(trajectory),
+            learning_mode=learning_mode,
+            learning_target=learning_target
+        )
+
+        total = self._state_manager.total_points
         self.status_changed.emit(f"Iniciando microscopia: {total} puntos")
         self.status_changed.emit(
             f"Delay antes: {self._delay_before_ms}ms, Delay despues: {self._delay_after_ms}ms"
@@ -233,11 +227,11 @@ class MicroscopyService(QObject):
 
     def stop_microscopy(self) -> None:
         """Detiene la microscopia automatizada."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
 
         logger.info("[MicroscopyService] === DETENIENDO MICROSCOPIA ===")
-        self._microscopy_active = False
+        self._state_manager.stop()
 
         if self._is_dual_control_active and self._is_dual_control_active():
             self._stop_dual_control()
@@ -247,35 +241,35 @@ class MicroscopyService(QObject):
 
     def is_running(self) -> bool:
         """Indica si hay una secuencia de microscopía activa."""
-        return bool(self._microscopy_active)
+        return self._state_manager.is_active
 
     # ------------------------------------------------------------------
     # Flujo interno de microscopia
     # ------------------------------------------------------------------
     def _move_to_point(self) -> None:
         """PASO 1: Mueve al punto actual usando TestService (mismo algoritmo probado)."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
         
-        # MEJORA 4: Verificar pausa
-        if self._is_paused:
+        # Verificar pausa
+        if self._state_manager.is_paused:
             # Esperar 500ms y volver a verificar
             QTimer.singleShot(500, self._move_to_point)
             return
 
-        if self._microscopy_trajectory is None:
-            return
-
-        if self._current_point >= len(self._microscopy_trajectory):
+        if self._state_manager.current_point >= self._state_manager.total_points:
             self._finish_microscopy()
             return
 
-        point = self._microscopy_trajectory[self._current_point]
+        point = self._state_manager.get_current_target()
+        if point is None:
+            return
+            
         x_target = point[0]
         y_target = point[1]
 
-        n = self._current_point + 1
-        total = len(self._microscopy_trajectory)
+        n = self._state_manager.current_point + 1
+        total = self._state_manager.total_points
         self.status_changed.emit(
             f"[{n}/{total}] Moviendo a X={x_target:.1f}, Y={y_target:.1f} um"
         )
@@ -316,7 +310,7 @@ class MicroscopyService(QObject):
     
     def _on_test_point_reached(self, index: int, x: float, y: float, status: str):
         """Callback cuando TestService alcanza el punto."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
         
         logger.info(f"[MicroscopyService] Punto alcanzado por TestService: ({x:.1f}, {y:.1f}) {status}")
@@ -344,7 +338,7 @@ class MicroscopyService(QObject):
 
     def _capture(self) -> None:
         """PASO 3: Captura la imagen (con o sin autofoco)."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
 
         if not self._microscopy_config:
@@ -367,20 +361,20 @@ class MicroscopyService(QObject):
         self.status_changed.emit("  Capturando imagen (Sin Autofoco)...")
         success = False
         if self._capture_microscopy_image:
-            success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
+            success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
 
         if success:
             logger.info(
                 "[MicroscopyService] Imagen %d capturada",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
         else:
             self.status_changed.emit(
-                f"  ERROR: Fallo captura imagen {self._current_point + 1}"
+                f"  ERROR: Fallo captura imagen {self._state_manager.current_point + 1}"
             )
             logger.error(
                 "[MicroscopyService] Fallo captura imagen %d",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
 
         # Actualizar progreso y avanzar
@@ -388,7 +382,7 @@ class MicroscopyService(QObject):
 
     def _capture_with_autofocus(self) -> None:
         """Captura RÁPIDA con detección y enfoque simple (NO escaneo completo)."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
 
         if not (self._get_current_frame and self._smart_focus_scorer and self._autofocus_service):
@@ -425,7 +419,7 @@ class MicroscopyService(QObject):
         min_area, max_area = self._get_area_range() if self._get_area_range else (0, 1e9)
 
         # Durante aprendizaje, NO aplicar filtros morfológicos estrictos.
-        apply_morph_filters = not self._learning_mode
+        apply_morph_filters = not self._state_manager.learning_mode
 
         if apply_morph_filters:
             # Filtrar por área Y circularidad para rechazar manchas sin morfología
@@ -476,13 +470,13 @@ class MicroscopyService(QObject):
             )
             logger.info(
                 "[MicroscopyService] Punto %d: sin objetos en rango (detectados: %d)",
-                self._current_point,
+                self._state_manager.current_point,
                 len(all_objects),
             )
             # Continuar con el siguiente punto
-            self._current_point += 1
-            self._position_checks = 0
-            self.progress_changed.emit(self._current_point, len(self._microscopy_trajectory))
+            self._state_manager.advance_point()
+            self._state_manager.reset_position_checks()
+            self.progress_changed.emit(self._state_manager.current_point, self._state_manager.total_points)
             self._move_to_point()
             return
         
@@ -494,8 +488,8 @@ class MicroscopyService(QObject):
         
         # Sistema de aprendizaje con confirmación (Assisted Labeling)
         # Si estamos en modo aprendizaje y no hemos alcanzado el objetivo
-        if self._learning_mode and self._learning_count < self._learning_target:
-            self.status_changed.emit(f"❓ Confirmación requerida ({self._learning_count + 1}/{self._learning_target})")
+        if self._state_manager.learning_mode and not self._state_manager.learning_completed:
+            self.status_changed.emit(f"❓ Confirmación requerida ({self._state_manager.learning_count + 1}/{self._state_manager.learning_target})")
             
             # Guardar estado para reanudar
             self._pending_object = largest_object
@@ -508,8 +502,8 @@ class MicroscopyService(QObject):
                 largest_object,
                 self._microscopy_config.get('class_name', 'object'),
                 getattr(largest_object, 'confidence', 0.0),
-                self._learning_count + 1,
-                self._learning_target,
+                self._state_manager.learning_count + 1,
+                self._state_manager.learning_target,
             )
             # DETENER FLUJO AQUÍ - Se reanudará cuando el usuario responda vía confirm_learning_step
             return
@@ -525,7 +519,7 @@ class MicroscopyService(QObject):
         - bool: aceptar/rechazar el ROI detectado automáticamente
         - dict: {'accepted': bool, 'replace': bool, 'custom_rois': [(x,y,w,h), ...]}
         """
-        if not self._microscopy_active or self._pending_object is None:
+        if not self._state_manager.is_active or self._pending_object is None:
             return
 
         # Normalizar respuesta
@@ -548,8 +542,8 @@ class MicroscopyService(QObject):
             return
 
         # Aceptado
-        self._learning_count += 1
-        logger.info(f"[MicroscopyService] Aprendizaje: Usuario aceptó objeto {self._learning_count}/{self._learning_target}")
+        self._state_manager.increment_image_counter()
+        logger.info(f"[MicroscopyService] Aprendizaje: Usuario aceptó objeto {self._state_manager.learning_count}/{self._state_manager.learning_target}")
         if user_class:
             logger.info(f"[MicroscopyService] Clase confirmada: {user_class}")
 
@@ -641,7 +635,7 @@ class MicroscopyService(QObject):
                 sharp = 0.0
 
             record = {
-                'point_index': int(self._current_point),
+                'point_index': int(self._state_manager.current_point),
                 'bbox': [int(x), int(y), int(w), int(h)],
                 'area_px': float(area),
                 'circularity': float(circularity),
@@ -666,7 +660,7 @@ class MicroscopyService(QObject):
         )
         logger.info(
             "[MicroscopyService] Punto %d: objeto detectado (área=%.0f px) - captura rápida %d imgs",
-            self._current_point,
+            self._state_manager.current_point,
             largest_object.area,
             n_captures,
         )
@@ -784,7 +778,7 @@ class MicroscopyService(QObject):
                 logger.info(f"[MicroscopyService] Captura {i+1}/3 ({label}): Z={z_pos:.2f}µm, S={score:.1f}")
         
         # PASO 3: Guardar las 3 imágenes
-        success = self._save_3images(frames, z_positions, scores, best_z, self._current_point)
+        success = self._save_3images(frames, z_positions, scores, best_z, self._state_manager.current_point)
         
         # PASO 4: SIEMPRE volver a Z medio (centro calibrado)
         logger.info(f"[MicroscopyService] Volviendo a Z medio: {z_center_hw:.2f}µm")
@@ -864,20 +858,20 @@ class MicroscopyService(QObject):
         """Captura sencilla usada como fallback cuando no hay autofoco disponible."""
         success = False
         if self._capture_microscopy_image and self._microscopy_config:
-            success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
+            success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
 
         if success:
             logger.info(
                 "[MicroscopyService] Imagen %d capturada (fallback)",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
         else:
             self.status_changed.emit(
-                f"  ERROR: Fallo captura imagen {self._current_point + 1} (fallback)"
+                f"  ERROR: Fallo captura imagen {self._state_manager.current_point + 1} (fallback)"
             )
             logger.error(
                 "[MicroscopyService] Fallo captura imagen %d (fallback)",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
 
         self._advance_point()
@@ -890,7 +884,7 @@ class MicroscopyService(QObject):
         Args:
             results: Lista de FocusResult con frames ya capturados en BPoF
         """
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
 
         self.status_changed.emit("📸 Guardando imagen con BPoF...")
@@ -902,31 +896,31 @@ class MicroscopyService(QObject):
             
             # Guardar todas las capturas multi-focales si existen
             if result.frames and len(result.frames) > 0:
-                success = self._save_multifocal_frames(result, self._current_point)
+                success = self._save_multifocal_frames(result, self._state_manager.current_point)
             # Fallback: guardar solo BPoF si no hay capturas multi-focales
             elif result.frame is not None:
-                success = self._save_autofocus_frame(result, self._current_point)
+                success = self._save_autofocus_frame(result, self._state_manager.current_point)
                 # También guardar frame alternativo si existe (legacy)
                 if result.frame_alt is not None:
-                    self._save_autofocus_frame_alt(result, self._current_point)
+                    self._save_autofocus_frame_alt(result, self._state_manager.current_point)
         else:
             # Fallback: capturar frame actual (puede estar desenfocado)
             logger.warning("[MicroscopyService] No hay frame en resultado de autofoco, usando frame actual")
             if self._capture_microscopy_image and self._microscopy_config:
-                success = self._capture_microscopy_image(self._microscopy_config, self._current_point)
+                success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
 
         if success:
             logger.info(
                 "[MicroscopyService] Imagen %d guardada con autofoco (BPoF)",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
         else:
             self.status_changed.emit(
-                f"  ERROR: Fallo guardar imagen {self._current_point + 1} tras autofoco"
+                f"  ERROR: Fallo guardar imagen {self._state_manager.current_point + 1} tras autofoco"
             )
             logger.error(
                 "[MicroscopyService] Fallo guardar imagen %d tras autofoco",
-                self._current_point + 1,
+                self._state_manager.current_point + 1,
             )
 
         self._advance_point()
@@ -1063,56 +1057,40 @@ class MicroscopyService(QObject):
 
     def _advance_point(self) -> None:
         """Avanza al siguiente punto de microscopía."""
-        if not self._microscopy_active or self._microscopy_trajectory is None:
+        if not self._state_manager.is_active:
             return
 
-        total = len(self._microscopy_trajectory)
-        self.progress_changed.emit(self._current_point + 1, total)
+        self.progress_changed.emit(self._state_manager.current_point + 1, self._state_manager.total_points)
 
-        self._current_point += 1
-        if self._current_point < total:
+        self._state_manager.advance_point()
+        if self._state_manager.current_point < self._state_manager.total_points:
             QTimer.singleShot(self._delay_after_ms, self._move_to_point)
         else:
             self._finish_microscopy()
-
-    def stop_microscopy(self) -> None:
-        """Detiene la microscopía en curso."""
-        if not self._microscopy_active:
-            return
-
-        self._microscopy_active = False
-        self._is_paused = False
-        self.status_changed.emit("Microscopía detenida")
-        logger.info("[MicroscopyService] Microscopía detenida por usuario")
     
     def enable_learning_mode(self, enabled: bool = True, target_count: int = 50):
         """Activa/desactiva el modo de aprendizaje."""
-        self._learning_mode = enabled
-        self._learning_target = target_count
-        self._learning_count = 0
-        
-        if enabled:
-            logger.info(f"[MicroscopyService] Modo aprendizaje activado: objetivo {target_count} imágenes")
-        else:
-            logger.info("[MicroscopyService] Modo aprendizaje desactivado")
+        # Este método ya no es necesario - el learning mode se configura en start()
+        # Mantenido por compatibilidad pero no hace nada
+        logger.warning("[MicroscopyService] enable_learning_mode() está obsoleto - usar start_microscopy() con config")
     
     def set_paused(self, paused: bool):
         """Pausa/reanuda la microscopía."""
-        self._is_paused = paused
         if paused:
-            logger.info(f"[MicroscopyService] Microscopía pausada en punto {self._current_point + 1}")
+            self._state_manager.pause()
+            logger.info(f"[MicroscopyService] Microscopía pausada en punto {self._state_manager.current_point + 1}")
         else:
+            self._state_manager.resume()
             logger.info("[MicroscopyService] Microscopía reanudada")
     
     def skip_current_point(self):
         """Salta el punto actual sin capturar."""
-        logger.info(f"[MicroscopyService] Usuario solicitó saltar punto {self._current_point}")
-        self.status_changed.emit(f"⏭️ Punto {self._current_point} saltado por usuario")
+        logger.info(f"[MicroscopyService] Usuario solicitó saltar punto {self._state_manager.current_point}")
+        self.status_changed.emit(f"⏭️ Punto {self._state_manager.current_point} saltado por usuario")
         # Limpiar máscaras antes de avanzar
-        self._clear_autofocus_masks()
-        # Avanzar al siguiente punto
-        self._current_point += 1
-        self._position_checks = 0
+        self.clear_masks.emit()
+        # Usar StateManager para saltar
+        self._state_manager.skip_current_point()
         self._move_to_point()
     
     def _show_autofocus_masks(self, objects):
@@ -1218,20 +1196,20 @@ class MicroscopyService(QObject):
 
     def _finish_microscopy(self) -> None:
         """Finaliza la microscopia automatizada."""
-        if not self._microscopy_active:
+        if not self._state_manager.is_active:
             return
 
-        self._microscopy_active = False
+        self._state_manager.complete()
 
         if self._is_dual_control_active and self._is_dual_control_active():
             self._stop_dual_control()
 
-        total = len(self._microscopy_trajectory) if self._microscopy_trajectory else 0
+        total_images = self._state_manager.image_counter
         self.status_changed.emit(
-            f"MICROSCOPIA COMPLETADA: {total} imagenes capturadas"
+            f"MICROSCOPIA COMPLETADA: {total_images} imagenes capturadas"
         )
         logger.info(
             "[MicroscopyService] MICROSCOPIA COMPLETADA: %d imagenes",
-            total,
+            total_images,
         )
-        self.finished.emit(total)
+        self.finished.emit(total_images)
