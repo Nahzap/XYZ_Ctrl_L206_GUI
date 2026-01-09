@@ -12,10 +12,60 @@ en un diccionario 'widgets' que se pasa como parámetro.
 import logging
 from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QLabel, QLineEdit, QPushButton, QTextEdit,
-                             QCheckBox, QRadioButton, QFrame, QButtonGroup)
+                             QCheckBox, QRadioButton, QFrame, QButtonGroup, QWidget)
 from PyQt5.QtCore import Qt
 
 logger = logging.getLogger('MotorControl_L206')
+
+
+def create_calibration_analysis_section(widgets: dict, show_analysis_callback) -> QWidget:
+    """
+    Crea sección de análisis de calibración (botón superior).
+    
+    Args:
+        widgets: Dict donde almacenar referencias a widgets
+        show_analysis_callback: Función a llamar cuando se presiona el botón
+        
+    Returns:
+        QWidget configurado
+    """
+    widget = QWidget()
+    layout = QHBoxLayout()
+    layout.setContentsMargins(0, 0, 0, 10)
+    
+    # Botón de análisis de calibración
+    widgets['calibration_analysis_btn'] = QPushButton("📊 Desplegar Gráficos de Calibración")
+    widgets['calibration_analysis_btn'].setStyleSheet("""
+        QPushButton {
+            background-color: #3498DB;
+            color: white;
+            font-weight: bold;
+            font-size: 13px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        QPushButton:hover {
+            background-color: #2980B9;
+        }
+        QPushButton:pressed {
+            background-color: #21618C;
+        }
+    """)
+    widgets['calibration_analysis_btn'].clicked.connect(show_analysis_callback)
+    widgets['calibration_analysis_btn'].setToolTip(
+        "Muestra gráficos de análisis completo de calibración:\n"
+        "• Sensor ADC vs Tiempo\n"
+        "• Posición con homogeneidad y barras de error\n"
+        "• PWM vs Tiempo\n"
+        "• Respuesta al escalón: Predicción vs Real\n\n"
+        "Verifica que el controlador H∞ está correctamente\n"
+        "linealizado por la función de transferencia."
+    )
+    
+    layout.addWidget(widgets['calibration_analysis_btn'])
+    
+    widget.setLayout(layout)
+    return widget
 
 
 def create_controllers_section(widgets: dict, clear_callback) -> QGroupBox:
@@ -173,39 +223,6 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     return group
 
 
-def create_calibration_section(widgets: dict, reload_callback) -> QGroupBox:
-    """
-    Crea sección de calibración.
-    
-    Args:
-        widgets: Dict donde almacenar referencias a widgets
-        reload_callback: Función a llamar cuando se presiona recargar
-        
-    Returns:
-        QGroupBox configurado
-    """
-    group = QGroupBox("📐 Calibración del Sistema")
-    layout = QVBoxLayout()
-    
-    # Status
-    widgets['calibration_status'] = QLabel("⚪ Cargando calibración...")
-    widgets['calibration_status'].setStyleSheet("font-size: 14px; font-weight: bold; color: #95A5A6;")
-    layout.addWidget(widgets['calibration_status'])
-    
-    # Detalles
-    widgets['calibration_details'] = QTextEdit()
-    widgets['calibration_details'].setReadOnly(True)
-    widgets['calibration_details'].setMaximumHeight(80)
-    widgets['calibration_details'].setStyleSheet("font-family: monospace; font-size: 11px; background: white; color: black;")
-    layout.addWidget(widgets['calibration_details'])
-    
-    # Botón recargar
-    reload_btn = QPushButton("🔄 Recargar Calibración")
-    reload_btn.clicked.connect(reload_callback)
-    layout.addWidget(reload_btn)
-    
-    group.setLayout(layout)
-    return group
 
 
 def create_position_control_section(widgets: dict, start_callback, stop_callback) -> QGroupBox:

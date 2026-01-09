@@ -584,6 +584,69 @@ class CameraViewWindow(QWidget):
         self.detection_result = None
         self.status_label.setText("Limpiado")
     
+    def update_detection_from_service(self, saliency_map: np.ndarray, objects: list):
+        """
+        Actualiza la lista de objetos desde detecciones externas (DetectionService/SAM).
+        
+        IMPORTANTE: Limpia detecciones previas antes de mostrar nuevas para evitar
+        acumulación en memoria.
+        
+        Args:
+            saliency_map: Mapa de saliencia de U2-Net
+            objects: Lista de DetectedObject desde SAM/U2-Net
+        """
+        logger.info(f"[CameraWindow] ✅ update_detection_from_service LLAMADO con {len(objects)} objetos")
+        print(f"[CameraWindow] ✅ update_detection_from_service LLAMADO con {len(objects)} objetos")
+        
+        # CRÍTICO: Limpiar detección previa para no acumular en memoria
+        self.detection_result = None
+        self.selected_object_index = None
+        logger.info(f"[CameraWindow] Detección previa limpiada")
+        
+        if not objects:
+            logger.warning(f"[CameraWindow] ⚠️ Lista de objetos VACÍA")
+            self.objects_table.setRowCount(0)
+            self.status_label.setText("Sin objetos detectados")
+            return
+        
+        # Convertir objetos a formato de boxes para la tabla
+        boxes = []
+        contours = []
+        
+        for obj in objects:
+            boxes.append({
+                'bbox': obj.bounding_box if hasattr(obj, 'bounding_box') else obj.bbox,
+                'area': obj.area,
+                'score': getattr(obj, 'focus_score', 0),
+                'is_focused': getattr(obj, 'is_focused', False),
+                'in_filter_range': True  # SAM detecta todo, sin filtro
+            })
+            
+            # Extraer contorno si está disponible
+            if hasattr(obj, 'contour') and obj.contour is not None:
+                contours.append(obj.contour)
+        
+        # Actualizar detection_result para overlay (REEMPLAZA el anterior)
+        self.detection_result = {
+            'contours': contours,
+            'boxes': boxes,
+            'frame_size': (1920, 1200),  # Placeholder, se ajusta en overlay
+            'n_objects': len(objects),
+            'n_in_range': len(objects),
+            'filter_range': (0, 999999)
+        }
+        
+        # Actualizar tabla de objetos (REEMPLAZA la anterior)
+        logger.info(f"[CameraWindow] Llamando a _update_objects_list con {len(boxes)} boxes")
+        print(f"[CameraWindow] Llamando a _update_objects_list con {len(boxes)} boxes")
+        self._update_objects_list(boxes, min_area=0, max_area=999999)
+        logger.info(f"[CameraWindow] _update_objects_list completado")
+        
+        # Actualizar status
+        self.status_label.setText(f"✅ {len(objects)} objetos detectados (SAM)")
+        logger.info(f"[CameraWindow] ✅ DETECCIÓN REFRESCADA: {len(objects)} objetos mostrados en tabla")
+        print(f"[CameraWindow] ✅ DETECCIÓN REFRESCADA: {len(objects)} objetos mostrados en tabla")
+    
     def _on_skip_roi(self):
         """Handler para botón 'No registrar ROI'."""
         logger.info("[CameraWindow] Usuario solicitó saltar ROI actual")

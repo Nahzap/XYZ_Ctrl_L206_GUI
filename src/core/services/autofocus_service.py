@@ -67,6 +67,7 @@ class AutofocusService(QThread):
         # Parámetros de búsqueda (configurables desde UI)
         # NOTA: Estos parámetros son para BÚSQUEDA de BPoF, NO para captura de volumen
         self.z_scan_range = 20.0  # µm - distancia máxima de búsqueda desde posición actual (±20µm)
+        self.use_full_range = True  # Si True, ignora z_scan_range y escanea TODO el rango calibrado (0-80µm)
         self.z_step_coarse = 0.5  # µm - paso grueso para fase de búsqueda inicial (hill climbing)
         self.z_step_fine = 0.1    # µm - paso fino para refinamiento alrededor del pico
         self.settle_time = 0.10   # segundos - tiempo de estabilización
@@ -243,7 +244,7 @@ class AutofocusService(QThread):
         z_range = z_max - z_min
         n_steps = int(z_range / self.z_step_coarse) + 1
         
-        msg = f"[Autofocus] Escaneando {n_steps} posiciones en rango completo..."
+        msg = f"[Autofocus] Escaneando {n_steps} posiciones en rango completo ({z_range:.2f}µm)..."
         logger.info(msg)
         print(msg)
         
@@ -274,16 +275,17 @@ class AutofocusService(QThread):
             if score > best_score:
                 best_z = z_current
                 best_score = score
-                msg = f"[Autofocus] [{i+1}/{n_steps}] Z={z_current:.2f}µm, S={score:.1f} ★ MEJOR"
-                logger.info(msg)
-                print(msg)
-            else:
-                msg = f"[Autofocus] [{i+1}/{n_steps}] Z={z_current:.2f}µm, S={score:.1f}"
-                logger.debug(msg)
-                if i % 10 == 0:  # Mostrar cada 10 pasos
-                    print(msg)
+            
+            # MENSAJE DE PROGRESO EN LÍNEA ÚNICA (se actualiza, no acumula)
+            progress_pct = ((i + 1) / n_steps) * 100
+            distance_traveled = z_current - z_min
+            msg = f"[Autofocus] COARSE: {distance_traveled:.2f}/{z_range:.2f}µm ({progress_pct:.1f}%) | Z={z_current:.2f}µm | Score={score:.1f} | Best={best_score:.1f}@{best_z:.2f}µm"
+            print(msg, end='\r', flush=True)
+            logger.debug(msg)
         
-        msg = f"[Autofocus] Escaneo completo finalizado: mejor Z={best_z:.2f}µm, S={best_score:.1f}"
+        # Línea final del escaneo coarse (nueva línea)
+        print()  # Nueva línea después del progreso
+        msg = f"[Autofocus] COARSE COMPLETO: Mejor Z={best_z:.2f}µm, Score={best_score:.1f} (recorrido: {z_range:.2f}µm)"
         logger.info(msg)
         print(msg)
         
@@ -309,6 +311,8 @@ class AutofocusService(QThread):
         best_z_coarse = best_z
         best_score_coarse = best_score
         
+        refine_range = z_refine_max - z_refine_min
+        
         while z_refine <= z_refine_max and refine_iteration < self.max_fine_iterations:
             if self.cancel_requested:
                 break
@@ -328,16 +332,20 @@ class AutofocusService(QThread):
             if score > best_score:
                 best_z = z_refine
                 best_score = score
-                msg = f"[Autofocus] Refinamiento [{refine_iteration}/{total_refine_steps}]: Z={z_refine:.2f}µm, S={score:.1f} ★ MEJOR"
-                logger.info(msg)
-                print(msg)
-            else:
-                msg = f"[Autofocus] Refinamiento [{refine_iteration}/{total_refine_steps}]: Z={z_refine:.2f}µm, S={score:.1f}"
-                logger.debug(msg)
+            
+            # MENSAJE DE PROGRESO EN LÍNEA ÚNICA (se actualiza, no acumula)
+            progress_pct = (refine_iteration / total_refine_steps) * 100
+            distance_traveled = z_refine - z_refine_min
+            msg = f"[Autofocus] FINE: {distance_traveled:.2f}/{refine_range:.2f}µm ({progress_pct:.1f}%) | Z={z_refine:.2f}µm | Score={score:.1f} | Best={best_score:.1f}@{best_z:.2f}µm"
+            print(msg, end='\r', flush=True)
+            logger.debug(msg)
             
             z_refine += step
         
-        msg = f"[Autofocus] ✓ ÓPTIMO FINAL: Z={best_z:.2f}µm, S={best_score:.1f}"
+        # Línea final del refinamiento (nueva línea)
+        print()  # Nueva línea después del progreso
+        improvement = best_score - best_score_coarse
+        msg = f"[Autofocus] ✓ ÓPTIMO FINAL: Z={best_z:.2f}µm, Score={best_score:.1f} (mejora: +{improvement:.1f})"
         logger.info(msg)
         print(msg)
         
@@ -374,33 +382,43 @@ class AutofocusService(QThread):
             z_min_hw = calib_info['z_min']
             z_max_hw = calib_info['z_max']
             z_center_hw = calib_info['z_center']
+            z_range_hw = z_max_hw - z_min_hw
             
-            # ESCANEO COMPLETO: usar TODO el rango calibrado
-            # Si z_scan_range es el rango total, escanear desde límites calibrados
-            z_min = z_min_hw
-            z_max = z_max_hw
-            
-            msg = f"[Autofocus] Rango de escaneo COMPLETO: {z_min:.2f}-{z_max:.2f}µm (rango total calibrado)"
-            logger.info(msg)
-            print(msg)
-            
-            # Usar posición actual como punto de inicio
-            z_center = z_current
-            msg = f"[Autofocus] Inicio desde posición actual: Z={z_current:.2f}µm"
-            logger.info(msg)
-            print(msg)
+            # Determinar rango de escaneo según configuración
+            if self.use_full_range:
+                # ESCANEO COMPLETO: usar TODO el rango calibrado (0 → 80µm)
+                z_min = z_min_hw
+                z_max = z_max_hw
+                z_center = z_current
+                
+                msg = f"[Autofocus] ESCANEO COMPLETO: {z_min:.2f} → {z_max:.2f}µm (rango total: {z_range_hw:.2f}µm)"
+                logger.info(msg)
+                print(msg)
+            else:
+                # ESCANEO LOCAL: usar z_scan_range (±µm desde posición actual)
+                z_min_requested = z_current - self.z_scan_range
+                z_max_requested = z_current + self.z_scan_range
+                
+                # Limitar al rango calibrado del hardware
+                z_min = max(z_min_hw, z_min_requested)
+                z_max = min(z_max_hw, z_max_requested)
+                z_center = z_current
+                
+                z_range_effective = z_max - z_min
+                msg = f"[Autofocus] Escaneo local: {z_min:.2f}-{z_max:.2f}µm ({z_range_effective:.2f}µm desde Z={z_current:.2f}µm)"
+                logger.info(msg)
+                print(msg)
+                
+                # Advertir si el rango fue limitado
+                if z_min_requested < z_min_hw or z_max_requested > z_max_hw:
+                    msg = f"[Autofocus] ⚠️ Rango limitado por calibración (hw: {z_min_hw:.2f}-{z_max_hw:.2f}µm)"
+                    logger.warning(msg)
+                    print(msg)
         else:
-            # Fallback: usar rango de hardware
-            z_range_hw = self.cfocus_controller.get_z_range()
-            if z_range_hw is None or z_range_hw <= 0:
-                z_range_hw = 80.0
-            
-            z_min = 0.0
-            z_max = z_range_hw
-            z_center = z_current
-            msg = f"[Autofocus] ⚠️ Sin calibración, rango completo: {z_min:.2f}-{z_max:.2f}µm"
-            logger.warning(msg)
-            print(msg)
+            # C-Focus NO calibrado - ERROR
+            error_msg = "C-Focus no calibrado. Ejecutar calibración antes de usar autofoco."
+            logger.error(f"[Autofocus] {error_msg}")
+            raise ValueError(error_msg)
         
         # Validar que el rango solicitado es válido
         is_valid, validation_msg = self.validate_scan_range()

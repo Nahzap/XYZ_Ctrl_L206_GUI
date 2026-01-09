@@ -141,7 +141,10 @@ class DetectionService(QThread):
                 self.frames_processed += 1
                 
                 # Emitir resultados
+                logger.info(f"[DetectionService] ✅ EMITIENDO detection_ready: {len(objects)} objetos detectados")
+                print(f"[DetectionService] ✅ EMITIENDO detection_ready: {len(objects)} objetos")
                 self.detection_ready.emit(saliency_map, objects)
+                logger.info(f"[DetectionService] Señal detection_ready emitida correctamente")
                 
             except Empty:
                 continue

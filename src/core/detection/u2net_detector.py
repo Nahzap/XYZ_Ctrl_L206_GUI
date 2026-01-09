@@ -242,17 +242,29 @@ class U2NetDetector:
     
     def _preprocess_gpu(self, image: np.ndarray) -> 'torch.Tensor':
         """Preprocesa imagen usando GPU para operaciones pesadas."""
-        # Convertir uint16 a uint8 si es necesario
+        # R3: MEJORA DE CONTRASTE OPTIMIZADA (GPU)
+        # Normalizar uint16 preservando rango dinámico
         if image.dtype == np.uint16:
-            image = (image / 256).astype(np.uint8)
+            # Normalización min-max para preservar detalles
+            image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         
-        # Convertir a RGB
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
-        elif image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Convertir a grayscale para CLAHE
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        # CLAHE para mejorar contraste local (optimizado: clipLimit bajo para velocidad)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # Sharpening suave para objetos borrosos (kernel optimizado)
+        # Usar unsharp masking en lugar de kernel directo (más suave)
+        blurred = cv2.GaussianBlur(enhanced, (3, 3), 1.0)
+        sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+        
+        # Convertir a RGB para U2-Net
+        image = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
         
         # Convertir a tensor y mover a GPU ANTES de resize
         tensor = torch.from_numpy(image).float().to(self.device)
@@ -299,12 +311,31 @@ class U2NetDetector:
     
     def _extract_objects(self, saliency: np.ndarray, original_image: np.ndarray) -> List[DetectedObject]:
         """Extrae objetos del mapa de saliencia."""
-        # DEBUG: Estadísticas del mapa de saliencia
-        sal_min, sal_max, sal_mean = float(saliency.min()), float(saliency.max()), float(saliency.mean())
-        logger.debug(f"[Extract] Saliency stats: min={sal_min:.3f}, max={sal_max:.3f}, mean={sal_mean:.3f}, threshold={self.saliency_threshold}")
+        # R2: UMBRAL ADAPTATIVO BASADO EN ESTADÍSTICAS
+        sal_min = float(np.min(saliency))
+        sal_max = float(np.max(saliency))
+        sal_mean = float(np.mean(saliency))
+        sal_std = float(np.std(saliency))
         
-        # Binarizar
-        binary = (saliency > self.saliency_threshold).astype(np.uint8) * 255
+        # Calcular umbral adaptativo: media + k*std, con límites
+        # k=0.5 para sensibilidad media (ajustable)
+        adaptive_threshold = sal_mean + 0.5 * sal_std
+        
+        # Límites: mínimo 0.15 (muy sensible), máximo 0.5 (conservador)
+        adaptive_threshold = max(0.15, min(0.5, adaptive_threshold))
+        
+        # Si la saliencia máxima es muy baja, usar umbral más bajo
+        if sal_max < 0.3:
+            adaptive_threshold = min(adaptive_threshold, sal_max * 0.7)
+        
+        logger.debug(
+            f"[Extract] Saliency: min={sal_min:.3f}, max={sal_max:.3f}, "
+            f"mean={sal_mean:.3f}, std={sal_std:.3f} → threshold={adaptive_threshold:.3f} "
+            f"(fixed={self.saliency_threshold:.3f})"
+        )
+        
+        # Binarizar con umbral adaptativo
+        binary = (saliency > adaptive_threshold).astype(np.uint8) * 255
         pixels_above = np.sum(binary > 0)
         logger.debug(f"[Extract] Pixels above threshold: {pixels_above} ({100*pixels_above/binary.size:.1f}%)")
         

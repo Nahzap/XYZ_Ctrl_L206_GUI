@@ -296,8 +296,33 @@ class CameraTab(QWidget):
     
     def _on_orchestrator_detection_complete(self, objects):
         """Handler cuando el orchestrator completa detección."""
-        # Actualizar UI si es necesario
-        pass
+        logger.info(f"[CameraTab] ✅ RECIBIDO orchestrator detection_complete: {len(objects)} objetos")
+        print(f"[CameraTab] ✅ RECIBIDO orchestrator detection_complete: {len(objects)} objetos")
+        
+        # Actualizar lista de objetos en ventana de cámara
+        if self.camera_view_window and self.camera_view_window.isVisible():
+            # Crear mapa de saliencia dummy (orchestrator usa SmartFocusScorer, no U2-Net directamente)
+            dummy_saliency = np.zeros((100, 100), dtype=np.float32)
+            logger.info(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service (orchestrator)")
+            self.camera_view_window.update_detection_from_service(dummy_saliency, objects)
+            self.log_message(f"✅ {len(objects)} objetos detectados")
+        else:
+            logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible (orchestrator)")
+    
+    def _on_microscopy_detection_complete(self, objects):
+        """Handler cuando MicroscopyService completa detección durante microscopía."""
+        logger.info(f"[CameraTab] ✅ RECIBIDO microscopy detection_complete: {len(objects)} objetos")
+        print(f"[CameraTab] ✅ RECIBIDO microscopy detection_complete: {len(objects)} objetos")
+        
+        # Actualizar lista de objetos en ventana de cámara
+        if self.camera_view_window and self.camera_view_window.isVisible():
+            # Crear mapa de saliencia dummy (microscopy usa SmartFocusScorer)
+            dummy_saliency = np.zeros((100, 100), dtype=np.float32)
+            logger.info(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service (microscopy)")
+            self.camera_view_window.update_detection_from_service(dummy_saliency, objects)
+            self.log_message(f"✅ {len(objects)} objetos detectados (Microscopía)")
+        else:
+            logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible (microscopy)")
     
     # ==================================================================
     # HANDLERS DE BOTONES (delegan a CameraService)
@@ -1135,8 +1160,23 @@ class CameraTab(QWidget):
     
     def on_detection_ready(self, saliency_map, objects):
         """Callback cuando hay nuevos resultados de detección."""
+        logger.info(f"[CameraTab] ✅ RECIBIDO detection_ready: {len(objects)} objetos")
+        print(f"[CameraTab] ✅ RECIBIDO detection_ready: {len(objects)} objetos")
+        
         if hasattr(self, 'saliency_widget') and self.saliency_widget:
             self.saliency_widget.update_detection(saliency_map, objects)
+            logger.info(f"[CameraTab] Saliency widget actualizado")
+        
+        # CRÍTICO: Actualizar lista de objetos en ventana de cámara
+        if self.camera_view_window and self.camera_view_window.isVisible():
+            logger.info(f"[CameraTab] Ventana de cámara visible, actualizando lista de objetos...")
+            print(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service con {len(objects)} objetos")
+            self.camera_view_window.update_detection_from_service(saliency_map, objects)
+            self.log_message(f"✅ {len(objects)} objetos detectados por SAM")
+            logger.info(f"[CameraTab] Lista de objetos actualizada en ventana de cámara")
+        else:
+            logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible: window={self.camera_view_window}, visible={self.camera_view_window.isVisible() if self.camera_view_window else 'N/A'}")
+            print(f"[CameraTab] ⚠️ VENTANA DE CÁMARA NO VISIBLE - objetos NO se mostrarán")
     
     def on_detection_status(self, status: str):
         """Callback cuando cambia el estado del servicio de detección."""

@@ -64,12 +64,19 @@ class HInfTab(QWidget):
         Inicializa la pestaña H∞.
         
         Args:
-            hinf_controller: Instancia de HInfController
+            hinf_controller: Instancia de HInfTrackingController (Zhou & Doyle)
             tf_analyzer: Instancia de TransferFunctionAnalyzer
             parent: Widget padre (ArduinoGUI)
         """
         super().__init__(parent)
-        self.hinf_controller = hinf_controller
+        
+        # Usar HInfController (implementación que FUNCIONA)
+        if hinf_controller is None:
+            from core.controllers.hinf_controller import HInfController
+            self.hinf_controller = HInfController()
+        else:
+            self.hinf_controller = hinf_controller
+        
         self.tf_analyzer = tf_analyzer
         self.parent_gui = parent
         

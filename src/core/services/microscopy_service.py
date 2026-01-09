@@ -50,6 +50,7 @@ class MicroscopyService(QObject):
     stopped = pyqtSignal()                        # detenido por usuario
     show_masks = pyqtSignal(list)                 # Mostrar máscaras durante autofoco
     clear_masks = pyqtSignal()                    # Limpiar máscaras después de capturar
+    detection_complete = pyqtSignal(list)         # Lista de objetos detectados (ObjectInfo)
     # Solicitud de confirmación de aprendizaje (frame, objeto, clase sugerida, confianza, count, target)
     learning_confirmation_requested = pyqtSignal(object, object, str, float, int, int)
 
@@ -482,6 +483,12 @@ class MicroscopyService(QObject):
         
         # Mostrar máscaras en ventana de cámara
         self._show_autofocus_masks(objects)
+        
+        # CRÍTICO: Emitir señal con objetos detectados para actualizar lista en ventana de cámara
+        logger.info(f"[MicroscopyService] ✅ EMITIENDO detection_complete: {len(objects)} objetos")
+        print(f"[MicroscopyService] ✅ EMITIENDO detection_complete: {len(objects)} objetos")
+        self.detection_complete.emit(objects)
+        logger.info(f"[MicroscopyService] Señal detection_complete emitida correctamente")
 
         # Enfocar solo en el objeto MÁS GRANDE
         largest_object = max(objects, key=lambda obj: obj.area)
@@ -715,23 +722,41 @@ class MicroscopyService(QObject):
         
         logger.info(f"[MicroscopyService] Captura rápida: Z actual={z_current:.2f}µm, Z centro={z_center_hw:.2f}µm")
         
-        # PASO 1: Búsqueda rápida de BPoF (±5µm desde posición actual con paso 0.5µm)
-        search_range = 5.0  # µm
-        search_step = 0.5   # µm
+        # PASO 1: Búsqueda de BPoF usando configuración de autofoco
+        # Si use_full_range=True, escanea TODO el rango calibrado (0-80µm)
+        # Si use_full_range=False, escanea ±z_scan_range desde posición actual
         
-        z_search_min = max(z_min_hw, z_current - search_range)
-        z_search_max = min(z_max_hw, z_current + search_range)
+        use_full_range = self._autofocus_service.use_full_range if self._autofocus_service else False
         
-        logger.info(f"[MicroscopyService] Búsqueda rápida BPoF: {z_search_min:.2f} - {z_search_max:.2f}µm")
+        if use_full_range:
+            # ESCANEO COMPLETO: usar TODO el rango calibrado
+            z_search_min = z_min_hw
+            z_search_max = z_max_hw
+            search_range_total = z_max_hw - z_min_hw
+            logger.info(f"[MicroscopyService] ESCANEO COMPLETO: {z_search_min:.2f} → {z_search_max:.2f}µm (rango: {search_range_total:.2f}µm)")
+        else:
+            # ESCANEO LOCAL: ±z_scan_range desde posición actual
+            search_range = self._autofocus_service.z_scan_range if self._autofocus_service else 5.0
+            z_search_min = max(z_min_hw, z_current - search_range)
+            z_search_max = min(z_max_hw, z_current + search_range)
+            search_range_total = z_search_max - z_search_min
+            logger.info(f"[MicroscopyService] Escaneo local: {z_search_min:.2f} - {z_search_max:.2f}µm (±{search_range:.2f}µm desde Z={z_current:.2f}µm)")
+        
+        search_step = self._autofocus_service.z_step_coarse if self._autofocus_service else 0.5
         
         best_z = z_current
         best_score = 0.0
         
         z = z_search_min
+        n_steps = int((z_search_max - z_search_min) / search_step) + 1
+        step_count = 0
+        
         while z <= z_search_max:
+            step_count += 1
             cfocus.move_z(z)
             time.sleep(0.05)  # 50ms estabilización
-            # Mantener la UI receptiva durante el escaneo rápido
+            
+            # Mantener la UI receptiva durante el escaneo
             try:
                 QCoreApplication.processEvents()
             except Exception:
@@ -743,10 +768,19 @@ class MicroscopyService(QObject):
                 if score > best_score:
                     best_z = z
                     best_score = score
+                
+                # Mensaje de progreso en línea única
+                progress_pct = (step_count / n_steps) * 100
+                distance_traveled = z - z_search_min
+                msg = f"[MicroscopyService] SCAN: {distance_traveled:.2f}/{search_range_total:.2f}µm ({progress_pct:.1f}%) | Z={z:.2f}µm | Score={score:.1f} | Best={best_score:.1f}@{best_z:.2f}µm"
+                print(msg, end='\r', flush=True)
+                logger.debug(msg)
             
             z += search_step
         
-        logger.info(f"[MicroscopyService] BPoF encontrado: Z={best_z:.2f}µm, S={best_score:.1f}")
+        # Nueva línea después del progreso
+        print()
+        logger.info(f"[MicroscopyService] BPoF encontrado: Z={best_z:.2f}µm, Score={best_score:.1f} (recorrido: {search_range_total:.2f}µm)")
         
         # PASO 2: Capturar 3 imágenes (BPoF, +offset, -offset)
         offset_z = self._autofocus_service.z_step_coarse  # Usar paso coarse como offset (ej: 0.5µm)

@@ -1,9 +1,19 @@
 """
-Módulo de controladores para el sistema.
+Módulo de controladores del sistema.
 
-Contiene implementaciones de controladores H∞ y otros algoritmos de control.
+Contiene el controlador H∞ para control de motores.
 """
 
-from .hinf_controller import HInfController, SynthesisConfig, SynthesisResult
+from .hinf_controller import (
+    HInfController,
+    SynthesisConfig,
+    SynthesisResult,
+    ValidationResult
+)
 
-__all__ = ['HInfController', 'SynthesisConfig', 'SynthesisResult']
+__all__ = [
+    'HInfController',
+    'SynthesisConfig',
+    'SynthesisResult',
+    'ValidationResult'
+]

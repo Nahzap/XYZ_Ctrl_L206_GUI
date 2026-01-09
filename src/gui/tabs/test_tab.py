@@ -25,20 +25,21 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTextEdit, QScrollArea,
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from config.constants import (
-    POSITION_TOLERANCE_UM, SETTLING_CYCLES,
-    reload_calibration, get_calibration_info
+    POSITION_TOLERANCE_UM, SETTLING_CYCLES
 )
 from core.services.test_service import TestService, ControllerConfig
 from gui.utils.trajectory_preview import show_trajectory_preview
 from gui.utils.csv_utils import export_trajectory_csv, import_trajectory_csv
 from gui.utils.test_tab_ui_builder import (
+    create_calibration_analysis_section,
     create_controllers_section,
     create_motor_sensor_section,
-    create_calibration_section,
     create_position_control_section,
     create_trajectory_section,
     create_zigzag_section
 )
+from core.services.calibration_analysis_service import CalibrationAnalysisService
+from gui.windows import MatplotlibWindow
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -108,6 +109,7 @@ class TestTab(QWidget):
         self.calibration_data = None
         
         self._setup_ui()
+        self._map_widgets()
         logger.debug("TestTab inicializado con TestService")
     
     def _connect_service_signals(self):
@@ -163,6 +165,13 @@ class TestTab(QWidget):
         # Diccionario para almacenar referencias a widgets
         self._widgets = {}
         
+        # Sección 0: Análisis de Calibración (botón superior)
+        calibration_analysis_widget = create_calibration_analysis_section(
+            self._widgets,
+            self.show_calibration_analysis
+        )
+        layout.addWidget(calibration_analysis_widget)
+        
         # Sección 1: Controladores H∞ Transferidos
         controllers_group = create_controllers_section(
             self._widgets, 
@@ -173,10 +182,6 @@ class TestTab(QWidget):
         # Sección 2: Asignación Motor-Sensor
         motor_sensor_group = create_motor_sensor_section(self._widgets)
         layout.addWidget(motor_sensor_group)
-        
-        # Sección 3: Calibración
-        calibration_group = create_calibration_section(self._widgets, self._reload_calibration)
-        layout.addWidget(calibration_group)
         
         # Sección 4: Control por Posición
         position_group = create_position_control_section(
@@ -219,9 +224,6 @@ class TestTab(QWidget):
         
         scroll.setWidget(scroll_widget)
         main_layout.addWidget(scroll)
-        
-        # Actualizar display de calibración
-        self._update_calibration_display()
     
     def _map_widgets(self):
         """Mapea widgets del diccionario a atributos del objeto para compatibilidad."""
@@ -243,9 +245,6 @@ class TestTab(QWidget):
         self.motor_b_sensor2 = self._widgets.get('motor_b_sensor2')
         self.motor_b_invert = self._widgets.get('motor_b_invert')
         
-        # Calibración
-        self.calibration_status = self._widgets.get('calibration_status')
-        self.calibration_details = self._widgets.get('calibration_details')
         
         # Control por posición
         self.ref_a_input = self._widgets.get('ref_a_input')
@@ -444,58 +443,6 @@ class TestTab(QWidget):
         # Emitir señal para sincronizar con CameraTab
         self.trajectory_changed.emit(n_points if has_trajectory else 0)
     
-    def set_calibration(self, calibrated: bool, details: str = ""):
-        """Actualiza estado de calibración (método legacy)."""
-        if calibrated:
-            self.calibration_status.setText("✅ Sistema calibrado")
-            self.calibration_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #27AE60;")
-            self.calibration_details.setText(details)
-        else:
-            self.calibration_status.setText("⚪ Sin calibración")
-            self.calibration_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #95A5A6;")
-            self.calibration_details.clear()
-    
-    def _update_calibration_display(self):
-        """Actualiza el display de calibración con datos de calibration.json."""
-        try:
-            cal_info = get_calibration_info()
-            
-            cal_x = cal_info['x']
-            cal_y = cal_info['y']
-            
-            # Verificar si hay calibración válida
-            has_calibration = cal_x.get('intercept', 0) > 0 and cal_y.get('intercept', 0) > 0
-            
-            if has_calibration:
-                self.calibration_status.setText("✅ Calibración cargada desde JSON")
-                self.calibration_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #27AE60;")
-                
-                details = f"📐 EJE X (Motor A): intercept={cal_x['intercept']:.1f}µm, slope={cal_x['slope']:.4f}µm/ADC\n"
-                details += f"📐 EJE Y (Motor B): intercept={cal_y['intercept']:.1f}µm, slope={cal_y['slope']:.4f}µm/ADC\n"
-                details += f"⚙️ Deadzone={cal_info['deadzone_adc']}ADC, Tolerancia={cal_info['tolerance_um']}µm, Settling={cal_info['settling_cycles']} ciclos"
-                self.calibration_details.setText(details)
-            else:
-                self.calibration_status.setText("⚠️ Calibración por defecto")
-                self.calibration_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #F39C12;")
-                self.calibration_details.setText("Ejecuta análisis en 'Análisis' para calibrar automáticamente")
-                
-            logger.info(f"Display de calibración actualizado: X={cal_x}, Y={cal_y}")
-            
-        except Exception as e:
-            logger.error(f"Error actualizando display de calibración: {e}")
-            self.calibration_status.setText("❌ Error cargando calibración")
-            self.calibration_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #E74C3C;")
-    
-    def _reload_calibration(self):
-        """Recarga la calibración desde calibration.json."""
-        try:
-            reload_calibration()
-            self._update_calibration_display()
-            self.results_text.append("🔄 Calibración recargada desde calibration.json")
-            logger.info("Calibración recargada manualmente")
-        except Exception as e:
-            self.results_text.append(f"❌ Error recargando calibración: {e}")
-            logger.error(f"Error recargando calibración: {e}")
     
     def append_result(self, text: str):
         """Agrega texto al área de resultados."""
@@ -573,12 +520,9 @@ class TestTab(QWidget):
             self.test_service.set_controller_b(None)
     
     def update_calibration_data(self, calibration_data: dict):
-        """Guarda datos de calibración desde AnalysisTab."""
+        """Guarda datos de calibración desde AnalysisTab (método legacy - ya no usado)."""
         self.calibration_data = calibration_data
-        details = f"K={calibration_data.get('K', 0):.4f} µm/s/PWM\n"
-        details += f"τ={calibration_data.get('tau', 0):.4f} s"
-        self.set_calibration(True, details)
-        logger.info("Calibración guardada en TestTab")
+        logger.info("Calibración guardada en TestTab (legacy)")
     
     def generate_zigzag_trajectory(self):
         """Genera trayectoria en zig-zag usando TrajectoryGenerator."""
@@ -840,3 +784,55 @@ class TestTab(QWidget):
         """Handler: Error del servicio."""
         self.results_text.append(f"❌ Error: {error}")
         QMessageBox.warning(self.parent_gui, "Error", error)
+    
+    # =========================================================================
+    # ANÁLISIS DE CALIBRACIÓN
+    # =========================================================================
+    
+    def show_calibration_analysis(self):
+        """Muestra gráficos de análisis de calibración para ambos motores."""
+        logger.info("Generando gráficos de análisis de calibración...")
+        
+        try:
+            # Generar análisis usando el servicio
+            result = CalibrationAnalysisService.generate_calibration_analysis()
+            
+            if not result['success']:
+                QMessageBox.warning(
+                    self.parent_gui,
+                    "Error en Análisis",
+                    result['message']
+                )
+                return
+            
+            # Mostrar gráfico de Motor A
+            if 'motor_a' in result:
+                window_a = MatplotlibWindow(
+                    result['motor_a'],
+                    "Análisis de Calibración - Motor A (Eje X)",
+                    self.parent_gui
+                )
+                window_a.show()
+                window_a.raise_()
+            
+            # Mostrar gráfico de Motor B
+            if 'motor_b' in result:
+                window_b = MatplotlibWindow(
+                    result['motor_b'],
+                    "Análisis de Calibración - Motor B (Eje Y)",
+                    self.parent_gui
+                )
+                window_b.show()
+                window_b.raise_()
+            
+            self.results_text.append("✅ Gráficos de calibración generados exitosamente")
+            logger.info("✅ Gráficos de calibración mostrados")
+            
+        except Exception as e:
+            error_msg = f"Error al generar gráficos de calibración: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            QMessageBox.critical(
+                self.parent_gui,
+                "Error",
+                error_msg
+            )

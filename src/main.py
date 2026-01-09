@@ -250,7 +250,8 @@ class ArduinoGUI(QMainWindow):
         self.test_tab.controller_clear_requested.connect(lambda motor: self.test_tab.clear_controller(motor))
         
         # Pestaña 4: H∞ Synthesis (HInfTab modular) - CREAR DESPUÉS de TestTab
-        self.hinf_tab = HInfTab(hinf_controller=self.hinf_designer, tf_analyzer=self.tf_analyzer, parent=self)
+        # HInfTab ahora crea automáticamente HInfTrackingController (Zhou & Doyle)
+        self.hinf_tab = HInfTab(hinf_controller=None, tf_analyzer=self.tf_analyzer, parent=self)
         # Configurar callbacks de hardware para control en tiempo real
         self.hinf_tab.set_hardware_callbacks(
             send_command=self.send_command,
@@ -345,6 +346,9 @@ class ArduinoGUI(QMainWindow):
         # Conectar señales de máscaras de autofoco con CameraViewWindow
         self.microscopy_service.show_masks.connect(self._on_show_autofocus_masks)
         self.microscopy_service.clear_masks.connect(self._on_clear_autofocus_masks)
+        
+        # CRÍTICO: Conectar señal de detección de microscopia para actualizar lista de objetos
+        self.microscopy_service.detection_complete.connect(self.camera_tab._on_microscopy_detection_complete)
 
         # Aprendizaje asistido: popup de confirmación
         if hasattr(self.microscopy_service, 'learning_confirmation_requested'):

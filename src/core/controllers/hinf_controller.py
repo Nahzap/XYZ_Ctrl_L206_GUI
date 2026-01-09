@@ -1,15 +1,16 @@
 """
-Diseño de controlador robusto H∞ - Versión Unificada.
+Diseño de controlador robusto H∞ para control de motores.
 
-Este módulo implementa el diseño de controladores H∞/H2 usando la técnica
-de mixed sensitivity synthesis con la librería python-control.
+Este módulo implementa síntesis H∞ usando mixsyn para control de posición
+de motores DC mediante un enfoque de dos etapas:
+1. Diseño del controlador para planta de velocidad G(s) = K/(τs+1)
+2. Integración externa para control de posición
 
-Basado en: Zhou, Doyle, Glover - "Robust and Optimal Control"
+El controlador resultante incluye acción integral implícita que garantiza
+error de estado estacionario = 0 para control de posición.
 
-REFACTORIZADO: 2025-12-15
-- Unificada toda la lógica de síntesis en esta clase
-- Eliminada duplicación con hinf_service.py
-- Agregados métodos de validación y escalado
+Refactorizado: 2025-12-15
+Última actualización: 2026-01-06
 """
 
 import logging

@@ -5,9 +5,9 @@ Utilidades de GUI.
 from .trajectory_preview import show_trajectory_preview
 from .csv_utils import export_trajectory_csv, import_trajectory_csv, get_trajectory_stats
 from .test_tab_ui_builder import (
+    create_calibration_analysis_section,
     create_controllers_section,
     create_motor_sensor_section,
-    create_calibration_section,
     create_position_control_section,
     create_trajectory_section,
     create_zigzag_section
@@ -28,9 +28,9 @@ __all__ = [
     'import_trajectory_csv',
     'get_trajectory_stats',
     # TestTab builders
+    'create_calibration_analysis_section',
     'create_controllers_section',
     'create_motor_sensor_section',
-    'create_calibration_section',
     'create_position_control_section',
     'create_trajectory_section',
     'create_zigzag_section',

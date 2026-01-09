@@ -182,16 +182,20 @@ def um_to_adc(um: float, axis: str = 'x') -> float:
     """
     Convierte posición en µm a valor ADC.
     
+    IMPORTANTE: NO satura artificialmente. Si la posición está fuera del rango
+    físico del sensor, retorna el valor calculado para que el controlador
+    pueda detectar el error correctamente.
+    
     Args:
         um: Posición en micrómetros
         axis: 'x' o 'y' para seleccionar calibración
         
     Returns:
-        Valor ADC correspondiente (0-1023)
+        Valor ADC correspondiente (puede estar fuera de 0-1023 si fuera de rango)
     """
     cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
     adc = (cal['intercept'] - um) / cal['slope']
-    return max(0, min(ADC_MAX, adc))
+    return adc  # NO saturar - dejar que el controlador maneje límites
 
 
 def adc_to_um(adc: float, axis: str = 'x') -> float:
