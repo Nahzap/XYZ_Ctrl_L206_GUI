@@ -222,8 +222,33 @@ class MicroscopyService(QObject):
         # Notificar progreso inicial
         self.progress_changed.emit(0, total)
 
-        # Ejecutar primer punto
-        self._move_to_point()
+        # FASE 1: Pasar trayectoria COMPLETA a TestService UNA SOLA VEZ
+        if not self._test_service:
+            logger.error("[MicroscopyService] TestService no disponible")
+            self.status_changed.emit("❌ Error: TestService no disponible")
+            return False
+        
+        # Conectar señal para recibir notificación cuando llegue a cada punto
+        try:
+            self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
+        except:
+            pass
+        self._test_service.trajectory_point_reached.connect(self._on_test_point_reached)
+        
+        # Iniciar trayectoria completa (TestService maneja TODO el control)
+        # pause_s reducido a 0.1s porque solo necesita settling, no operaciones
+        success = self._test_service.start_trajectory(
+            list(trajectory),
+            tolerance_um=self._trajectory_tolerance,
+            pause_s=0.1  # Solo settling, MicroscopyService controla timing real
+        )
+        
+        if not success:
+            logger.error("[MicroscopyService] Error iniciando trayectoria completa en TestService")
+            self.status_changed.emit("❌ Error iniciando trayectoria")
+            return False
+        
+        logger.info("[MicroscopyService] ✅ Trayectoria completa iniciada: %d puntos", total)
         return True
 
     def stop_microscopy(self) -> None:
@@ -310,30 +335,25 @@ class MicroscopyService(QObject):
             self._move_to_point_legacy()
     
     def _on_test_point_reached(self, index: int, x: float, y: float, status: str):
-        """Callback cuando TestService alcanza el punto."""
+        """Callback cuando TestService alcanza un punto.
+        
+        TestService YA está PAUSADO (esperando comando explícito).
+        Solo ejecutamos delay de usuario y captura.
+        """
         if not self._state_manager.is_active:
             return
         
-        logger.info(f"[MicroscopyService] Punto alcanzado por TestService: ({x:.1f}, {y:.1f}) {status}")
+        n = index + 1
+        total = self._state_manager.total_points
+        logger.info(f"[MicroscopyService] Punto {n}/{total} alcanzado: ({x:.1f}, {y:.1f}) {status}")
+        logger.info(f"[MicroscopyService] TestService PAUSADO - ejecutando detección")
         
-        # Detener TestService (ya completó el punto)
-        if self._test_service:
-            self._test_service.stop_trajectory()
-        
-        # PASO 2: DELAY_BEFORE (Optimizado)
-        # Si usamos TestService, ya hubo settling y tolerancia, así que el delay adicional
-        # puede ser mínimo o el configurado si el usuario insiste.
-        # User complained about >5s delay. Let's clamp it or ignore if it's too high?
-        # Actually, TestService pause=0.1s + settling time is usually enough.
-        # We will use a reduced delay if using TestService.
-        
-        effective_delay = min(self._delay_before_ms, 500) # Cap delay at 500ms when using TestService
-        
-        if effective_delay > 0:
+        # Delay de usuario (para eliminar vibración)
+        if self._delay_before_ms > 0:
             self.status_changed.emit(
-                f"  Posición alcanzada - Esperando {effective_delay}ms..."
+                f"[{n}/{total}] Posición alcanzada - Esperando {self._delay_before_ms}ms..."
             )
-            QTimer.singleShot(effective_delay, self._capture)
+            QTimer.singleShot(self._delay_before_ms, self._capture)
         else:
             self._capture()
 
@@ -474,11 +494,15 @@ class MicroscopyService(QObject):
                 self._state_manager.current_point,
                 len(all_objects),
             )
-            # Continuar con el siguiente punto
+            # FASE 3: Comando explícito para avanzar (sin objetos)
             self._state_manager.advance_point()
             self._state_manager.reset_position_checks()
             self.progress_changed.emit(self._state_manager.current_point, self._state_manager.total_points)
-            self._move_to_point()
+            
+            # Reanudar TestService para que avance al siguiente punto
+            if self._test_service:
+                logger.info("[MicroscopyService] Sin objetos - comandando avance a TestService")
+                self._test_service.resume_trajectory()
             return
         
         # Mostrar máscaras en ventana de cámara
@@ -831,8 +855,18 @@ class MicroscopyService(QObject):
         else:
             self.status_changed.emit(f"  ⚠️ Error guardando imágenes")
         
-        # Avanzar al siguiente punto
-        self._advance_point()
+        # FASE 3: Comando explícito para avanzar (después de captura)
+        self._state_manager.advance_point()
+        self.progress_changed.emit(self._state_manager.current_point, self._state_manager.total_points)
+        
+        # Delay de usuario (post-captura)
+        if self._delay_after_ms > 0:
+            time.sleep(self._delay_after_ms / 1000.0)
+        
+        # Reanudar TestService para que avance al siguiente punto
+        if self._test_service:
+            logger.info("[MicroscopyService] Captura completada - comandando avance a TestService")
+            self._test_service.resume_trajectory()
     
     def _save_3images(self, frames: list, z_positions: list, scores: list, best_z: float, image_index: int) -> bool:
         """
@@ -1090,17 +1124,26 @@ class MicroscopyService(QObject):
             return False
 
     def _advance_point(self) -> None:
-        """Avanza al siguiente punto de microscopía."""
+        """OBSOLETO: Avanza al siguiente punto (legacy).
+        
+        NOTA: Con el nuevo protocolo, el avance se hace explícitamente
+        llamando a TestService.resume_trajectory() después de cada operación.
+        Este método se mantiene por compatibilidad con flujos legacy.
+        """
         if not self._state_manager.is_active:
             return
 
-        self.progress_changed.emit(self._state_manager.current_point + 1, self._state_manager.total_points)
-
         self._state_manager.advance_point()
-        if self._state_manager.current_point < self._state_manager.total_points:
-            QTimer.singleShot(self._delay_after_ms, self._move_to_point)
-        else:
-            self._finish_microscopy()
+        self.progress_changed.emit(self._state_manager.current_point, self._state_manager.total_points)
+        
+        # Delay de usuario (post-captura)
+        if self._delay_after_ms > 0:
+            time.sleep(self._delay_after_ms / 1000.0)
+        
+        # Reanudar TestService
+        if self._test_service:
+            logger.info("[MicroscopyService] _advance_point (legacy) - comandando avance")
+            self._test_service.resume_trajectory()
     
     def enable_learning_mode(self, enabled: bool = True, target_count: int = 50):
         """Activa/desactiva el modo de aprendizaje."""

@@ -511,8 +511,20 @@ class HInfTab(QWidget):
             logger.error("TestTab reference no configurada")
             return
         
-        # Obtener parámetros del controlador
+        # Obtener parámetros del controlador con verificación detallada
         try:
+            # Verificar atributos críticos uno por uno
+            if not hasattr(self, 'Kp_designed'):
+                raise AttributeError("Kp_designed no está definido. Sintetiza o carga un controlador primero.")
+            if not hasattr(self, 'Ki_designed'):
+                raise AttributeError("Ki_designed no está definido. Sintetiza o carga un controlador primero.")
+            if not hasattr(self, 'K_value'):
+                raise AttributeError("K_value no está definido. Carga la planta desde Análisis primero.")
+            if not hasattr(self, 'tau_value'):
+                raise AttributeError("tau_value no está definido. Carga la planta desde Análisis primero.")
+            if not hasattr(self, 'Umax_designed'):
+                raise AttributeError("Umax_designed no está definido. Sintetiza o carga un controlador primero.")
+            
             Kp = self.Kp_designed
             Ki = self.Ki_designed
             K_abs = abs(self.K_value)
@@ -524,6 +536,10 @@ class HInfTab(QWidget):
             gamma = self.gamma
             
             logger.info(f"Parámetros a transferir: Kp={Kp:.4f}, Ki={Ki:.4f}, K={K_abs:.4f}, τ={tau:.4f}")
+        except AttributeError as e:
+            QMessageBox.warning(self, "Error", f"Parámetros incompletos:\n\n{str(e)}\n\nPasos necesarios:\n1. Cargar planta desde Análisis\n2. Sintetizar controlador H∞\n3. Transferir a Prueba")
+            logger.error(f"Error obteniendo parámetros: {e}")
+            return
         except Exception as e:
             QMessageBox.warning(self, "Error", f"No se pudieron obtener parámetros: {e}")
             logger.error(f"Error obteniendo parámetros: {e}")

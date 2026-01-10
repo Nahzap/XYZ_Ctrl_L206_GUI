@@ -109,8 +109,8 @@ class TestService(QObject):
         self._trajectory: Optional[List[Tuple[float, float]]] = None
         self._trajectory_index = 0
         self._trajectory_config = TrajectoryConfig()
+        self._trajectory_paused = True
         self._trajectory_waiting = False
-        self._trajectory_wait_start = 0.0
         self._traj_settling_counter = 0
         self._traj_near_attempts = 0
         
@@ -362,20 +362,22 @@ class TestService(QObject):
     # EJECUCIÓN DE TRAYECTORIA
     # =========================================================================
     
-    def start_trajectory(self, trajectory: List[Tuple[float, float]], 
-                        tolerance_um: float = 25.0, pause_s: float = 2.0) -> bool:
+    def start_trajectory(self, trajectory: list, tolerance_um: float = 25.0, pause_s: float = 2.0, auto_advance: bool = False) -> bool:
         """
-        Inicia la ejecución de una trayectoria.
+        Inicia la ejecución de una trayectoria con control PI dual.
         
         Args:
             trajectory: Lista de puntos (x, y) en µm
             tolerance_um: Tolerancia de posición en µm
             pause_s: Pausa en cada punto en segundos
+            auto_advance: Si True, avanza automáticamente después de pausa (TestTab).
+                         Si False, espera comando explícito resume_trajectory (MicroscopyService).
             
         Returns:
             True si se inició correctamente
         """
         logger.info(f"=== TestService: INICIANDO TRAYECTORIA ({len(trajectory)} puntos) ===")
+        logger.info(f"    Modo: {'AUTO-ADVANCE' if auto_advance else 'MANUAL (espera resume_trajectory)'}")
         
         if not trajectory:
             self.error_occurred.emit("Trayectoria vacía")
@@ -389,16 +391,24 @@ class TestService(QObject):
             self.error_occurred.emit("No hay controladores cargados")
             return False
         
+        # CRÍTICO: Detener trayectoria anterior si existe
+        if self._trajectory_active:
+            logger.warning("[TestService] Trayectoria anterior activa - deteniendo antes de iniciar nueva")
+            self.stop_trajectory()
+            time.sleep(0.2)  # Dar tiempo para que se detenga completamente
+        
         # Guardar configuración
         self._trajectory = list(trajectory)
         self._trajectory_config.tolerance_um = tolerance_um
         self._trajectory_config.pause_s = pause_s
+        self._trajectory_auto_advance = auto_advance  # NUEVO: modo auto-advance
         
-        # Inicializar estado
+        # Inicializar estado - SIEMPRE desde cero
         self._trajectory_index = 0
         self._trajectory_active = True
+        self._trajectory_paused = False  # CORRECCIÓN: Iniciar NO pausado para ir al primer punto
         self._trajectory_waiting = False
-        self._trajectory_wait_start = 0.0
+        self._point_accepted = False  # NUEVO: Flag para evitar múltiples aceptaciones del mismo punto
         
         # Estado de corrección de eje bloqueado
         self._correcting_locked_axis = False
@@ -448,6 +458,61 @@ class TestService(QObject):
         self.trajectory_stopped.emit(self._trajectory_index + 1, total)
         self.log_message.emit(f"⏹️ Trayectoria detenida en punto {self._trajectory_index + 1}/{total} (Freno Activo)")
     
+    def pause_trajectory(self):
+        """Pausa la trayectoria (mantiene el timer activo).
+        
+        Timer continúa ejecutándose para mantener posición activamente.
+        """
+        if not self._trajectory_active:
+            return
+        
+        self._trajectory_paused = True
+        logger.info("[TestService] Trayectoria pausada - manteniendo posición")
+    
+    def resume_trajectory(self):
+        """
+        Reanuda la ejecución de la trayectoria, avanzando al siguiente punto.
+        Este método es llamado explícitamente por MicroscopyService.
+        """
+        if not self._trajectory_active:
+            logger.warning("[TestService] Intento de reanudar trayectoria inactiva.")
+            return
+        if not self._trajectory_paused:
+            logger.warning("[TestService] Intento de reanudar trayectoria no pausada.")
+            return
+
+        logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Avanzando al siguiente punto.")
+        self._trajectory_paused = False
+        self._trajectory_index += 1  # Avanzar al siguiente punto
+        self.status_changed.emit(f"Reanudando trayectoria. Moviendo a punto {self._trajectory_index + 1}.")
+
+        # Resetear integrales al reanudar para evitar wind-up
+        self._dual_integral_a = 0.0
+        self._dual_integral_b = 0.0
+    
+    def _auto_advance_to_next_point(self):
+        """Avanza automáticamente al siguiente punto (modo auto_advance)."""
+        if not self._trajectory_active:
+            return
+        
+        logger.info("[TestService] ▶️  Auto-avanzando al siguiente punto (delay 100ms)")
+        
+        # Delay pequeño de 100ms antes de avanzar
+        time.sleep(0.1)
+        
+        # Avanzar al siguiente punto
+        self._trajectory_index += 1
+        
+        # Resetear flag de punto aceptado para el nuevo punto
+        self._point_accepted = False
+        
+        # Reanudar trayectoria (desactivar pausa)
+        self._trajectory_paused = False
+        
+        # Resetear integrales
+        self._dual_integral_a = 0.0
+        self._dual_integral_b = 0.0
+    
     def _detect_axis_lock(self, current_idx: int) -> Tuple[bool, bool]:
         """Detecta si algún eje debe bloquearse."""
         if not self._trajectory or current_idx >= len(self._trajectory):
@@ -464,34 +529,22 @@ class TestService(QObject):
         return (False, False)
     
     def _execute_trajectory_step(self):
-        """Ejecuta un paso del control de trayectoria."""
+        """Ejecuta un paso del control de trayectoria.
+        
+        FASE 2 y 5: Si está pausado, mantiene posición activamente.
+        """
         try:
             if not self._trajectory_active:
                 return
             
-            current_time = time.time()
-            
-            # Si estamos en pausa
-            if self._trajectory_waiting:
-                if current_time - self._trajectory_wait_start >= self._trajectory_config.pause_s:
-                    self._trajectory_index += 1
-                    self._trajectory_waiting = False
-                    self._dual_integral_a = 0
-                    self._dual_integral_b = 0
-                    self._traj_settling_counter = 0
-                    self._traj_near_attempts = 0
-                    self._correcting_locked_axis = False
-                    logger.info(f"⏭️ Pausa completada, avanzando a punto {self._trajectory_index + 1}")
-                return
-            
-            # Si estamos corrigiendo un eje bloqueado
-            if self._correcting_locked_axis:
-                self._execute_locked_axis_correction()
+            # FASE 5: Si está pausado, mantener posición activamente
+            if self._trajectory_paused:
+                self._maintain_position()
                 return
             
             # Calcular Ts
-            Ts = current_time - self._dual_last_time
-            self._dual_last_time = current_time
+            Ts = time.time() - self._dual_last_time
+            self._dual_last_time = time.time()
             
             # Verificar si completamos
             if self._trajectory_index >= len(self._trajectory):
@@ -633,32 +686,113 @@ class TestService(QObject):
         except Exception as e:
             logger.error(f"TestService: Error en trayectoria: {e}")
     
+    def _maintain_position(self):
+        """Mantiene la posición actual con control activo durante pausa.
+        
+        FASE 5: Aplica control proporcional suave para corregir deriva sin acumular integral.
+        Llamado cada 10ms por _execute_trajectory_step cuando está pausado.
+        """
+        if not self._trajectory or self._trajectory_index >= len(self._trajectory):
+            return
+        
+        target = self._trajectory[self._trajectory_index]
+        target_x, target_y = target[0], target[1]
+        
+        # Calcular referencias en ADC
+        ref_adc_x = um_to_adc(target_x, axis='x')
+        ref_adc_y = um_to_adc(target_y, axis='y')
+        
+        pwm_a = 0
+        pwm_b = 0
+        
+        # Control correctivo suave para eje A (solo proporcional)
+        if self._controller_a:
+            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
+            if sensor_adc is not None:
+                error_adc = ref_adc_x - sensor_adc
+                if abs(error_adc) > DEADZONE_ADC:
+                    # Solo proporcional, sin integral para evitar acumulación
+                    # Ganancia reducida al 30% para control suave
+                    pwm_base = self._controller_a.Kp * error_adc * 0.3
+                    pwm_a = -int(pwm_base) if self._controller_a.invert else int(pwm_base)
+                    U_max = int(self._controller_a.U_max)
+                    pwm_a = max(-U_max, min(U_max, pwm_a))
+        
+        # Control correctivo suave para eje B (solo proporcional)
+        if self._controller_b:
+            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
+            if sensor_adc is not None:
+                error_adc = ref_adc_y - sensor_adc
+                if abs(error_adc) > DEADZONE_ADC:
+                    # Solo proporcional, sin integral para evitar acumulación
+                    # Ganancia reducida al 30% para control suave
+                    pwm_base = self._controller_b.Kp * error_adc * 0.3
+                    pwm_b = -int(pwm_base) if self._controller_b.invert else int(pwm_base)
+                    U_max = int(self._controller_b.U_max)
+                    pwm_b = max(-U_max, min(U_max, pwm_b))
+        
+        # Enviar comando de mantenimiento de posición si hay corrección necesaria
+        if pwm_a != 0 or pwm_b != 0:
+            self._send_command(f"A,{pwm_a},{pwm_b}")
+    
     def _accept_trajectory_point(self, target_x: float, target_y: float, 
                                   error_x: float, error_y: float, status: str):
-        """Acepta el punto actual y prepara para el siguiente."""
-        current_time = time.time()
+        """Acepta el punto actual y PAUSA o AVANZA según modo.
+        
+        Si auto_advance=True (TestTab): Pausa temporal y avanza automáticamente.
+        Si auto_advance=False (MicroscopyService): Pausa indefinida esperando resume_trajectory().
+        """
+        # CRÍTICO: Evitar múltiples aceptaciones del mismo punto
+        if self._point_accepted:
+            logger.warning(f"[TestService] Punto {self._trajectory_index + 1} ya fue aceptado - ignorando llamada duplicada")
+            return
+        
+        # Marcar punto como aceptado
+        self._point_accepted = True
         
         # Freno activo
         self._send_command('B')
         time.sleep(0.05)
         self._send_command('A,0,0')
         
-        # Iniciar pausa
-        self._trajectory_waiting = True
-        self._trajectory_wait_start = current_time
+        # Resetear contadores
         self._traj_settling_counter = 0
         self._traj_near_attempts = 0
+        
+        # Resetear integrales para el siguiente punto
+        self._dual_integral_a = 0.0
+        self._dual_integral_b = 0.0
         
         # Emitir señales
         total = len(self._trajectory) if self._trajectory else 0
         self.trajectory_point_reached.emit(self._trajectory_index, target_x, target_y, status)
-        self.log_message.emit(
-            f"📍 Punto {self._trajectory_index + 1}/{total}: "
-            f"({target_x:.0f}, {target_y:.0f})µm {status} "
-            f"[Error: X={error_x:.1f}, Y={error_y:.1f}µm] "
-            f"- Pausa {self._trajectory_config.pause_s}s"
-        )
-        logger.info(f"{status} Punto {self._trajectory_index + 1} - Pausa {self._trajectory_config.pause_s}s")
+        
+        if self._trajectory_auto_advance:
+            # MODO AUTO-ADVANCE (TestTab): Pausa temporal y avanza automáticamente
+            # PAUSAR trayectoria durante la pausa para evitar movimiento
+            self._trajectory_paused = True
+            
+            self.log_message.emit(
+                f"📍 Punto {self._trajectory_index + 1}/{total}: "
+                f"({target_x:.0f}, {target_y:.0f})µm {status} "
+                f"[Error: X={error_x:.1f}, Y={error_y:.1f}µm] "
+                f"- Pausa {self._trajectory_config.pause_s}s"
+            )
+            logger.info(f"{status} Punto {self._trajectory_index + 1} - Pausa {self._trajectory_config.pause_s}s antes de avanzar")
+            
+            # Programar avance automático después de pausa
+            pause_ms = int(self._trajectory_config.pause_s * 1000)
+            QTimer.singleShot(pause_ms, self._auto_advance_to_next_point)
+        else:
+            # MODO MANUAL (MicroscopyService): Pausa indefinida esperando comando
+            self._trajectory_paused = True
+            self.log_message.emit(
+                f"📍 Punto {self._trajectory_index + 1}/{total}: "
+                f"({target_x:.0f}, {target_y:.0f})µm {status} "
+                f"[Error: X={error_x:.1f}, Y={error_y:.1f}µm] "
+                f"- PAUSADO (esperando comando)"
+            )
+            logger.info(f"{status} Punto {self._trajectory_index + 1} - PAUSADO esperando resume_trajectory()")
     
     def _accept_corrected_point(self):
         """Acepta el punto actual después de corregir el eje bloqueado."""

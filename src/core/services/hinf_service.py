@@ -524,6 +524,13 @@ def load_previous_controller(tab):
         tab.w2_umax.setText(str(data['w2_umax']))
         tab.w3_wunc.setText(str(data['w3_wunc']))
         tab.w3_epsT.setText(str(data['w3_epsT']))
+        
+        # CRÍTICO: Restaurar atributos necesarios para transfer_to_test
+        tab.Kp_designed = data['Kp']
+        tab.Ki_designed = data['Ki']
+        tab.K_value = data['K']
+        tab.tau_value = data['tau']
+        tab.Umax_designed = data['w2_umax']
 
         # Mostrar info
         tab.results_text.clear()

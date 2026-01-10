@@ -22,7 +22,7 @@ import numpy as np
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTextEdit, QScrollArea,
                              QMessageBox, QFileDialog)
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
 from config.constants import (
     POSITION_TOLERANCE_UM, SETTLING_CYCLES
@@ -631,8 +631,8 @@ class TestTab(QWidget):
         # Convertir trayectoria a lista de tuplas
         trajectory_list = [(p[0], p[1]) for p in self.current_trajectory]
         
-        # Delegar al servicio
-        self.test_service.start_trajectory(trajectory_list, tolerance, pause)
+        # Delegar al servicio con auto_advance=True para TestTab standalone
+        self.test_service.start_trajectory(trajectory_list, tolerance, pause, auto_advance=True)
     
     def _update_trajectory_feedback(self, target_x: float, target_y: float, error_x: float, error_y: float, 
                                       lock_x: bool = False, lock_y: bool = False):
