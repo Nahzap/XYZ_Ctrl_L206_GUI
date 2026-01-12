@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Test Parameters Auto-Fill Template",
+  "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
+  "version": "1.0.0",
+  "last_updated": "2026-01-12T13:25:19.358123",
+  "trajectory": {
+    "description": "Parámetros de generación de trayectoria",
+    "points": 1024,
+    "x_range": {
+      "min": 10000.0,
+      "max": 19500.0,
+      "unit": "µm"
+    },
+    "y_range": {
+      "min": 10000.0,
+      "max": 19500.0,
+      "unit": "µm"
+    },
+    "delay_between_points": 0.5,
+    "delay_unit": "seconds"
+  },
+  "test_service": {
+    "description": "Parámetros de TestService para ejecución de trayectoria",
+    "tolerance": 100.0,
+    "tolerance_unit": "µm",
+    "pause_duration": 0.5,
+    "pause_unit": "seconds",
+    "mode": "AUTO-ADVANCE",
+    "modes_available": [
+      "AUTO-ADVANCE",
+      "MANUAL"
+    ]
+  },
+  "microscopy": {
+    "description": "Parámetros de microscopía automatizada",
+    "class_name": "Quillaja_Saponaria",
+    "total_points": 1024,
+    "autofocus": {
+      "enabled": true,
+      "area_range": {
+        "min": 5000,
+        "max": 120000,
+        "unit": "px"
+      }
+    },
+    "channels": "G",
+    "channels_available": [
+      "R",
+      "G",
+      "B",
+      "RGB",
+      "GRAY"
+    ],
+    "format": "PNG",
+    "format_available": [
+      "PNG",
+      "TIFF",
+      "JPEG"
+    ],
+    "bit_depth": 16,
+    "bit_depth_available": [
+      8,
+      16
+    ],
+    "delays": {
+      "before_capture": 0,
+      "after_capture": 0,
+      "unit": "ms"
+    },
+    "learning_mode": {
+      "enabled": true,
+      "target_samples": 50
+    }
+  },
+  "detection": {
+    "description": "Parámetros de detección U2-Net",
+    "model": "u2netp",
+    "threshold": 0.5,
+    "min_area": 500,
+    "min_probability": 0.3,
+    "morphological_filters": {
+      "min_circularity": 0.42,
+      "min_aspect_ratio": 0.4,
+      "description": "Filtros morfológicos para rechazar manchas irregulares"
+    }
+  },
+  "camera": {
+    "description": "Parámetros de cámara Thorlabs",
+    "model": "CS235MU",
+    "serial_number": "09213",
+    "frame_rate": 30,
+    "frame_rate_unit": "FPS",
+    "exposure": 0.015,
+    "exposure_unit": "seconds",
+    "buffer_size": 1,
+    "buffer_unit": "frames"
+  },
+  "cfocus": {
+    "description": "Parámetros de C-Focus (autofoco)",
+    "enabled": true,
+    "calibrated": true,
+    "range": {
+      "min": 0.02,
+      "max": 75.35,
+      "center": 37.68,
+      "total_range": 75.32,
+      "unit": "µm"
+    }
+  },
+  "serial": {
+    "description": "Parámetros de comunicación serial con Arduino",
+    "port": "COM5",
+    "baudrate": 1000000,
+    "device": "Arduino Uno"
+  },
+  "control": {
+    "description": "Parámetros de control PID/H-infinity",
+    "deadzone": 2,
+    "deadzone_unit": "ADC",
+    "tolerance": 25.0,
+    "tolerance_unit": "µm",
+    "settling_cycles": 4,
+    "max_attempts": 500,
+    "pwm": {
+      "min": 80,
+      "max": 150,
+      "adaptive_enabled": true,
+      "adaptive_mode": "AUTO_ONLY",
+      "description": "PWM adaptativo solo en modo AUTO, PWM completo en modo MANUAL"
+    }
+  },
+  "calibration": {
+    "description": "Parámetros de calibración ADC a µm",
+    "axis_x": {
+      "intercept": 20887.372013651875,
+      "slope": 11.376564277588168,
+      "unit": "µm/ADC",
+      "relation": "INVERSE"
+    },
+    "axis_y": {
+      "intercept": 21929.38209331652,
+      "slope": 12.610340479192939,
+      "unit": "µm/ADC",
+      "relation": "INVERSE"
+    }
+  },
+  "analysis": {
+    "description": "Parámetros de análisis de función de transferencia",
+    "last_file": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/MotorA_Sensor2_exp110-1.csv",
+    "motor": "A",
+    "sensor": 2,
+    "time_range": {
+      "start": 0.0,
+      "end": 34.0,
+      "unit": "seconds"
+    },
+    "results": {
+      "gain_K": 0.6999,
+      "gain_unit": "µm/s/PWM",
+      "tau_fast": 0.0,
+      "tau_slow": 1000.0,
+      "tau_unit": "seconds",
+      "steady_state_velocity": 113.9695,
+      "velocity_unit": "µm/s",
+      "average_pwm": 162.83
+    }
+  },
+  "usage_notes": {
+    "description": "Instrucciones de uso del formulario",
+    "auto_update": "Los valores se actualizan automáticamente con los últimos parámetros ingresados en cada sesión",
+    "persistence": "Este archivo se sobrescribe en cada ejecución para mantener los últimos valores",
+    "integration": "Los tabs pueden leer estos valores por defecto al iniciar",
+    "validation": "Validar que los valores sean coherentes antes de ejecutar tests"
+  }
+}

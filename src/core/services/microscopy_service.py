@@ -406,16 +406,20 @@ class MicroscopyService(QObject):
         if not self._state_manager.is_active:
             return
 
-        if not (self._get_current_frame and self._smart_focus_scorer and self._autofocus_service):
-            # Fallback a captura normal
-            self.status_changed.emit("⚠️ Autofoco no disponible, capturando normal...")
-            self._capture_without_autofocus_fallback()
-            return
+        current_idx = self._state_manager.current_point
+        total = self._state_manager.total_points
+        n = current_idx + 1
 
+        logger.info(f"[MicroscopyService] 🔍 Iniciando captura con autofoco para punto {n}/{total}")
+        self.status_changed.emit(f"[{n}/{total}] 🔍 Detectando objetos...")
+
+        # Capturar frame actual
         frame = self._get_current_frame()
         if frame is None:
-            self.status_changed.emit("⚠️ Sin frame disponible")
+            logger.warning("[MicroscopyService] No se pudo obtener frame de cámara")
+            self.status_changed.emit("⚠️ Error: No hay frame de cámara")
             self._advance_point()
+            self._resume_test_service()
             return
 
         # Convertir uint16 -> uint8
@@ -487,7 +491,7 @@ class MicroscopyService(QObject):
         n_objects = len(objects)
         if n_objects == 0:
             self.status_changed.emit(
-                f"  ⚠️ Sin objetos en rango [{min_area}-{max_area}] px - saltando punto"
+                f"[{n}/{total}]   ⚠️ Sin objetos en rango [{min_area}-{max_area}] px - saltando punto"
             )
             logger.info(
                 "[MicroscopyService] Punto %d: sin objetos en rango (detectados: %d)",
@@ -501,9 +505,14 @@ class MicroscopyService(QObject):
             
             # Reanudar TestService para que avance al siguiente punto
             if self._test_service:
-                logger.info("[MicroscopyService] Sin objetos - comandando avance a TestService")
+                logger.info(f"[MicroscopyService] [{n}/{total}] Sin objetos - avanzando a punto {n+1}")
+                self.status_changed.emit(f"[{n}/{total}] ➡️  Avanzando a punto {n+1}/{total}")
                 self._test_service.resume_trajectory()
             return
+        
+        # Objetos detectados
+        logger.info(f"[MicroscopyService] [{n}/{total}] ✅ {n_objects} objeto(s) detectado(s)")
+        self.status_changed.emit(f"[{n}/{total}] ✅ {n_objects} objeto(s) - iniciando autofoco")
         
         # Mostrar máscaras en ventana de cámara
         self._show_autofocus_masks(objects)
@@ -707,6 +716,17 @@ class MicroscopyService(QObject):
         # We might need to store 'result' in pending state too if we want visualization.
         # For now, let's skip complex visualization in learning mode or pass None.
         
+        # CRÍTICO: Actualizar ROI con detección ANTES de capturar
+        # Esto corrige el desfase entre la posición de detección inicial y la captura
+        frame_current = self._get_current_frame()
+        if frame_current is not None:
+            # Re-detectar objetos en la posición actual para actualizar ROI
+            all_objects_updated = self._detection_service.detect_objects(frame_current)
+            if all_objects_updated and len(all_objects_updated) > 0:
+                # Usar el objeto más grande de la detección actualizada
+                largest_object = max(all_objects_updated, key=lambda obj: obj.area)
+                logger.info(f"[MicroscopyService] ROI actualizado: área={largest_object.area:.0f} px")
+        
         # CAPTURA RÁPIDA: N imágenes multi-focales
         self._quick_capture_multifocal(largest_object)
     
@@ -848,7 +868,10 @@ class MicroscopyService(QObject):
             pass
         
         z_final = cfocus.read_z()
-        logger.info(f"[MicroscopyService] ✓ Posición final: Z={z_final:.2f}µm (centro calibrado)")
+        if z_final is not None:
+            logger.info(f"[MicroscopyService] ✓ Posición final: Z={z_final:.2f}µm (centro calibrado)")
+        else:
+            logger.warning("[MicroscopyService] ⚠️ No se pudo leer posición Z final (C-Focus desconectado?)")
         
         if success:
             self.status_changed.emit(f"  ✓ 3 imágenes guardadas - vuelto a Z medio")
@@ -863,10 +886,17 @@ class MicroscopyService(QObject):
         if self._delay_after_ms > 0:
             time.sleep(self._delay_after_ms / 1000.0)
         
-        # Reanudar TestService para que avance al siguiente punto
-        if self._test_service:
-            logger.info("[MicroscopyService] Captura completada - comandando avance a TestService")
-            self._test_service.resume_trajectory()
+        # DECISIÓN: ¿Reanudar automáticamente o esperar confirmación?
+        # En modo aprendizaje: PAUSAR para verificar
+        # En modo automático: CONTINUAR para no interrumpir el flujo
+        if self._state_manager.learning_mode and not self._state_manager.learning_completed:
+            logger.info("[MicroscopyService] ✅ Captura completada - trayectoria PAUSADA (modo aprendizaje)")
+            self.status_changed.emit("⏸️  Trayectoria pausada - presione 'Reanudar' para continuar")
+        else:
+            # Modo automático: reanudar inmediatamente
+            logger.info("[MicroscopyService] ✅ Captura completada - reanudando trayectoria automáticamente")
+            if self._test_service:
+                self._test_service.resume_trajectory()
     
     def _save_3images(self, frames: list, z_positions: list, scores: list, best_z: float, image_index: int) -> bool:
         """

@@ -403,6 +403,12 @@ class TestService(QObject):
         self._trajectory_config.pause_s = pause_s
         self._trajectory_auto_advance = auto_advance  # NUEVO: modo auto-advance
         
+        # DEBUG: Mostrar primeros puntos de la trayectoria
+        logger.info(f"[DEBUG] Primeros 5 puntos de trayectoria:")
+        for i in range(min(5, len(self._trajectory))):
+            p = self._trajectory[i]
+            logger.info(f"  Punto {i}: ({p[0]:.1f}, {p[1]:.1f})µm")
+        
         # Inicializar estado - SIEMPRE desde cero
         self._trajectory_index = 0
         self._trajectory_active = True
@@ -481,14 +487,30 @@ class TestService(QObject):
             logger.warning("[TestService] Intento de reanudar trayectoria no pausada.")
             return
 
-        logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Avanzando al siguiente punto.")
-        self._trajectory_paused = False
-        self._trajectory_index += 1  # Avanzar al siguiente punto
-        self.status_changed.emit(f"Reanudando trayectoria. Moviendo a punto {self._trajectory_index + 1}.")
+        try:
+            logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Avanzando al siguiente punto.")
+            
+            # DEBUG: Estado ANTES de cambios
+            logger.info(f"[DEBUG-RESUME] ANTES: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}")
+            
+            # PRIMERO: Actualizar todas las variables de estado
+            self._trajectory_paused = False
+            self._trajectory_index += 1  # Avanzar al siguiente punto
+            
+            # CRÍTICO: Resetear flag de punto aceptado para el nuevo punto
+            # Sin esto, _accept_trajectory_point() detecta que el punto ya fue aceptado
+            # y el sistema queda atascado indefinidamente
+            self._point_accepted = False
 
-        # Resetear integrales al reanudar para evitar wind-up
-        self._dual_integral_a = 0.0
-        self._dual_integral_b = 0.0
+            # Resetear integrales al reanudar para evitar wind-up
+            self._dual_integral_a = 0.0
+            self._dual_integral_b = 0.0
+            
+            # DEBUG: Estado DESPUÉS de cambios
+            logger.info(f"[DEBUG-RESUME] DESPUÉS: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}")
+            
+        except Exception as e:
+            logger.error(f"❌ ERROR CRÍTICO en resume_trajectory: {e}", exc_info=True)
     
     def _auto_advance_to_next_point(self):
         """Avanza automáticamente al siguiente punto (modo auto_advance)."""
@@ -503,6 +525,13 @@ class TestService(QObject):
         # Avanzar al siguiente punto
         self._trajectory_index += 1
         
+        # DEBUG: Mostrar nuevo índice y punto objetivo
+        if self._trajectory_index < len(self._trajectory):
+            next_point = self._trajectory[self._trajectory_index]
+            logger.info(f"[DEBUG] Nuevo índice: {self._trajectory_index}, Punto objetivo: ({next_point[0]:.1f}, {next_point[1]:.1f})µm")
+        else:
+            logger.info(f"[DEBUG] Nuevo índice: {self._trajectory_index} >= {len(self._trajectory)} (trayectoria completada)")
+        
         # Resetear flag de punto aceptado para el nuevo punto
         self._point_accepted = False
         
@@ -512,6 +541,35 @@ class TestService(QObject):
         # Resetear integrales
         self._dual_integral_a = 0.0
         self._dual_integral_b = 0.0
+    
+    def _get_adaptive_pwm_limit(self, axis: str, error_um: float) -> float:
+        """Calcula PWM adaptativo según error, manteniendo mínimo de 80.
+        
+        IMPORTANTE: PWM adaptativo SOLO funciona en modo AUTO (TestTab).
+        En modo MANUAL (ImgRecTab), el sistema se detiene completamente durante
+        captura de microscopía, y PWM reducido es insuficiente para vencer inercia.
+        
+        - Modo MANUAL: PWM completo siempre
+        - Modo AUTO: PWM adaptativo según error
+        """
+        base_umax = self._controller_a.U_max if axis == 'x' else self._controller_b.U_max
+        
+        # Desactivar PWM adaptativo en modo MANUAL
+        # En ImgRecTab, sistema se detiene completamente → necesita PWM completo
+        if not self._trajectory_auto_advance:
+            return base_umax
+        
+        # PWM adaptativo SOLO en modo AUTO (TestTab)
+        # Umbrales ajustados para distancias típicas de ~306 µm entre puntos
+        if abs(error_um) > 300:
+            # Error grande: PWM completo para velocidad máxima
+            return base_umax
+        elif abs(error_um) > 150:
+            # Error medio: 70% de PWM (pero mínimo 80)
+            return max(80, base_umax * 0.7)
+        else:
+            # Aproximación final: PWM mínimo (80)
+            return 80
     
     def _detect_axis_lock(self, current_idx: int) -> Tuple[bool, bool]:
         """Detecta si algún eje debe bloquearse."""
@@ -556,6 +614,13 @@ class TestService(QObject):
             target = self._trajectory[self._trajectory_index]
             target_x, target_y = target[0], target[1]
             
+            # DEBUG: Log cada 100 ciclos para no saturar
+            if not hasattr(self, '_debug_counter'):
+                self._debug_counter = 0
+            self._debug_counter += 1
+            if self._debug_counter % 100 == 0:
+                logger.info(f"[DEBUG] Índice={self._trajectory_index}, Objetivo=({target_x:.1f}, {target_y:.1f})µm, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}")
+            
             # Detectar bloqueo de ejes
             lock_x, lock_y = self._detect_axis_lock(self._trajectory_index)
             
@@ -586,7 +651,8 @@ class TestService(QObject):
                         else:
                             pwm_a = int(pwm_base)
                         
-                        U_max = int(self._controller_a.U_max)
+                        # PWM adaptativo con mínimo 80
+                        U_max = int(self._get_adaptive_pwm_limit('x', error_x_um))
                         if abs(pwm_a) > U_max:
                             self._dual_integral_a -= error_adc * Ts
                             pwm_a = max(-U_max, min(U_max, pwm_a))
@@ -615,7 +681,8 @@ class TestService(QObject):
                         else:
                             pwm_b = int(pwm_base)
                         
-                        U_max = int(self._controller_b.U_max)
+                        # PWM adaptativo con mínimo 80
+                        U_max = int(self._get_adaptive_pwm_limit('y', error_y_um))
                         if abs(pwm_b) > U_max:
                             self._dual_integral_b -= error_adc * Ts
                             pwm_b = max(-U_max, min(U_max, pwm_b))
@@ -650,15 +717,13 @@ class TestService(QObject):
                 self._traj_near_attempts += 1
                 
                 if self._traj_settling_counter >= SETTLING_CYCLES:
-                    # CORRECCIÓN ÚNICA: Antes de aceptar, corregir eje bloqueado si error > 100µm
-                    if lock_x and abs(error_x_um) > 100.0 and not self._correcting_locked_axis:
-                        self._start_locked_axis_correction('x', target_x, error_x_um)
-                        return
-                    elif lock_y and abs(error_y_um) > 100.0 and not self._correcting_locked_axis:
-                        self._start_locked_axis_correction('y', target_y, error_y_um)
-                        return
+                    # CORRECCIÓN DESHABILITADA: Causa oscilación en ImgRecTab
+                    # Si hay deriva en eje bloqueado, se acepta con error (tolerancia 100µm)
+                    # La corrección intenta mover un eje que NO debe moverse, causando inestabilidad
                     
-                    self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um, "✅ Estable")
+                    # Verificar flag ANTES de aceptar para prevenir llamadas duplicadas
+                    if not self._point_accepted:
+                        self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um, "✅ Estable")
                 else:
                     self._send_command(f"A,{pwm_a},{pwm_b}")
                     
@@ -667,9 +732,11 @@ class TestService(QObject):
                 self._traj_near_attempts += 1
                 
                 if self._traj_near_attempts >= MAX_ATTEMPTS_PER_POINT:
-                    self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um,
-                                                  f"⚠️ Fallback ({self._traj_near_attempts} intentos)")
-                    logger.warning(f"⚠️ Punto {self._trajectory_index + 1} aceptado con fallback")
+                    # CRÍTICO: Verificar flag ANTES de aceptar para prevenir llamadas duplicadas
+                    if not self._point_accepted:
+                        self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um,
+                                                      f"⚠️ Fallback ({self._traj_near_attempts} intentos)")
+                        logger.warning(f"⚠️ Punto {self._trajectory_index + 1} aceptado con fallback")
                 else:
                     self._send_command(f"A,{pwm_a},{pwm_b}")
             else:

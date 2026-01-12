@@ -19,6 +19,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 
 # SmartFocusScorer viene de core.autofocus (versión unificada), re-exportado por img_analysis
 from img_analysis import SmartFocusScorer, FocusResult
+from utils.parameter_manager import get_parameter_manager
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -141,6 +142,7 @@ class ImgAnalysisTab(QWidget):
         self._layers = {}
         
         self._setup_ui()
+        self._load_default_parameters()
         logger.debug("ImgAnalysisTab (U2-Net) inicializado")
     
     def _setup_ui(self):
@@ -267,6 +269,23 @@ class ImgAnalysisTab(QWidget):
         
         splitter.setSizes([200, 500, 150])
         main_layout.addWidget(splitter, 1)
+        
+        self.setLayout(main_layout)
+    
+    def _load_default_parameters(self):
+        """Carga parámetros por defecto desde ParameterManager."""
+        try:
+            pm = get_parameter_manager()
+            detect_defaults = pm.get_detection_defaults()
+            
+            if self.spin_threshold:
+                self.spin_threshold.setValue(detect_defaults.get('threshold', 0.5))
+            if self.spin_min_area:
+                self.spin_min_area.setValue(detect_defaults.get('min_area', 500))
+            
+            logger.info("✅ Parámetros de detección cargados en ImgAnalysisTab")
+        except Exception as e:
+            logger.warning(f"No se pudieron cargar parámetros de detección: {e}")
     
     def _load_images(self):
         """Carga imágenes de una carpeta."""

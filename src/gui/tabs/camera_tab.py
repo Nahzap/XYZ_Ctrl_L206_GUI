@@ -32,6 +32,7 @@ from gui.utils.camera_tab_ui_builder import (
 )
 from core.services import CameraOrchestrator
 from core.models import AutofocusConfig
+from utils.parameter_manager import get_parameter_manager
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -95,9 +96,6 @@ class CameraTab(QWidget):
         
         # Configurar UI
         self._setup_ui()
-        
-        # Conectar señales del servicio
-        self._connect_service_signals()
         
         # Conectar señales del orchestrator
         if self.orchestrator:
@@ -169,6 +167,9 @@ class CameraTab(QWidget):
         
         # Mapear widgets al objeto PRIMERO
         self._map_widgets()
+        
+        # Cargar parámetros por defecto
+        self._load_default_parameters()
         
         # Conectar botón de calibración DESPUÉS del mapeo
         self.cfocus_calibrate_btn.clicked.connect(self._on_calibrate_cfocus)
@@ -255,23 +256,49 @@ class CameraTab(QWidget):
         self.estimated_images_label = self._widgets.get('estimated_images_label')
         self.cfocus_status_label = self._widgets.get('cfocus_status_label')
         
-        # Z-Stack widgets
-        self.capture_zstack_radio = self._widgets.get('capture_zstack_radio')
-        self.zstack_n_images_spin = self._widgets.get('zstack_n_images_spin')
-        self.zstack_z_step_spin = self._widgets.get('zstack_z_step_spin')
-        self.zstack_save_json_check = self._widgets.get('zstack_save_json_check')
-        self.zstack_cfocus_range_label = self._widgets.get('zstack_cfocus_range_label')
-        
-        # Log
+        # Terminal
         self.camera_terminal = self._widgets.get('camera_terminal')
-    
-    def _connect_service_signals(self):
-        """Conecta señales del CameraService con handlers de UI."""
-        if self.camera_service is None:
-            return
         
         # Solo conectar error_occurred que no está en main.py
         self.camera_service.error_occurred.connect(self._on_error)
+    
+    def _load_default_parameters(self):
+        """Carga parámetros por defecto desde ParameterManager."""
+        try:
+            pm = get_parameter_manager()
+            
+            # Cargar parámetros de microscopía
+            micro_defaults = pm.get_microscopy_defaults()
+            if self.class_name_input:
+                self.class_name_input.setText(micro_defaults.get('class_name', 'Quillaja_Saponaria'))
+            if self.delay_before_input:
+                # delay_before_input es QDoubleSpinBox, no QLineEdit
+                delay_val = micro_defaults.get('delays', {}).get('before_capture', 700)
+                self.delay_before_input.setValue(float(delay_val) / 1000.0)  # Convertir ms a segundos
+            if self.delay_after_input:
+                delay_val = micro_defaults.get('delays', {}).get('after_capture', 100)
+                self.delay_after_input.setValue(float(delay_val))
+            
+            # Cargar parámetros de autofoco
+            af_config = micro_defaults.get('autofocus', {})
+            if self.autofocus_enabled_cb:
+                self.autofocus_enabled_cb.setChecked(af_config.get('enabled', True))
+            if self.min_pixels_spin:
+                self.min_pixels_spin.setValue(af_config.get('area_range', {}).get('min', 5000))
+            if self.max_pixels_spin:
+                self.max_pixels_spin.setValue(af_config.get('area_range', {}).get('max', 120000))
+            
+            # Cargar parámetros de detección
+            detect_defaults = pm.get_detection_defaults()
+            filters = detect_defaults.get('morphological_filters', {})
+            if self.circularity_spin:
+                self.circularity_spin.setValue(filters.get('min_circularity', 0.42))
+            if self.aspect_ratio_spin:
+                self.aspect_ratio_spin.setValue(filters.get('min_aspect_ratio', 0.40))
+            
+            logger.info("✅ Parámetros de microscopía cargados desde configuración")
+        except Exception as e:
+            logger.warning(f"No se pudieron cargar parámetros de microscopía: {e}")
     
     def _connect_orchestrator_signals(self):
         """Conecta señales del CameraOrchestrator con handlers de UI."""
@@ -725,6 +752,28 @@ class CameraTab(QWidget):
                 'z_step_coarse': self.z_step_coarse_spin.value(),
                 'z_step_fine': self.z_step_fine_spin.value()
             }
+            
+            # Guardar parámetros para autocompletado futuro
+            try:
+                pm = get_parameter_manager()
+                pm.update_microscopy(
+                    class_name=config['class_name'],
+                    total_points=config['n_points'],
+                    autofocus_enabled=config['autofocus_enabled'],
+                    af_min=config['min_pixels'],
+                    af_max=config['max_pixels'],
+                    channels=''.join([c for c in ['R','G','B'] if config['channels'][c]]),
+                    format=config['img_format'].upper(),
+                    bit_depth=16 if config['use_16bit'] else 8,
+                    delay_before=int(config['delay_before']),
+                    delay_after=int(config['delay_after'])
+                )
+                pm.update_detection(
+                    min_circularity=self.circularity_spin.value(),
+                    min_aspect_ratio=self.aspect_ratio_spin.value()
+                )
+            except Exception as e:
+                logger.warning(f"No se pudieron guardar parámetros: {e}")
         except ValueError as e:
             self.log_message(f"❌ Error en parámetros: {e}")
             return
@@ -795,12 +844,26 @@ class CameraTab(QWidget):
     def _on_connect_cfocus(self):
         """Handler para conectar C-Focus."""
         if self.parent_gui:
+            # DESHABILITAR BOTÓN INMEDIATAMENTE para evitar múltiples clics
+            self.cfocus_connect_btn.setEnabled(False)
+            self.cfocus_connect_btn.setText("Conectando...")
+            self.log_message("🔌 Conectando C-Focus...")
+            
+            # Forzar actualización de UI antes de operación bloqueante
+            from PyQt5.QtWidgets import QApplication
+            QApplication.processEvents()
+            
             success = self.parent_gui.connect_cfocus()
+            
             if success:
-                self.cfocus_connect_btn.setEnabled(False)
                 self.cfocus_disconnect_btn.setEnabled(True)
-                self.cfocus_calibrate_btn.setEnabled(True)  # Habilitar calibración
+                self.cfocus_calibrate_btn.setEnabled(True)
                 self.update_cfocus_status(True, "Conectado")
+                self.cfocus_connect_btn.setText("Conectar C-Focus")
+            else:
+                # Re-habilitar si falla
+                self.cfocus_connect_btn.setEnabled(True)
+                self.cfocus_connect_btn.setText("Conectar C-Focus")
     
     def _on_disconnect_cfocus(self):
         """Handler para desconectar C-Focus."""

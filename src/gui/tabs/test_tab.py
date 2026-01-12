@@ -40,6 +40,7 @@ from gui.utils.test_tab_ui_builder import (
 )
 from core.services.calibration_analysis_service import CalibrationAnalysisService
 from gui.windows import MatplotlibWindow
+from utils.parameter_manager import get_parameter_manager
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -110,6 +111,7 @@ class TestTab(QWidget):
         
         self._setup_ui()
         self._map_widgets()
+        self._load_default_parameters()
         logger.debug("TestTab inicializado con TestService")
     
     def _connect_service_signals(self):
@@ -272,6 +274,47 @@ class TestTab(QWidget):
         self.zigzag_start_btn = self._widgets.get('zigzag_start_btn')
         self.zigzag_stop_btn = self._widgets.get('zigzag_stop_btn')
     
+    def _load_default_parameters(self):
+        """Carga parámetros por defecto desde ParameterManager."""
+        try:
+            pm = get_parameter_manager()
+            defaults = pm.get_trajectory_defaults()
+            
+            # Cargar valores en los widgets
+            if self.points_input:
+                self.points_input.setText(str(defaults.get('points', 1024)))
+            if self.x_start_input:
+                self.x_start_input.setText(str(defaults.get('x_range', {}).get('min', 10000.0)))
+            if self.x_end_input:
+                self.x_end_input.setText(str(defaults.get('x_range', {}).get('max', 19500.0)))
+            if self.y_start_input:
+                self.y_start_input.setText(str(defaults.get('y_range', {}).get('min', 10000.0)))
+            if self.y_end_input:
+                self.y_end_input.setText(str(defaults.get('y_range', {}).get('max', 19500.0)))
+            if self.delay_input:
+                self.delay_input.setText(str(defaults.get('delay_between_points', 0.5)))
+            
+            logger.info("✅ Parámetros de trayectoria cargados desde configuración")
+        except Exception as e:
+            logger.warning(f"No se pudieron cargar parámetros por defecto: {e}")
+    
+    def _save_trajectory_parameters(self, n_points: int, x_min: float, x_max: float,
+                                    y_min: float, y_max: float, delay: float):
+        """Guarda parámetros de trayectoria en ParameterManager."""
+        try:
+            pm = get_parameter_manager()
+            pm.update_trajectory(
+                points=n_points,
+                x_min=x_min,
+                x_max=x_max,
+                y_min=y_min,
+                y_max=y_max,
+                delay=delay
+            )
+            logger.info("📝 Parámetros de trayectoria guardados")
+        except Exception as e:
+            logger.warning(f"No se pudieron guardar parámetros: {e}")
+    
     # ============================================================
     # MÉTODOS DE ACCIÓN (callbacks de botones)
     # ============================================================
@@ -300,6 +343,9 @@ class TestTab(QWidget):
             step_delay = float(self.delay_input.text())
             
             logger.info(f"Parámetros: {n_points} puntos, X=[{x_min},{x_max}], Y=[{y_min},{y_max}], delay={step_delay}s")
+            
+            # Guardar parámetros para autocompletado futuro
+            self._save_trajectory_parameters(n_points, x_min, x_max, y_min, y_max, step_delay)
             
             # Generar trayectoria
             result = self.trajectory_gen.generate_zigzag_by_points(
