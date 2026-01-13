@@ -336,6 +336,7 @@ class ArduinoGUI(QMainWindow):
                 and getattr(self.test_tab, 'controller_b', None) is not None
             ),
             test_service=self.test_tab.test_service,
+            send_command=self.send_command,
         )
 
         # Conectar señales de microscopía

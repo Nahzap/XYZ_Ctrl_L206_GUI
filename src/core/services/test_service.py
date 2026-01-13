@@ -93,6 +93,7 @@ class TestService(QObject):
         
         # Estado de control dual
         self._dual_active = False
+        self._dual_paused = False  # NUEVO: Para pausar control XY durante captura
         self._dual_timer: Optional[QTimer] = None
         self._dual_ref_a_um = 0.0
         self._dual_ref_b_um = 0.0
@@ -242,8 +243,16 @@ class TestService(QObject):
         logger.info("TestService: Control dual detenido")
     
     def _execute_dual_control_step(self):
-        """Ejecuta un ciclo del control dual PI."""
+        """Ejecuta un paso del control dual."""
         try:
+            if not self._dual_active or self._send_command is None or self._get_sensor_value is None:
+                return
+            
+            # CRÍTICO: Si está pausado, NO enviar comandos (mantiene posición actual)
+            if self._dual_paused:
+                # NO hacer logging aquí porque se llama 100 veces por segundo
+                return
+            
             current_time = time.time()
             Ts = current_time - self._dual_last_time
             self._dual_last_time = current_time
@@ -357,6 +366,11 @@ class TestService(QObject):
     def is_dual_control_active(self) -> bool:
         """Retorna si el control dual está activo."""
         return self._dual_active
+    
+    @property
+    def is_dual_control_paused(self) -> bool:
+        """Retorna si el control dual está pausado."""
+        return self._dual_paused
     
     # =========================================================================
     # EJECUCIÓN DE TRAYECTORIA
@@ -475,9 +489,53 @@ class TestService(QObject):
         self._trajectory_paused = True
         logger.info("[TestService] Trayectoria pausada - manteniendo posición")
     
-    def resume_trajectory(self):
+    def pause_dual_control(self):
         """
-        Reanuda la ejecución de la trayectoria, avanzando al siguiente punto.
+        Pausa temporalmente el control dual XY (mantiene posición).
+        Usado durante captura multifocal para evitar movimiento XY.
+        
+        CRÍTICO: DETIENE el timer para que NO se ejecute _execute_dual_control_step
+        y NO se envíen comandos A,x,y durante el autofoco Z.
+        """
+        if not self._dual_active:
+            logger.warning("[TestService] ⚠️  No se puede pausar: control dual NO está activo")
+            return
+        
+        if self._dual_paused:
+            logger.warning("[TestService] ⚠️  Control dual YA está pausado")
+            return
+        
+        # CRÍTICO: DETENER el timer para que NO se ejecuten comandos XY
+        if self._dual_timer:
+            self._dual_timer.stop()
+            logger.info("[TestService] 🛑 Timer del control dual XY DETENIDO")
+        
+        # Activar BRAKE para mantener posición
+        if self._send_command:
+            self._send_command('B')  # Freno activo
+            time.sleep(0.02)
+            self._send_command('A,0,0')  # PWM a 0
+            logger.info("[TestService] 🔒 BRAKE activado - motores XY bloqueados")
+        
+        self._dual_paused = True
+        logger.info("[TestService] ⏸️  Control dual XY PAUSADO COMPLETAMENTE (timer detenido + BRAKE activo)")
+    
+    def resume_dual_control(self):
+        """
+        Reanuda el control dual XY después de captura.
+        """
+        if self._dual_active and self._dual_paused:
+            self._dual_paused = False
+            logger.info("[TestService] ▶️  Control dual XY REANUDADO")
+    
+    def resume_trajectory(self, advance_to_next: bool = True):
+        """
+        Reanuda la ejecución de la trayectoria.
+        
+        Args:
+            advance_to_next: Si True, avanza al siguiente punto (después de captura).
+                           Si False, reanuda en el punto actual (pausa manual).
+        
         Este método es llamado explícitamente por MicroscopyService.
         """
         if not self._trajectory_active:
@@ -488,23 +546,33 @@ class TestService(QObject):
             return
 
         try:
-            logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Avanzando al siguiente punto.")
+            if advance_to_next:
+                logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Avanzando al siguiente punto.")
+            else:
+                logger.info("[TestService] ▶️  Comando RESUME_TRAJECTORY recibido. Reanudando en punto actual (pausa manual).")
             
             # DEBUG: Estado ANTES de cambios
-            logger.info(f"[DEBUG-RESUME] ANTES: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}")
+            logger.info(f"[DEBUG-RESUME] ANTES: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}, advance={advance_to_next}")
             
             # PRIMERO: Actualizar todas las variables de estado
             self._trajectory_paused = False
-            self._trajectory_index += 1  # Avanzar al siguiente punto
             
-            # CRÍTICO: Resetear flag de punto aceptado para el nuevo punto
-            # Sin esto, _accept_trajectory_point() detecta que el punto ya fue aceptado
-            # y el sistema queda atascado indefinidamente
-            self._point_accepted = False
+            if advance_to_next:
+                # Avanzar al siguiente punto (después de captura completada)
+                self._trajectory_index += 1
+                
+                # CRÍTICO: Resetear flag de punto aceptado para el nuevo punto
+                # Sin esto, _accept_trajectory_point() detecta que el punto ya fue aceptado
+                # y el sistema queda atascado indefinidamente
+                self._point_accepted = False
 
-            # Resetear integrales al reanudar para evitar wind-up
-            self._dual_integral_a = 0.0
-            self._dual_integral_b = 0.0
+                # Resetear integrales al reanudar para evitar wind-up
+                self._dual_integral_a = 0.0
+                self._dual_integral_b = 0.0
+            else:
+                # Pausa manual: NO avanzar, solo reanudar en punto actual
+                # NO resetear _point_accepted porque el punto ya fue alcanzado
+                logger.info("[TestService] Reanudando en punto actual sin avanzar")
             
             # DEBUG: Estado DESPUÉS de cambios
             logger.info(f"[DEBUG-RESUME] DESPUÉS: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}")

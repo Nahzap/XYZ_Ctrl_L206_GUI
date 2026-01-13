@@ -3,7 +3,7 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-01-12T13:25:19.358123",
+  "last_updated": "2026-01-12T17:00:15.932342",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
     "points": 1024,
@@ -39,7 +39,7 @@
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 5000,
+        "min": 6000,
         "max": 120000,
         "unit": "px"
       }
@@ -58,7 +58,7 @@
       "TIFF",
       "JPEG"
     ],
-    "bit_depth": 16,
+    "bit_depth": 8,
     "bit_depth_available": [
       8,
       16
