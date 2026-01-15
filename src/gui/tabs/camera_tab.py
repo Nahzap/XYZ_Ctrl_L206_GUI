@@ -28,6 +28,7 @@ from gui.utils.camera_tab_ui_builder import (
     create_capture_section,
     create_microscopy_section,
     create_autofocus_section,
+    create_u2net_config_section,
     create_log_section
 )
 from core.services import CameraOrchestrator
@@ -159,6 +160,13 @@ class CameraTab(QWidget):
             self._on_test_detection, self._update_detection_params
         ))
         
+        # Sección 6.5: Configuración Detector U2NET
+        main_layout.addWidget(create_u2net_config_section(
+            self._widgets,
+            self._on_detection_mode_changed,
+            self._update_u2net_params
+        ))
+        
         # Sección 7: Log
         main_layout.addWidget(create_log_section(
             self._widgets,
@@ -255,6 +263,15 @@ class CameraTab(QWidget):
         self.roi_margin_spin = self._widgets.get('roi_margin_spin')
         self.estimated_images_label = self._widgets.get('estimated_images_label')
         self.cfocus_status_label = self._widgets.get('cfocus_status_label')
+        
+        # U2NET Config
+        self.detection_mode_combo = self._widgets.get('detection_mode_combo')
+        self.saliency_threshold_spin = self._widgets.get('saliency_threshold_spin')
+        self.adaptive_k_spin = self._widgets.get('adaptive_k_spin')
+        self.morph_kernel_combo = self._widgets.get('morph_kernel_combo')
+        self.clahe_clip_spin = self._widgets.get('clahe_clip_spin')
+        self.clahe_tile_combo = self._widgets.get('clahe_tile_combo')
+        self.u2net_status_label = self._widgets.get('u2net_status_label')
         
         # Terminal
         self.camera_terminal = self._widgets.get('camera_terminal')
@@ -926,11 +943,118 @@ class CameraTab(QWidget):
         self.camera_view_window.trigger_detection()
         self.log_message(f"🔍 TEST Detección - Área: [{self.min_pixels_spin.value()}-{self.max_pixels_spin.value()}] px")
     
+    def _on_detection_mode_changed(self):
+        """Callback cuando cambia el modo de detección (aplica presets)."""
+        from core.detection.u2net_detector import U2NetDetector, DetectionMode
+        
+        logger.info("[CameraTab] _on_detection_mode_changed() LLAMADO")
+        
+        detector = U2NetDetector.get_instance()
+        
+        mode_idx = self.detection_mode_combo.currentIndex()
+        mode_map = {0: DetectionMode.NORMAL, 1: DetectionMode.SENSITIVE, 2: DetectionMode.ROBUST}
+        mode = mode_map.get(mode_idx, DetectionMode.NORMAL)
+        
+        logger.info(f"[CameraTab] Cambiando modo a: {mode.value} (index={mode_idx})")
+        
+        # Aplicar preset del modo
+        detector.set_detection_mode(mode)
+        
+        # Actualizar UI con valores del preset (sin disparar callbacks)
+        self.saliency_threshold_spin.blockSignals(True)
+        self.adaptive_k_spin.blockSignals(True)
+        self.morph_kernel_combo.blockSignals(True)
+        self.clahe_clip_spin.blockSignals(True)
+        self.clahe_tile_combo.blockSignals(True)
+        
+        self.saliency_threshold_spin.setValue(detector.saliency_threshold)
+        self.adaptive_k_spin.setValue(detector.adaptive_k)
+        self.clahe_clip_spin.setValue(detector.clahe_clip_limit)
+        
+        kernel_map = {3: 0, 5: 1, 7: 2}
+        self.morph_kernel_combo.setCurrentIndex(kernel_map.get(detector.morph_kernel_size, 1))
+        
+        tile_map = {(4, 4): 0, (8, 8): 1, (16, 16): 2}
+        self.clahe_tile_combo.setCurrentIndex(tile_map.get(detector.clahe_tile_size, 1))
+        
+        self.saliency_threshold_spin.blockSignals(False)
+        self.adaptive_k_spin.blockSignals(False)
+        self.morph_kernel_combo.blockSignals(False)
+        self.clahe_clip_spin.blockSignals(False)
+        self.clahe_tile_combo.blockSignals(False)
+        
+        # Actualizar label de estado
+        params = detector.get_parameters()
+        device_str = "GPU" if "cuda" in params['device'] else "CPU"
+        model_str = "U2NETP" if params['model_loaded'] else "Contornos"
+        self.u2net_status_label.setText(f"Modelo: {model_str} | Device: {device_str}")
+        
+        # Mostrar confirmación en UI y log
+        params = detector.get_parameters()
+        self.log_message(f"✅ Modo U2NET: {mode.value} | thr={params['saliency_threshold']:.2f}, k={params['adaptive_k']:.1f}")
+        logger.info(f"[CameraTab] ✅ Modo aplicado: {mode.value}, thr={params['saliency_threshold']:.2f}, "
+                   f"k={params['adaptive_k']:.1f}, kernel={params['morph_kernel_size']}")
+    
+    def _update_u2net_params(self, restore_defaults=False):
+        """Actualiza parámetros individuales del detector U2NET."""
+        from core.detection.u2net_detector import U2NetDetector, DetectionMode
+        
+        logger.info(f"[CameraTab] _update_u2net_params() LLAMADO (restore_defaults={restore_defaults})")
+        
+        detector = U2NetDetector.get_instance()
+        
+        if restore_defaults:
+            # Llamar al callback de cambio de modo para aplicar preset
+            logger.info("[CameraTab] Restaurando defaults...")
+            self._on_detection_mode_changed()
+            return
+        
+        # Actualizar parámetros individuales desde UI
+        # Esto permite edición libre sin importar el modo
+        saliency_thr = self.saliency_threshold_spin.value()
+        adaptive_k = self.adaptive_k_spin.value()
+        clahe_clip = self.clahe_clip_spin.value()
+        
+        logger.info(f"[CameraTab] Leyendo valores UI: thr={saliency_thr:.2f}, k={adaptive_k:.1f}, clip={clahe_clip:.1f}")
+        
+        # Mapear combo a tamaño de kernel
+        kernel_idx = self.morph_kernel_combo.currentIndex()
+        kernel_sizes = [3, 5, 7]
+        morph_kernel = kernel_sizes[kernel_idx]
+        
+        # Mapear combo a tile size
+        tile_idx = self.clahe_tile_combo.currentIndex()
+        tile_sizes = [(4, 4), (8, 8), (16, 16)]
+        clahe_tiles = tile_sizes[tile_idx]
+        
+        logger.info(f"[CameraTab] Aplicando parámetros: thr={saliency_thr:.2f}, k={adaptive_k:.1f}, "
+                   f"kernel={morph_kernel}, clip={clahe_clip:.1f}, tiles={clahe_tiles}")
+        
+        detector.set_advanced_parameters(
+            saliency_threshold=saliency_thr,
+            adaptive_k=adaptive_k,
+            morph_kernel_size=morph_kernel,
+            clahe_clip_limit=clahe_clip,
+            clahe_tile_size=clahe_tiles
+        )
+        
+        self.log_message(f"✅ Parámetros U2NET actualizados: thr={saliency_thr:.2f}, k={adaptive_k:.1f}")
+        logger.info(f"[CameraTab] ✅ Parámetros U2NET aplicados correctamente")
+    
     def _update_detection_params(self):
         """Actualiza parámetros de detección y autofocus."""
+        from core.detection.u2net_detector import U2NetDetector
+        
+        min_area = self.min_pixels_spin.value()
+        max_area = self.max_pixels_spin.value()
+        
+        # Actualizar min_area y max_area en el detector U2NET
+        detector = U2NetDetector.get_instance()
+        detector.set_parameters(min_area=min_area, max_area=max_area)
+        logger.info(f"[CameraTab] Área actualizada en U2NET: min={min_area}, max={max_area}")
+        
+        # Actualizar ventana de cámara
         if self.camera_view_window:
-            min_area = self.min_pixels_spin.value()
-            max_area = self.max_pixels_spin.value()
             self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
         
         # Actualizar parámetros morfológicos usando orchestrator

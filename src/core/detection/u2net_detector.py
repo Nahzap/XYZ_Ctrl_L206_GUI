@@ -14,6 +14,7 @@ import logging
 import numpy as np
 import cv2
 from typing import Tuple, List, Dict, Optional
+from enum import Enum
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -29,6 +30,13 @@ except ImportError:
 
 # Importar modelo unificado
 from core.models.detected_object import DetectedObject
+
+
+class DetectionMode(Enum):
+    """Modos de detección preconfigurados."""
+    NORMAL = "normal"
+    SENSITIVE = "sensitive"  # Para polen/objetos pequeños
+    ROBUST = "robust"        # Para objetos grandes con ruido
 
 
 class U2NetDetector:
@@ -73,10 +81,17 @@ class U2NetDetector:
         self.device = None
         self.model_loaded = False
         
-        # Parámetros de detección
+        # Parámetros de detección (valores por defecto)
         self.min_area = 500  # Área mínima en píxeles
         self.max_area = 500000  # Área máxima en píxeles
-        self.saliency_threshold = 0.3  # Umbral de probabilidad (más bajo = más sensible)
+        self.saliency_threshold = 0.3  # Umbral de probabilidad
+        self.adaptive_k = 0.5  # Factor adaptativo para umbral
+        self.morph_kernel_size = 5  # Tamaño kernel morfológico
+        self.clahe_clip_limit = 2.0  # CLAHE clip limit
+        self.clahe_tile_size = (8, 8)  # CLAHE tile size
+        
+        # Modo de detección
+        self.detection_mode = DetectionMode.NORMAL
         
         # Cargar modelo
         self._load_model()
@@ -254,8 +269,8 @@ class U2NetDetector:
         else:
             gray = image.copy()
         
-        # CLAHE para mejorar contraste local (optimizado: clipLimit bajo para velocidad)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # CLAHE para mejorar contraste local (parámetros configurables)
+        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_tile_size)
         enhanced = clahe.apply(gray)
         
         # Sharpening suave para objetos borrosos (kernel optimizado)
@@ -318,8 +333,8 @@ class U2NetDetector:
         sal_std = float(np.std(saliency))
         
         # Calcular umbral adaptativo: media + k*std, con límites
-        # k=0.5 para sensibilidad media (ajustable)
-        adaptive_threshold = sal_mean + 0.5 * sal_std
+        # k configurable según modo de detección
+        adaptive_threshold = sal_mean + self.adaptive_k * sal_std
         
         # Límites: mínimo 0.15 (muy sensible), máximo 0.5 (conservador)
         adaptive_threshold = max(0.15, min(0.5, adaptive_threshold))
@@ -339,8 +354,9 @@ class U2NetDetector:
         pixels_above = np.sum(binary > 0)
         logger.debug(f"[Extract] Pixels above threshold: {pixels_above} ({100*pixels_above/binary.size:.1f}%)")
         
-        # Operaciones morfológicas para limpiar
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Operaciones morfológicas para limpiar (kernel configurable)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                          (self.morph_kernel_size, self.morph_kernel_size))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
         
@@ -475,9 +491,69 @@ class U2NetDetector:
         
         return saliency, objects
     
+    def set_detection_mode(self, mode: DetectionMode):
+        """Cambia el modo de detección y aplica parámetros preconfigurados."""
+        self.detection_mode = mode
+        self._apply_mode_parameters()
+        logger.info(f"[U2NetDetector] Modo cambiado a: {mode.value}")
+    
+    def _apply_mode_parameters(self):
+        """Aplica parámetros según el modo activo."""
+        if self.detection_mode == DetectionMode.SENSITIVE:
+            # POLEN / OBJETOS PEQUEÑOS
+            self.min_area = 100
+            self.saliency_threshold = 0.15
+            self.adaptive_k = 0.3
+            self.morph_kernel_size = 3
+            self.clahe_clip_limit = 3.5
+            self.clahe_tile_size = (4, 4)
+            logger.info("[U2NetDetector] Parámetros SENSIBLE aplicados (polen/objetos pequeños)")
+            
+        elif self.detection_mode == DetectionMode.ROBUST:
+            # OBJETOS GRANDES CON RUIDO
+            self.min_area = 1000
+            self.saliency_threshold = 0.35
+            self.adaptive_k = 0.7
+            self.morph_kernel_size = 7
+            self.clahe_clip_limit = 2.0
+            self.clahe_tile_size = (8, 8)
+            logger.info("[U2NetDetector] Parámetros ROBUSTO aplicados (objetos grandes)")
+            
+        else:  # NORMAL
+            self.min_area = 500
+            self.saliency_threshold = 0.3
+            self.adaptive_k = 0.5
+            self.morph_kernel_size = 5
+            self.clahe_clip_limit = 2.0
+            self.clahe_tile_size = (8, 8)
+            logger.info("[U2NetDetector] Parámetros NORMAL aplicados")
+    
+    def set_advanced_parameters(self, 
+                               saliency_threshold: float = None,
+                               adaptive_k: float = None,
+                               morph_kernel_size: int = None,
+                               clahe_clip_limit: float = None,
+                               clahe_tile_size: tuple = None):
+        """Actualiza parámetros avanzados de detección."""
+        if saliency_threshold is not None:
+            self.saliency_threshold = np.clip(saliency_threshold, 0.1, 0.5)
+        if adaptive_k is not None:
+            self.adaptive_k = np.clip(adaptive_k, 0.1, 1.0)
+        if morph_kernel_size is not None:
+            self.morph_kernel_size = morph_kernel_size
+        if clahe_clip_limit is not None:
+            self.clahe_clip_limit = np.clip(clahe_clip_limit, 1.0, 5.0)
+        if clahe_tile_size is not None:
+            self.clahe_tile_size = clahe_tile_size
+        
+        logger.info(f"[U2NetDetector] Parámetros actualizados: "
+                   f"sal_thr={self.saliency_threshold:.2f}, k={self.adaptive_k:.2f}, "
+                   f"kernel={self.morph_kernel_size}, clahe_clip={self.clahe_clip_limit:.1f}, "
+                   f"clahe_tiles={self.clahe_tile_size}")
+    
     def set_parameters(self, min_area: int = None, max_area: int = None, 
                        saliency_threshold: float = None):
-        """Actualiza parámetros de detección."""
+        """Actualiza parámetros de detección (legacy compatibility)."""
         if min_area is not None:
             self.min_area = min_area
         if max_area is not None:
@@ -492,3 +568,18 @@ class U2NetDetector:
     def get_device(self) -> str:
         """Retorna el dispositivo usado (cuda/cpu)."""
         return str(self.device) if self.device else "cpu (fallback)"
+    
+    def get_parameters(self) -> Dict:
+        """Retorna parámetros actuales del detector."""
+        return {
+            'mode': self.detection_mode.value,
+            'min_area': self.min_area,
+            'max_area': self.max_area,
+            'saliency_threshold': self.saliency_threshold,
+            'adaptive_k': self.adaptive_k,
+            'morph_kernel_size': self.morph_kernel_size,
+            'clahe_clip_limit': self.clahe_clip_limit,
+            'clahe_tile_size': self.clahe_tile_size,
+            'model_loaded': self.model_loaded,
+            'device': self.get_device()
+        }

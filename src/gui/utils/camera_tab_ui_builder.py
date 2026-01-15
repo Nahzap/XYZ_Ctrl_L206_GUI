@@ -703,6 +703,141 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     return group
 
 
+def create_u2net_config_section(widgets: dict, mode_change_cb, update_params_cb) -> QGroupBox:
+    """
+    Crea la sección de configuración del detector U2NET.
+    
+    Args:
+        widgets: Dict donde almacenar referencias a widgets
+        update_params_cb: Callback para actualizar parámetros del detector
+        
+    Returns:
+        QGroupBox configurado
+    """
+    group = QGroupBox("🎛️ Opciones Detector U2NET")
+    layout = QVBoxLayout()
+    
+    # Modo de detección (presets)
+    mode_layout = QHBoxLayout()
+    mode_layout.addWidget(QLabel("Modo de Detección:"))
+    
+    widgets['detection_mode_combo'] = QComboBox()
+    widgets['detection_mode_combo'].addItems(["Normal", "Sensible (Polen)", "Robusto"])
+    widgets['detection_mode_combo'].setToolTip(
+        "Presets optimizados:\n"
+        "• Normal: Objetos medianos-grandes, buen contraste\n"
+        "• Sensible: Polen/objetos pequeños, bajo contraste\n"
+        "• Robusto: Objetos grandes con ruido de fondo"
+    )
+    widgets['detection_mode_combo'].setFixedWidth(180)
+    widgets['detection_mode_combo'].currentIndexChanged.connect(mode_change_cb)
+    mode_layout.addWidget(widgets['detection_mode_combo'])
+    mode_layout.addStretch()
+    layout.addLayout(mode_layout)
+    
+    # Parámetros avanzados
+    advanced_form = QGridLayout()
+    
+    # Fila 0: Umbral de Saliencia
+    advanced_form.addWidget(QLabel("Umbral Saliencia:"), 0, 0)
+    widgets['saliency_threshold_spin'] = QDoubleSpinBox()
+    widgets['saliency_threshold_spin'].setRange(0.10, 0.50)
+    widgets['saliency_threshold_spin'].setSingleStep(0.05)
+    widgets['saliency_threshold_spin'].setValue(0.30)
+    widgets['saliency_threshold_spin'].setDecimals(2)
+    widgets['saliency_threshold_spin'].setToolTip(
+        "Sensibilidad de detección (0.10-0.50)\n"
+        "• Menor valor = más objetos detectados\n"
+        "• Mayor valor = solo objetos muy salientes\n"
+        "Default: 0.30 (Normal), 0.15 (Sensible)"
+    )
+    widgets['saliency_threshold_spin'].setFixedWidth(100)
+    widgets['saliency_threshold_spin'].valueChanged.connect(lambda: update_params_cb())
+    advanced_form.addWidget(widgets['saliency_threshold_spin'], 0, 1)
+    
+    # Fila 0 col 2: Factor Adaptativo K
+    advanced_form.addWidget(QLabel("Factor Adaptativo K:"), 0, 2)
+    widgets['adaptive_k_spin'] = QDoubleSpinBox()
+    widgets['adaptive_k_spin'].setRange(0.1, 1.0)
+    widgets['adaptive_k_spin'].setSingleStep(0.1)
+    widgets['adaptive_k_spin'].setValue(0.5)
+    widgets['adaptive_k_spin'].setDecimals(1)
+    widgets['adaptive_k_spin'].setToolTip(
+        "Agresividad del umbral adaptativo (0.1-1.0)\n"
+        "Fórmula: threshold = mean + k×std\n"
+        "• Menor k = más sensible a variaciones\n"
+        "• Mayor k = más conservador\n"
+        "Default: 0.5 (Normal), 0.3 (Sensible)"
+    )
+    widgets['adaptive_k_spin'].setFixedWidth(100)
+    widgets['adaptive_k_spin'].valueChanged.connect(lambda: update_params_cb())
+    advanced_form.addWidget(widgets['adaptive_k_spin'], 0, 3)
+    
+    # Fila 1: Kernel Morfológico
+    advanced_form.addWidget(QLabel("Kernel Morfológico:"), 1, 0)
+    widgets['morph_kernel_combo'] = QComboBox()
+    widgets['morph_kernel_combo'].addItems(["3×3 (Sensible)", "5×5 (Normal)", "7×7 (Robusto)"])
+    widgets['morph_kernel_combo'].setCurrentIndex(1)  # 5×5 por defecto
+    widgets['morph_kernel_combo'].setToolTip(
+        "Tamaño del filtro morfológico\n"
+        "• 3×3: Preserva objetos pequeños (polen)\n"
+        "• 5×5: Balance general\n"
+        "• 7×7: Elimina ruido agresivamente"
+    )
+    widgets['morph_kernel_combo'].setFixedWidth(150)
+    widgets['morph_kernel_combo'].currentIndexChanged.connect(lambda: update_params_cb())
+    advanced_form.addWidget(widgets['morph_kernel_combo'], 1, 1)
+    
+    # Fila 1 col 2: CLAHE Clip Limit
+    advanced_form.addWidget(QLabel("CLAHE Clip Limit:"), 1, 2)
+    widgets['clahe_clip_spin'] = QDoubleSpinBox()
+    widgets['clahe_clip_spin'].setRange(1.0, 5.0)
+    widgets['clahe_clip_spin'].setSingleStep(0.5)
+    widgets['clahe_clip_spin'].setValue(2.0)
+    widgets['clahe_clip_spin'].setDecimals(1)
+    widgets['clahe_clip_spin'].setToolTip(
+        "Intensidad de mejora de contraste (1.0-5.0)\n"
+        "• Mayor valor = más contraste local\n"
+        "• Útil para objetos con bajo contraste\n"
+        "Default: 2.0 (Normal), 3.5 (Sensible)"
+    )
+    widgets['clahe_clip_spin'].setFixedWidth(100)
+    widgets['clahe_clip_spin'].valueChanged.connect(lambda: update_params_cb())
+    advanced_form.addWidget(widgets['clahe_clip_spin'], 1, 3)
+    
+    # Fila 2: CLAHE Tile Size
+    advanced_form.addWidget(QLabel("CLAHE Tile Size:"), 2, 0)
+    widgets['clahe_tile_combo'] = QComboBox()
+    widgets['clahe_tile_combo'].addItems(["4×4 (Detalle)", "8×8 (Normal)", "16×16 (Global)"])
+    widgets['clahe_tile_combo'].setCurrentIndex(1)  # 8×8 por defecto
+    widgets['clahe_tile_combo'].setToolTip(
+        "Tamaño de región para ecualización\n"
+        "• 4×4: Más detalle local (polen pequeño)\n"
+        "• 8×8: Balance general\n"
+        "• 16×16: Ecualización más global"
+    )
+    widgets['clahe_tile_combo'].setFixedWidth(150)
+    widgets['clahe_tile_combo'].currentIndexChanged.connect(lambda: update_params_cb())
+    advanced_form.addWidget(widgets['clahe_tile_combo'], 2, 1)
+    
+    # Botón restaurar defaults
+    restore_btn = QPushButton("↺ Restaurar Defaults")
+    restore_btn.setToolTip("Restaura valores por defecto según el modo seleccionado")
+    restore_btn.setFixedWidth(150)
+    restore_btn.clicked.connect(lambda: update_params_cb(restore_defaults=True))
+    advanced_form.addWidget(restore_btn, 2, 2, 1, 2)
+    
+    layout.addLayout(advanced_form)
+    
+    # Información de estado
+    widgets['u2net_status_label'] = QLabel("Modelo: U2NETP | Device: CPU")
+    widgets['u2net_status_label'].setStyleSheet("color: #3498DB; font-style: italic; font-size: 10px;")
+    layout.addWidget(widgets['u2net_status_label'])
+    
+    group.setLayout(layout)
+    return group
+
+
 def create_log_section(widgets: dict, clear_cb) -> QGroupBox:
     """
     Crea la sección de terminal de log.

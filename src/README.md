@@ -806,7 +806,6 @@ Se permite el uso, copia, modificación y distribución libre
 
 - **Python Control Systems Library:** [python-control.org](https://python-control.org)
 - **PyQtGraph Documentation:** [pyqtgraph.org](http://www.pyqtgraph.org)
-- **IEEE Software Engineering Standards**
 - **H-infinity Control Theory:** Zhou & Doyle (1998)
 - **Thorlabs SDK Documentation**
 
