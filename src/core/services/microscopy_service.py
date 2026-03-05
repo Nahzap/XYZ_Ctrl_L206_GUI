@@ -239,10 +239,12 @@ class MicroscopyService(QObject):
         
         # Iniciar trayectoria completa (TestService maneja TODO el control)
         # pause_s reducido a 0.1s porque solo necesita settling, no operaciones
+        # CRÍTICO: auto_advance=False para que TestService PAUSE en cada punto
         success = self._test_service.start_trajectory(
             list(trajectory),
             tolerance_um=self._trajectory_tolerance,
-            pause_s=0.1  # Solo settling, MicroscopyService controla timing real
+            pause_s=0.1,  # Solo settling, MicroscopyService controla timing real
+            auto_advance=False  # Modo manual: espera resume_trajectory() explícito
         )
         
         if not success:

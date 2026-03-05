@@ -417,6 +417,11 @@ class TestService(QObject):
         self._trajectory_config.pause_s = pause_s
         self._trajectory_auto_advance = auto_advance  # NUEVO: modo auto-advance
         
+        # LOGGING DETALLADO para diagnóstico
+        logger.info(f"[TestService] ⚙️  auto_advance configurado: {auto_advance}")
+        logger.info(f"[TestService] ⚙️  pause_s configurado: {pause_s}s")
+        logger.info(f"[TestService] ⚙️  tolerance_um configurado: {tolerance_um}µm")
+        
         # DEBUG: Mostrar primeros puntos de la trayectoria
         logger.info(f"[DEBUG] Primeros 5 puntos de trayectoria:")
         for i in range(min(5, len(self._trajectory))):
@@ -657,15 +662,18 @@ class TestService(QObject):
     def _execute_trajectory_step(self):
         """Ejecuta un paso del control de trayectoria.
         
-        FASE 2 y 5: Si está pausado, mantiene posición activamente.
+        FASE 2: Si está pausado, motores DETENIDOS con BRAKE (NO enviar comandos).
         """
         try:
             if not self._trajectory_active:
                 return
             
-            # FASE 5: Si está pausado, mantener posición activamente
+            # FASE 2: Si está pausado, NO hacer nada (motores ya están con BRAKE)
+            # Los motores fueron detenidos en _accept_trajectory_point() con:
+            #   - send_command('B')  ← BRAKE activo
+            #   - send_command('A,0,0')  ← PWM a 0
+            # NO se envían comandos de corrección durante pausa
             if self._trajectory_paused:
-                self._maintain_position()
                 return
             
             # Calcular Ts
@@ -791,6 +799,7 @@ class TestService(QObject):
                     
                     # Verificar flag ANTES de aceptar para prevenir llamadas duplicadas
                     if not self._point_accepted:
+                        logger.info(f"[TestService] 📍 Aceptando punto {self._trajectory_index + 1} - auto_advance={self._trajectory_auto_advance}")
                         self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um, "✅ Estable")
                 else:
                     self._send_command(f"A,{pwm_a},{pwm_b}")
@@ -820,55 +829,6 @@ class TestService(QObject):
             
         except Exception as e:
             logger.error(f"TestService: Error en trayectoria: {e}")
-    
-    def _maintain_position(self):
-        """Mantiene la posición actual con control activo durante pausa.
-        
-        FASE 5: Aplica control proporcional suave para corregir deriva sin acumular integral.
-        Llamado cada 10ms por _execute_trajectory_step cuando está pausado.
-        """
-        if not self._trajectory or self._trajectory_index >= len(self._trajectory):
-            return
-        
-        target = self._trajectory[self._trajectory_index]
-        target_x, target_y = target[0], target[1]
-        
-        # Calcular referencias en ADC
-        ref_adc_x = um_to_adc(target_x, axis='x')
-        ref_adc_y = um_to_adc(target_y, axis='y')
-        
-        pwm_a = 0
-        pwm_b = 0
-        
-        # Control correctivo suave para eje A (solo proporcional)
-        if self._controller_a:
-            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
-            if sensor_adc is not None:
-                error_adc = ref_adc_x - sensor_adc
-                if abs(error_adc) > DEADZONE_ADC:
-                    # Solo proporcional, sin integral para evitar acumulación
-                    # Ganancia reducida al 30% para control suave
-                    pwm_base = self._controller_a.Kp * error_adc * 0.3
-                    pwm_a = -int(pwm_base) if self._controller_a.invert else int(pwm_base)
-                    U_max = int(self._controller_a.U_max)
-                    pwm_a = max(-U_max, min(U_max, pwm_a))
-        
-        # Control correctivo suave para eje B (solo proporcional)
-        if self._controller_b:
-            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
-            if sensor_adc is not None:
-                error_adc = ref_adc_y - sensor_adc
-                if abs(error_adc) > DEADZONE_ADC:
-                    # Solo proporcional, sin integral para evitar acumulación
-                    # Ganancia reducida al 30% para control suave
-                    pwm_base = self._controller_b.Kp * error_adc * 0.3
-                    pwm_b = -int(pwm_base) if self._controller_b.invert else int(pwm_base)
-                    U_max = int(self._controller_b.U_max)
-                    pwm_b = max(-U_max, min(U_max, pwm_b))
-        
-        # Enviar comando de mantenimiento de posición si hay corrección necesaria
-        if pwm_a != 0 or pwm_b != 0:
-            self._send_command(f"A,{pwm_a},{pwm_b}")
     
     def _accept_trajectory_point(self, target_x: float, target_y: float, 
                                   error_x: float, error_y: float, status: str):

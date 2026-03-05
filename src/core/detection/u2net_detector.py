@@ -37,6 +37,7 @@ class DetectionMode(Enum):
     NORMAL = "normal"
     SENSITIVE = "sensitive"  # Para polen/objetos pequeños
     ROBUST = "robust"        # Para objetos grandes con ruido
+    HYBRID = "hybrid"        # U2NET + Gradiente para polen desenfocado
 
 
 class U2NetDetector:
@@ -199,6 +200,10 @@ class U2NetDetector:
         """
         if image is None or image.size == 0:
             return np.zeros((100, 100), dtype=np.float32), []
+        
+        # Si modo HYBRID, usar detección híbrida
+        if self.detection_mode == DetectionMode.HYBRID:
+            return self.detect_hybrid(image)
         
         # Si el modelo está cargado, usar U2-Net
         if self.model_loaded and self.model is not None:
@@ -491,6 +496,314 @@ class U2NetDetector:
         
         return saliency, objects
     
+    def _detect_blurred_objects(self, image: np.ndarray) -> List[DetectedObject]:
+        """
+        Detección especializada para objetos muy desenfocados usando gradientes.
+        
+        Método:
+        1. CLAHE agresivo para realzar gradientes suaves
+        2. Calcular gradiente con Sobel (magnitud)
+        3. Umbralización adaptativa sobre gradiente
+        4. Morfología MUY SUAVE (kernel 2×2)
+        5. Filtrar por circularidad (muy permisivo: >0.25)
+        
+        Args:
+            image: Imagen de entrada (BGR o grayscale)
+            
+        Returns:
+            Lista de DetectedObject detectados por gradiente
+        """
+        import time
+        t0 = time.perf_counter()
+        
+        # Convertir a grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        # Normalizar uint16 → uint8
+        if gray.dtype == np.uint16:
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # CLAHE agresivo para realzar gradientes suaves
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+        enhanced = clahe.apply(gray)
+        
+        # Calcular gradiente con Sobel (kernel 5×5 para suavidad)
+        grad_x = cv2.Sobel(enhanced, cv2.CV_64F, 1, 0, ksize=5)
+        grad_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=5)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # Normalizar gradiente a [0, 255]
+        gradient_magnitude = cv2.normalize(gradient_magnitude, None, 0, 255, 
+                                          cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Umbralización adaptativa sobre gradiente
+        # blockSize=21 (vecindario grande para gradientes suaves)
+        # C=-5 (negativo para invertir, capturar regiones oscuras)
+        binary = cv2.adaptiveThreshold(
+            gradient_magnitude, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            21, -5
+        )
+        
+        # Morfología MUY SUAVE (kernel 2×2, preserva geometría)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # NO aplicar MORPH_OPEN (destruiría objetos pequeños)
+        
+        # Encontrar contornos
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        objects = []
+        rejected_small = 0
+        rejected_circularity = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            # Filtro de área (más permisivo: min_area/2)
+            min_area_gradient = self.min_area // 2
+            if area < min_area_gradient or area > self.max_area:
+                rejected_small += 1
+                continue
+            
+            # Bounding box
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Calcular circularidad
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = (4 * np.pi * area) / (perimeter ** 2)
+            else:
+                circularity = 0.0
+            
+            # Filtro de circularidad MÁS PERMISIVO (0.25 vs 0.45 en U2NET)
+            if circularity < 0.25:
+                rejected_circularity += 1
+                continue
+            
+            # Centroide
+            M = cv2.moments(contour)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+            else:
+                cx, cy = x + w // 2, y + h // 2
+            
+            # Probabilidad basada en circularidad (más circular = más probable)
+            probability = min(1.0, circularity * 1.5)
+            
+            obj = DetectedObject(
+                index=len(objects),
+                bbox=(x, y, w, h),
+                area=int(area),
+                probability=probability,
+                centroid=(cx, cy),
+                contour=contour,
+                circularity=circularity
+            )
+            objects.append(obj)
+        
+        t_ms = (time.perf_counter() - t0) * 1000
+        
+        logger.info(
+            f"[BlurredDetection] {len(objects)} objetos detectados | "
+            f"Rechazados: {rejected_small} (área), {rejected_circularity} (circ) | "
+            f"Tiempo: {t_ms:.0f}ms"
+        )
+        
+        return objects
+    
+    def _merge_detections(self, 
+                         objects_a: List[DetectedObject],
+                         objects_b: List[DetectedObject],
+                         iou_threshold: float = 0.5) -> List[DetectedObject]:
+        """
+        Fusiona dos listas de objetos eliminando duplicados con IoU.
+        
+        Algoritmo:
+        1. Concatenar todas las detecciones
+        2. Ordenar por probabilidad (mayor primero)
+        3. NMS: suprimir objetos con IoU > threshold
+        4. Reindexar objetos finales
+        
+        Args:
+            objects_a: Lista A (típicamente U2NET)
+            objects_b: Lista B (típicamente Gradiente)
+            iou_threshold: Umbral IoU para considerar duplicado (default: 0.5)
+            
+        Returns:
+            Lista fusionada sin duplicados
+        """
+        # Concatenar todas las detecciones
+        all_objects = list(objects_a) + list(objects_b)
+        
+        if len(all_objects) == 0:
+            return []
+        
+        # Ordenar por probabilidad (mayor primero)
+        all_objects.sort(key=lambda o: o.probability, reverse=True)
+        
+        # NMS: Non-Maximum Suppression
+        keep = []
+        suppressed = set()
+        
+        for i, obj_i in enumerate(all_objects):
+            if i in suppressed:
+                continue
+            
+            keep.append(obj_i)
+            
+            # Suprimir objetos con alto overlap
+            for j in range(i + 1, len(all_objects)):
+                if j in suppressed:
+                    continue
+                
+                obj_j = all_objects[j]
+                iou = self._calculate_iou(obj_i.bbox, obj_j.bbox)
+                
+                if iou > iou_threshold:
+                    suppressed.add(j)
+                    logger.debug(f"[NMS] Suprimido obj {j} (IoU={iou:.2f} con obj {i})")
+        
+        # Reindexar
+        for i, obj in enumerate(keep):
+            obj.index = i
+        
+        logger.info(f"[NMS] Fusión: {len(objects_a)} + {len(objects_b)} → {len(keep)} objetos")
+        return keep
+    
+    def _calculate_iou(self, 
+                      bbox1: Tuple[int, int, int, int],
+                      bbox2: Tuple[int, int, int, int]) -> float:
+        """
+        Calcula Intersection over Union entre dos bounding boxes.
+        
+        IoU = Area(intersection) / Area(union)
+        
+        Args:
+            bbox1: (x, y, w, h)
+            bbox2: (x, y, w, h)
+            
+        Returns:
+            IoU en [0, 1]
+        """
+        x1, y1, w1, h1 = bbox1
+        x2, y2, w2, h2 = bbox2
+        
+        # Calcular intersección
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Calcular unión
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def detect_hybrid(self, image: np.ndarray) -> Tuple[np.ndarray, List[DetectedObject]]:
+        """
+        Detección híbrida: U2NET + Gradiente con fusión inteligente.
+        
+        Pipeline:
+        1. RAMA A: U2NET → objetos con textura/contraste (polen enfocado)
+        2. RAMA B: Gradiente → blobs circulares (polen desenfocado)
+        3. Fusión NMS → eliminar duplicados (IoU > 0.5)
+        4. Mapa de saliencia combinado
+        
+        Args:
+            image: Imagen de entrada (BGR o grayscale)
+            
+        Returns:
+            saliency_combined: Mapa de saliencia fusionado
+            objects_fused: Lista de objetos sin duplicados
+        """
+        import time
+        t_total = time.perf_counter()
+        
+        # RAMA A: U2NET (objetos bien definidos)
+        if self.model_loaded and self.model is not None:
+            saliency_u2net, objects_u2net = self._detect_with_u2net(image)
+        else:
+            saliency_u2net, objects_u2net = self._detect_with_contours(image)
+        
+        logger.info(f"[Hybrid] U2NET: {len(objects_u2net)} objetos")
+        
+        # RAMA B: Gradiente (objetos desenfocados)
+        objects_gradient = self._detect_blurred_objects(image)
+        logger.info(f"[Hybrid] Gradiente: {len(objects_gradient)} objetos")
+        
+        # FUSIÓN: NMS con IoU
+        objects_fused = self._merge_detections(
+            objects_u2net, 
+            objects_gradient,
+            iou_threshold=0.5
+        )
+        
+        # Mapa de saliencia combinado (para visualización)
+        if len(objects_gradient) > 0:
+            saliency_gradient = self._create_gradient_saliency(objects_gradient, image.shape[:2])
+            # Combinar con peso 0.7 para gradiente (menos confiable que U2NET)
+            saliency_combined = np.maximum(saliency_u2net, saliency_gradient * 0.7)
+        else:
+            saliency_combined = saliency_u2net
+        
+        t_total_ms = (time.perf_counter() - t_total) * 1000
+        logger.info(f"[Hybrid] Total: {len(objects_fused)} objetos | Tiempo: {t_total_ms:.0f}ms")
+        
+        return saliency_combined, objects_fused
+    
+    def _create_gradient_saliency(self, 
+                                  objects: List[DetectedObject],
+                                  shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Crea mapa de saliencia pseudo para visualización de detecciones por gradiente.
+        
+        Dibuja Gaussianos centrados en cada objeto detectado.
+        
+        Args:
+            objects: Lista de objetos detectados por gradiente
+            shape: (height, width) de la imagen
+            
+        Returns:
+            Mapa de saliencia [0, 1]
+        """
+        h, w = shape
+        saliency = np.zeros((h, w), dtype=np.float32)
+        
+        for obj in objects:
+            cx, cy = obj.centroid
+            
+            # Radio del objeto (máximo de w, h del bbox)
+            r = max(obj.w, obj.h) // 2
+            
+            # Dibujar Gaussiano centrado en objeto
+            y1, y2 = max(0, cy - r), min(h, cy + r)
+            x1, x2 = max(0, cx - r), min(w, cx + r)
+            
+            for yy in range(y1, y2):
+                for xx in range(x1, x2):
+                    dist = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+                    if dist < r:
+                        # Gaussiano: exp(-dist²/2σ²)
+                        sigma = r / 2.0
+                        val = np.exp(-(dist**2) / (2 * sigma**2))
+                        # Actualizar saliencia (máximo entre actual y nuevo)
+                        saliency[yy, xx] = max(saliency[yy, xx], val * obj.probability)
+        
+        return saliency
+    
     def set_detection_mode(self, mode: DetectionMode):
         """Cambia el modo de detección y aplica parámetros preconfigurados."""
         self.detection_mode = mode
@@ -499,7 +812,17 @@ class U2NetDetector:
     
     def _apply_mode_parameters(self):
         """Aplica parámetros según el modo activo."""
-        if self.detection_mode == DetectionMode.SENSITIVE:
+        if self.detection_mode == DetectionMode.HYBRID:
+            # HÍBRIDO: U2NET + Gradiente para polen desenfocado
+            self.min_area = 50
+            self.saliency_threshold = 0.15
+            self.adaptive_k = 0.2
+            self.morph_kernel_size = 2
+            self.clahe_clip_limit = 4.0
+            self.clahe_tile_size = (4, 4)
+            logger.info("[U2NetDetector] Parámetros HÍBRIDO aplicados (U2NET + Gradiente)")
+            
+        elif self.detection_mode == DetectionMode.SENSITIVE:
             # POLEN / OBJETOS PEQUEÑOS
             self.min_area = 100
             self.saliency_threshold = 0.15
