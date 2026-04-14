@@ -1,6 +1,6 @@
 """
-Camera Service - Servicio de Cámara Thorlabs
-===========================================
+Camera Service - Servicio de Cámara (Multi-Cámara)
+===================================================
 
 Orquesta CameraWorker en un QThread separado y expone señales
 para que la UI (CameraTab) no tenga lógica de hardware.
@@ -9,31 +9,41 @@ REFACTORIZACIÓN 2025-12-17:
 - Expandido con lógica de captura, detección y configuración
 - Toda la lógica de cámara movida desde CameraTab
 
+REFACTORIZACIÓN 2026-03-05:
+- Soporte multi-cámara (Thorlabs, Basler)
+- Usa CameraWorkerFactory para creación automática
+- Detección automática de hardware disponible
+
 Autor: Sistema de Control L206
 """
 
 import os
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 import cv2
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from hardware.camera.camera_worker import CameraWorker
-from config.hardware_availability import THORLABS_AVAILABLE, Thorlabs
+from hardware.camera import CameraWorkerFactory, BaseCameraWorker
+from config.hardware_availability import THORLABS_AVAILABLE, BASLER_AVAILABLE
+import traceback
 
 
 logger = logging.getLogger('MotorControl_L206')
 
 
 class CameraService(QObject):
-    """Servicio de cámara que encapsula CameraWorker.
+    """Servicio de cámara multi-hardware que encapsula CameraWorker.
 
     Expone señales de alto nivel para que la UI se mantenga liviana.
     Contiene toda la lógica de cámara: conexión, captura, configuración.
+    
+    Soporta múltiples tipos de cámara mediante factory pattern:
+    - Thorlabs (vía pylablib)
+    - Basler (vía pypylon)
 
     Signals:
         status_changed: Mensajes de estado para logging en UI.
@@ -54,39 +64,79 @@ class CameraService(QObject):
     cameras_detected = pyqtSignal(list)  # lista de cámaras
     error_occurred = pyqtSignal(str)  # mensaje de error
 
-    def __init__(self, parent=None, thorlabs_available: bool = False):
+    def __init__(self, parent=None, camera_type: str = "auto"):
+        """
+        Inicializa el servicio de cámara.
+        
+        Args:
+            parent: Parent QObject
+            camera_type: Tipo de cámara ("auto", "thorlabs", "basler")
+                - "auto": Detecta automáticamente (prioridad: Thorlabs → Basler)
+                - "thorlabs": Fuerza uso de Thorlabs
+                - "basler": Fuerza uso de Basler
+        """
         super().__init__(parent)
-        self.worker: Optional[CameraWorker] = None
-        self._thorlabs_available = thorlabs_available
+        self.worker: Optional[BaseCameraWorker] = None
+        self._camera_type = camera_type
         self._pending_capture = False  # Flag para captura después de autofoco
+        
+        logger.info(f"[CameraService] Inicializado con camera_type='{camera_type}'")
 
-    def set_thorlabs_available(self, available: bool) -> None:
-        """Configura si el SDK de Thorlabs está disponible."""
-        self._thorlabs_available = available
+    def set_camera_type(self, camera_type: str) -> None:
+        """
+        Configura el tipo de cámara a usar.
+        
+        Args:
+            camera_type: "auto", "thorlabs", o "basler"
+        """
+        self._camera_type = camera_type
+        logger.info(f"[CameraService] Tipo de cámara configurado: '{camera_type}'")
 
-    def connect_camera(self, thorlabs_available: Optional[bool] = None, buffer_size: int = 2) -> None:
-        """Conecta con la cámara Thorlabs usando CameraWorker.
+    def connect_camera(self, buffer_size: int = 2, camera_type: Optional[str] = None) -> None:
+        """Conecta con la cámara usando CameraWorkerFactory.
 
         Args:
-            thorlabs_available: Si pylablib/Thorlabs está disponible.
             buffer_size: Tamaño de buffer para adquisición.
+            camera_type: Tipo de cámara (opcional, usa self._camera_type si None)
         """
-        if thorlabs_available is not None:
-            self._thorlabs_available = thorlabs_available
-
-        if not self._thorlabs_available:
-            msg = "❌ Error: pylablib no está disponible"
+        # Permitir override de tipo
+        if camera_type is not None:
+            self._camera_type = camera_type
+        
+        # NUEVA LÓGICA: Detectar cámaras físicas primero
+        physical_cameras = self.detect_cameras()
+        if not physical_cameras:
+            msg = "❌ Error: No se detectaron cámaras físicas conectadas"
             self.status_changed.emit(msg)
-            logger.warning(f"[CameraService] {msg}")
-            self.connected.emit(False, "pylablib no disponible")
+            logger.error(f"[CameraService] {msg}")
+            self.connected.emit(False, "No hay cámaras físicas")
             return
+        
+        # Si es auto, usar el tipo de la primera cámara detectada
+        if self._camera_type == "auto":
+            self._camera_type = physical_cameras[0]['type']
+            logger.info(f"[CameraService] Auto-detección: usando primera cámara '{self._camera_type}'")
+            self.status_changed.emit(f"Auto-detección: conectando a {physical_cameras[0]['name']}")
 
         if self.worker is None:
-            logger.info("[CameraService] Creando CameraWorker...")
-            self.worker = CameraWorker()
+            logger.info(f"[CameraService] Creando worker para '{self._camera_type}'...")
+            
+            # Factory crea el worker apropiado
+            self.worker = CameraWorkerFactory.create_worker(self._camera_type)
+            
+            if self.worker is None:
+                msg = f"❌ Error: No se pudo crear worker para '{self._camera_type}'"
+                self.status_changed.emit(msg)
+                logger.error(f"[CameraService] {msg}")
+                self.connected.emit(False, f"Worker creation failed: {self._camera_type}")
+                return
+            
+            # Conectar señales (igual para todos los workers gracias a BaseCameraWorker)
             self.worker.connection_success.connect(self._on_worker_connected)
             self.worker.new_frame_ready.connect(self._on_new_frame)
             self.worker.status_update.connect(self.status_changed.emit)
+            
+            logger.info(f"[CameraService] Worker creado: {self.worker.__class__.__name__}")
 
         # Configurar buffer inicial
         try:
@@ -95,9 +145,8 @@ class CameraService(QObject):
             self.worker.buffer_size = 2
         logger.info(f"[CameraService] Buffer inicial: {self.worker.buffer_size} frames")
 
-        # CameraWorker emite status_update que está conectado a status_changed
-        # No emitir aquí para evitar duplicación
-        logger.info("[CameraService] Conectando cámara Thorlabs...")
+        # Worker emite status_update que está conectado a status_changed
+        logger.info(f"[CameraService] Conectando cámara ({self.worker.get_camera_type()})...")
         self.worker.connect_camera()
 
     def disconnect_camera(self) -> None:
@@ -165,40 +214,73 @@ class CameraService(QObject):
     # DETECCIÓN DE CÁMARAS
     # ==================================================================
 
-    def detect_cameras(self) -> List[str]:
-        """Detecta cámaras Thorlabs conectadas.
+    def detect_cameras(self) -> List[Dict[str, str]]:
+        """Detecta cámaras FÍSICAS disponibles (no solo SDKs).
         
         Returns:
-            Lista de identificadores de cámaras encontradas.
+            Lista de diccionarios con info de cámaras: [{'type': 'basler', 'name': '...', 'serial': '...'}, ...]
         """
-        if not self._thorlabs_available:
-            self.status_changed.emit("❌ Error: pylablib no está instalado")
-            self.error_occurred.emit("pylablib no está instalado")
-            logger.warning("[CameraService] Intento de detectar cámara sin pylablib")
-            return []
+        self.status_changed.emit("🔍 Buscando cámaras físicas conectadas...")
+        logger.info("[CameraService] Detectando cámaras físicas...")
         
-        self.status_changed.emit("🔍 Buscando cámaras Thorlabs...")
-        logger.info("[CameraService] Detectando cámaras Thorlabs...")
+        cameras_found = []
         
         try:
-            cameras = Thorlabs.list_cameras_tlcam()
+            # 1. Detectar cámaras Thorlabs físicas
+            if THORLABS_AVAILABLE:
+                try:
+                    from config.hardware_availability import Thorlabs
+                    thorlabs_cameras = Thorlabs.list_cameras_tlcam()
+                    
+                    if thorlabs_cameras:
+                        for serial in thorlabs_cameras:
+                            cameras_found.append({
+                                'type': 'thorlabs',
+                                'serial': serial,
+                                'name': f'Thorlabs S/N:{serial}'
+                            })
+                            self.status_changed.emit(f"   ✅ Thorlabs encontrada: S/N {serial}")
+                            logger.info(f"[CameraService] Thorlabs detectada: {serial}")
+                except Exception as e:
+                    logger.debug(f"[CameraService] Error detectando Thorlabs: {e}")
             
-            if not cameras:
-                self.status_changed.emit("⚠️ No se encontraron cámaras")
-                logger.warning("[CameraService] No se encontraron cámaras")
+            # 2. Detectar cámaras Basler físicas
+            if BASLER_AVAILABLE:
+                try:
+                    from config.hardware_availability import pylon
+                    tlFactory = pylon.TlFactory.GetInstance()
+                    devices = tlFactory.EnumerateDevices()
+                    
+                    if devices:
+                        for device in devices:
+                            model = device.GetModelName()
+                            serial = device.GetSerialNumber()
+                            cameras_found.append({
+                                'type': 'basler',
+                                'serial': serial,
+                                'name': f'{model} S/N:{serial}'
+                            })
+                            self.status_changed.emit(f"   ✅ Basler encontrada: {model} S/N {serial}")
+                            logger.info(f"[CameraService] Basler detectada: {model} {serial}")
+                except Exception as e:
+                    logger.debug(f"[CameraService] Error detectando Basler: {e}")
+            
+            # Resultado final
+            if not cameras_found:
+                self.status_changed.emit("⚠️ No se encontraron cámaras físicas conectadas")
+                logger.warning("[CameraService] No se detectaron cámaras físicas")
+                self.cameras_detected.emit([])
+                return []
             else:
-                self.status_changed.emit(f"✅ Encontradas {len(cameras)} cámara(s)")
-                for i, cam in enumerate(cameras, 1):
-                    self.status_changed.emit(f"   Cámara {i}: {cam}")
-                logger.info(f"[CameraService] Detectadas {len(cameras)} cámaras Thorlabs")
-            
-            self.cameras_detected.emit(list(cameras) if cameras else [])
-            return list(cameras) if cameras else []
+                self.status_changed.emit(f"✅ Encontradas {len(cameras_found)} cámara(s)")
+                logger.info(f"[CameraService] Total detectadas: {len(cameras_found)} cámaras")
+                self.cameras_detected.emit(cameras_found)
+                return cameras_found
             
         except Exception as e:
             self.status_changed.emit(f"❌ Error detectando: {e}")
             self.error_occurred.emit(f"Error detectando cámaras: {e}")
-            logger.error(f"[CameraService] Error en detección: {e}")
+            logger.error(f"[CameraService] Error en detección: {e}\n{traceback.format_exc()}")
             return []
 
     # ==================================================================
@@ -378,12 +460,15 @@ class CameraService(QObject):
             h_orig, w_orig = frame.shape[:2]
             original_dtype = frame.dtype
             
-            # Redimensionar si es necesario (mantener dtype original)
-            target_width = config.get('img_width', 1920)
-            target_height = config.get('img_height', 1080)
+            # Redimensionar SOLO si el usuario especificó dimensiones diferentes a las del frame original
+            target_width = config.get('img_width', w_orig)
+            target_height = config.get('img_height', h_orig)
             
             if w_orig != target_width or h_orig != target_height:
+                logger.info(f"[CameraService] Redimensionando frame: {w_orig}x{h_orig} → {target_width}x{target_height}")
                 frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+            else:
+                logger.debug(f"[CameraService] Sin redimensionamiento (frame ya es {w_orig}x{h_orig})")
             
             # Procesar canales según selección del usuario
             channels = config.get('channels', {'R': False, 'G': True, 'B': False})
@@ -525,3 +610,18 @@ class CameraService(QObject):
             'min': int(frame.min()),
             'max': int(frame.max())
         }
+    
+    def get_resolution(self) -> Tuple[int, int]:
+        """Retorna la resolución real de la cámara (width, height) del frame actual.
+        
+        Returns:
+            Tupla (width, height) en píxeles, o (1920, 1080) por defecto si no hay frame.
+        """
+        if self.worker is None or self.worker.current_frame is None:
+            logger.warning("[CameraService] No hay frame disponible, retornando resolución por defecto")
+            return (1920, 1080)
+        
+        frame = self.worker.current_frame
+        h, w = frame.shape[:2]
+        logger.info(f"[CameraService] Resolución real de cámara: {w}x{h}")
+        return (w, h)

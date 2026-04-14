@@ -9,7 +9,6 @@ REFACTORIZACIÓN 2025-12-17:
 Reducción: 1472 → ~450 líneas
 """
 
-import os
 import logging
 import numpy as np
 import cv2
@@ -19,7 +18,6 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QScrollArea,
                              QFileDialog, QMessageBox)
 from PyQt5.QtCore import pyqtSignal, Qt
 
-from config.hardware_availability import THORLABS_AVAILABLE, Thorlabs
 from gui.windows.camera_window import CameraViewWindow
 from gui.utils.camera_tab_ui_builder import (
     create_connection_section,
@@ -142,7 +140,7 @@ class CameraTab(QWidget):
         # Sección 4: Captura
         main_layout.addWidget(create_capture_section(
             self._widgets,
-            self._browse_folder, self._on_capture_clicked, self._on_focus_clicked
+            self._on_browse_folder, self._on_capture_clicked, self._on_focus_clicked
         ))
         
         # Sección 5: Microscopía
@@ -217,8 +215,9 @@ class CameraTab(QWidget):
         self.capture_btn = self._widgets.get('capture_btn')
         self.focus_btn = self._widgets.get('focus_btn')
         
-        # Volumetría
+        # Volumetría / Z-Stack
         self.capture_simple_radio = self._widgets.get('capture_simple_radio')
+        self.capture_zstack_radio = self._widgets.get('capture_zstack_radio')  # Alias para compatibilidad
         self.capture_volumetry_radio = self._widgets.get('capture_volumetry_radio')
         self.volumetry_n_images_spin = self._widgets.get('volumetry_n_images_spin')
         self.volumetry_z_step_spin = self._widgets.get('volumetry_z_step_spin')
@@ -226,6 +225,18 @@ class CameraTab(QWidget):
         self.volumetry_include_bpof_check = self._widgets.get('volumetry_include_bpof_check')
         self.volumetry_save_json_check = self._widgets.get('volumetry_save_json_check')
         self.volumetry_params_widget = self._widgets.get('volumetry_params_widget')
+        
+        # Z-Stack params (mapear también con nombres alternativos)
+        self.zstack_n_images_spin = self._widgets.get('zstack_n_images_spin')
+        self.zstack_z_step_spin = self._widgets.get('zstack_z_step_spin')
+        self.zstack_z_min_spin = self._widgets.get('zstack_z_min_spin')
+        self.zstack_z_max_spin = self._widgets.get('zstack_z_max_spin')
+        self.zstack_save_json_check = self._widgets.get('zstack_save_json_check')
+        self.zstack_params_widget = self._widgets.get('zstack_params_widget')
+        self.zstack_channel_r_check = self._widgets.get('zstack_channel_r_check')
+        self.zstack_channel_g_check = self._widgets.get('zstack_channel_g_check')
+        self.zstack_channel_b_check = self._widgets.get('zstack_channel_b_check')
+        self.zstack_storage_estimate_label = self._widgets.get('zstack_storage_estimate_label')
         
         # Microscopía
         self.trajectory_status = self._widgets.get('trajectory_status')
@@ -277,7 +288,29 @@ class CameraTab(QWidget):
         self.camera_terminal = self._widgets.get('camera_terminal')
         
         # Solo conectar error_occurred que no está en main.py
-        self.camera_service.error_occurred.connect(self._on_error)
+        if self.camera_service and hasattr(self.camera_service, 'error_occurred'):
+            self.camera_service.error_occurred.connect(self._on_error)
+
+        # Wiring dinámico de Z-Stack (canal monobanda + estimación tamaño)
+        if self.zstack_z_min_spin:
+            self.zstack_z_min_spin.valueChanged.connect(self._update_zstack_storage_estimate)
+        if self.zstack_z_max_spin:
+            self.zstack_z_max_spin.valueChanged.connect(self._update_zstack_storage_estimate)
+        if self.zstack_z_step_spin:
+            self.zstack_z_step_spin.valueChanged.connect(self._update_zstack_storage_estimate)
+        if self.capture_zstack_radio:
+            self.capture_zstack_radio.toggled.connect(self._on_capture_mode_toggled)
+        if self.image_format_combo:
+            self.image_format_combo.currentTextChanged.connect(self._on_zstack_format_changed)
+        if self.use_16bit_check:
+            self.use_16bit_check.toggled.connect(lambda _: self._update_zstack_storage_estimate())
+
+        for channel in (self.zstack_channel_r_check, self.zstack_channel_g_check, self.zstack_channel_b_check):
+            if channel:
+                channel.toggled.connect(lambda checked, ch=channel: self._on_zstack_channel_toggled(ch, checked))
+
+        self._on_capture_mode_toggled(self.capture_zstack_radio.isChecked() if self.capture_zstack_radio else False)
+        self._update_zstack_storage_estimate()
     
     def _load_default_parameters(self):
         """Carga parámetros por defecto desde ParameterManager."""
@@ -288,13 +321,10 @@ class CameraTab(QWidget):
             micro_defaults = pm.get_microscopy_defaults()
             if self.class_name_input:
                 self.class_name_input.setText(micro_defaults.get('class_name', 'Quillaja_Saponaria'))
-            if self.delay_before_input:
-                # delay_before_input es QDoubleSpinBox, no QLineEdit
-                delay_val = micro_defaults.get('delays', {}).get('before_capture', 700)
-                self.delay_before_input.setValue(float(delay_val) / 1000.0)  # Convertir ms a segundos
-            if self.delay_after_input:
-                delay_val = micro_defaults.get('delays', {}).get('after_capture', 100)
-                self.delay_after_input.setValue(float(delay_val))
+            delay_before_ms = micro_defaults.get('delays', {}).get('before_capture', 700)
+            delay_after_ms = micro_defaults.get('delays', {}).get('after_capture', 100)
+            self._set_numeric_widget_value(self.delay_before_input, float(delay_before_ms) / 1000.0)
+            self._set_numeric_widget_value(self.delay_after_input, float(delay_after_ms) / 1000.0)
             
             # Cargar parámetros de autofoco
             af_config = micro_defaults.get('autofocus', {})
@@ -337,11 +367,12 @@ class CameraTab(QWidget):
             self.log_message("📸 Capturando imagen post-autofoco...")
             self._do_capture_image()
             self.orchestrator.clear_pending_capture()
+            # Compatibilidad con callback legado en main.py
+            self._pending_capture = False
     
     def _on_orchestrator_detection_complete(self, objects):
         """Handler cuando el orchestrator completa detección."""
         logger.info(f"[CameraTab] ✅ RECIBIDO orchestrator detection_complete: {len(objects)} objetos")
-        print(f"[CameraTab] ✅ RECIBIDO orchestrator detection_complete: {len(objects)} objetos")
         
         # Actualizar lista de objetos en ventana de cámara
         if self.camera_view_window and self.camera_view_window.isVisible():
@@ -356,7 +387,6 @@ class CameraTab(QWidget):
     def _on_microscopy_detection_complete(self, objects):
         """Handler cuando MicroscopyService completa detección durante microscopía."""
         logger.info(f"[CameraTab] ✅ RECIBIDO microscopy detection_complete: {len(objects)} objetos")
-        print(f"[CameraTab] ✅ RECIBIDO microscopy detection_complete: {len(objects)} objetos")
         
         # Actualizar lista de objetos en ventana de cámara
         if self.camera_view_window and self.camera_view_window.isVisible():
@@ -514,32 +544,42 @@ class CameraTab(QWidget):
     
     def _on_capture_clicked(self):
         """Handler para botón Capturar."""
+        logger.info("[CameraTab] _on_capture_clicked: Iniciando captura")
+        
         if self.camera_service is None:
             self.log_message("❌ Error: CameraService no disponible")
+            logger.error("[CameraTab] CameraService no disponible")
             return
         
         # Verificar si es Z-Stack
         if self.capture_zstack_radio and self.capture_zstack_radio.isChecked():
+            logger.info("[CameraTab] Modo Z-Stack seleccionado")
             self._start_zstack_capture()
             return
         
-        # Si autofoco está habilitado, ejecutar autofoco primero
-        if (self.autofocus_enabled_cb.isChecked() and 
-            self.parent_gui and getattr(self.parent_gui, 'cfocus_enabled', False)):
-            self.log_message("🎯 Autofoco habilitado - ejecutando Z-scan antes de captura...")
-            self._run_autofocus(capture_after=True)
-            return
+        # CAPTURA SIMPLE
+        logger.info("[CameraTab] Modo Captura Simple seleccionado")
+        self.log_message("📸 Ejecutando captura simple...")
         
-        # Captura simple
+        # Obtener carpeta
         folder = self.save_folder_input.text()
         if not folder:
             folder = QFileDialog.getExistingDirectory(self.parent_gui, "Seleccionar Carpeta")
             if folder:
                 self.save_folder_input.setText(folder)
         
-        if folder:
-            img_format = self.image_format_combo.currentText().lower()
-            self.camera_service.capture_image(folder, img_format)
+        if not folder:
+            self.log_message("❌ Error: No se seleccionó carpeta")
+            logger.warning("[CameraTab] No se seleccionó carpeta de destino")
+            return
+        
+        img_format = self.image_format_combo.currentText().lower()
+        logger.info(f"[CameraTab] Capturando imagen simple - Carpeta: {folder}, Formato: {img_format}")
+        
+        # Capturar directamente SIN autofoco (captura simple inmediata)
+        self.camera_service.capture_image(folder, img_format)
+        self.log_message(f"✅ Imagen capturada en {folder}")
+        logger.info(f"[CameraTab] Captura simple completada: {folder}")
     
     def _start_zstack_capture(self):
         """Inicia captura de Z-Stack (múltiples planos Z comandados por Paso Z)."""
@@ -550,6 +590,25 @@ class CameraTab(QWidget):
                               "Z-Stack requiere C-Focus conectado para control de Z")
             return
         
+        # Verificar calibración del C-Focus
+        cfocus = getattr(self.parent_gui, 'cfocus_controller', None) if self.parent_gui else None
+        if not cfocus or not hasattr(cfocus, 'get_calibration_info'):
+            self.log_message("❌ Error: Controlador C-Focus no disponible")
+            return
+
+        calib_info = cfocus.get_calibration_info() or {}
+        if not calib_info.get('is_calibrated', False):
+            self.log_message("❌ Error: Debes calibrar C-Focus antes del Z-Stack")
+            QMessageBox.warning(
+                self.parent_gui,
+                "Calibración requerida",
+                "Debes calibrar C-Focus antes de ejecutar Z-Stack."
+            )
+            return
+
+        cfocus_z_min = float(calib_info.get('z_min', 0.0))
+        cfocus_z_max = float(calib_info.get('z_max', 0.0))
+
         # Verificar SmartFocusScorer disponible
         if not self.orchestrator or not self.orchestrator.scorer:
             self.log_message("❌ Error: SmartFocusScorer no disponible")
@@ -566,22 +625,70 @@ class CameraTab(QWidget):
             self.log_message("❌ Error: No se seleccionó carpeta")
             return
         
-        # Preparar configuración de Z-Stack
-        # Paso Z COMANDA las slices
+        # Z min/max se toman SIEMPRE desde calibración de hardware (solo lectura en UI)
+        z_min = cfocus_z_min
+        z_max = cfocus_z_max
         z_step = self.zstack_z_step_spin.value() if self.zstack_z_step_spin else 0.05
-        n_images = self.zstack_n_images_spin.value() if self.zstack_n_images_spin else 200
         
-        # Calcular rango Z basado en número de imágenes y paso
-        z_range_total = (n_images - 1) * z_step
+        # Validar que z_max > z_min
+        if z_max <= z_min:
+            self.log_message("❌ Error: Z Max debe ser mayor que Z Min")
+            logger.error(f"[CameraTab] Z-Stack inválido: z_min={z_min}, z_max={z_max}")
+            QMessageBox.warning(self.parent_gui, "Error", 
+                              f"Z Max ({z_max:.2f}µm) debe ser mayor que Z Min ({z_min:.2f}µm)")
+            return
+
+        # Reflejar límites hardware en UI por seguridad
+        if self.zstack_z_min_spin:
+            self.zstack_z_min_spin.setValue(z_min)
+        if self.zstack_z_max_spin:
+            self.zstack_z_max_spin.setValue(z_max)
+        
+        # Calcular número de imágenes automáticamente
+        z_range_total = z_max - z_min
+        n_images = int(z_range_total / z_step) + 1
+        if self.zstack_n_images_spin:
+            self.zstack_n_images_spin.setValue(n_images)
+
+        # Canal monobanda obligatorio para evitar datos redundantes
+        channel_map = {
+            'R': self.zstack_channel_r_check.isChecked() if self.zstack_channel_r_check else False,
+            'G': self.zstack_channel_g_check.isChecked() if self.zstack_channel_g_check else False,
+            'B': self.zstack_channel_b_check.isChecked() if self.zstack_channel_b_check else False,
+        }
+        selected_channels = [c for c, enabled in channel_map.items() if enabled]
+        if len(selected_channels) != 1:
+            self.log_message("❌ Error: selecciona exactamente 1 canal para Z-Stack monobanda (R/G/B)")
+            QMessageBox.warning(
+                self.parent_gui,
+                "Canal inválido",
+                "Z-Stack monobanda requiere seleccionar exactamente un canal (R, G o B)."
+            )
+            return
+        selected_channel = selected_channels[0]
+        
+        img_format = self.image_format_combo.currentText().lower() if self.image_format_combo else 'tiff'
+        use_16bit = self.use_16bit_check.isChecked() if self.use_16bit_check else True
+        if img_format == 'jpg':
+            use_16bit = False
+            self.log_message("⚠️ JPG solo soporta 8-bit. Se ajusta automáticamente.")
+
+        logger.info(
+            f"[CameraTab] Z-Stack config: z_min={z_min:.2f}, z_max={z_max:.2f}, "
+            f"z_step={z_step:.3f}, n_images={n_images}, format={img_format}, 16bit={use_16bit}"
+        )
         
         config = {
-            'n_images': n_images,
+            'z_min': z_min,  # PARÁMETRO EDITABLE POR USUARIO
+            'z_max': z_max,  # PARÁMETRO EDITABLE POR USUARIO
             'z_step': z_step,  # Paso Z que COMANDA las slices
-            'z_range': z_range_total,  # Calculado automáticamente
+            'n_images': n_images,  # CALCULADO AUTOMÁTICAMENTE
+            'z_range': z_range_total,  # z_max - z_min
             'save_json': self.zstack_save_json_check.isChecked() if self.zstack_save_json_check else True,
             'save_folder': folder,
-            'img_format': self.image_format_combo.currentText().lower(),
-            'use_16bit': self.use_16bit_check.isChecked() if self.use_16bit_check else True,
+            'img_format': img_format,
+            'use_16bit': use_16bit,
+            'channel_mode': selected_channel,
             'min_area': self.min_pixels_spin.value() if self.min_pixels_spin else 5000,
             'max_area': self.max_pixels_spin.value() if self.max_pixels_spin else 50000,
             'score_threshold': 0.3,
@@ -589,13 +696,18 @@ class CameraTab(QWidget):
             'exposure_ms': float(self.exposure_input.text()) if self.exposure_input else 50.0
         }
         
-        self.log_message("=" * 40)
-        self.log_message("🔬 INICIANDO Z-STACK")
-        self.log_message(f"   Imágenes: {config['n_images']}")
-        self.log_message(f"   Paso Z: {config['z_step']}µm (COMANDA las slices)")
-        self.log_message(f"   Rango Z total: {config['z_range']:.2f}µm")
-        self.log_message(f"   Formato: {config['img_format'].upper()} ({'16-bit' if config['use_16bit'] else '8-bit'})")
-        self.log_message("=" * 40)
+        self.log_message("=" * 60)
+        self.log_message("🔬 INICIANDO CAPTURA Z-STACK")
+        self.log_message(f"   📍 Rango Z: {z_min:.2f} → {z_max:.2f} µm ({z_range_total:.2f}µm total)")
+        self.log_message(f"   📏 Paso Z: {z_step:.3f} µm")
+        self.log_message(f"   📸 Imágenes: {n_images} (calculado automáticamente)")
+        self.log_message(f"   💾 Carpeta: {folder}")
+        self.log_message(f"   🎯 Canal monobanda: {selected_channel}")
+        bits_text = "16-bit" if use_16bit else "8-bit"
+        self.log_message(f"   🎨 Formato: {img_format.upper()} ({bits_text})")
+        self.log_message(f"   📊 JSON: {'Sí' if config['save_json'] else 'No'}")
+        self.log_message("=" * 60)
+        logger.info(f"[CameraTab] Iniciando Z-Stack: {n_images} imágenes, rango {z_min:.2f}-{z_max:.2f}µm")
         
         # Ejecutar volumetría en thread separado
         import threading
@@ -643,7 +755,7 @@ class CameraTab(QWidget):
         return 0.0
     
     def _volumetry_capture_image(self, filepath: str, config: dict) -> bool:
-        """Captura y guarda una imagen usando EXACTAMENTE la misma lógica de capture_image."""
+        """Captura y guarda imagen Z-Stack en monobanda (8/16-bit según formato)."""
         if not self.camera_service or not self.camera_service.worker:
             logger.error("[CameraTab] No hay camera_service o worker disponible")
             return False
@@ -655,36 +767,47 @@ class CameraTab(QWidget):
         try:
             # Obtener frame actual - COPIA
             frame = self.camera_service.worker.current_frame.copy()
-            img_format = config.get('img_format', 'png')
-            
-            # EXACTAMENTE la misma lógica de CameraService.capture_image
-            if frame.dtype == np.uint16:
-                frame_min, frame_max = frame.min(), frame.max()
-                logger.debug(f"[Volumetry] Frame: [{frame_min}, {frame_max}]")
-                
-                if img_format == 'tiff':
-                    # TIFF: mantener 16 bits original
-                    success = cv2.imwrite(filepath, frame)
-                else:
-                    # PNG/JPG: normalizar a 8 bits (IGUAL que capture_image)
-                    if frame_max > 0:
-                        frame_norm = (frame / frame_max * 255).astype(np.uint8)
-                    else:
-                        frame_norm = np.zeros_like(frame, dtype=np.uint8)
-                    
-                    if img_format == 'jpg':
-                        success = cv2.imwrite(filepath, frame_norm, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    else:  # png
-                        success = cv2.imwrite(filepath, frame_norm, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+            channel_mode = str(config.get('channel_mode', 'G')).upper()
+            img_format = str(config.get('img_format', 'tiff')).lower()
+            use_16bit = bool(config.get('use_16bit', True))
+            if channel_mode not in ('R', 'G', 'B'):
+                channel_mode = 'G'
+            if img_format == 'jpg':
+                use_16bit = False
+
+            # Convertir SIEMPRE a 1 canal (sin color artificial)
+            if frame.ndim == 3:
+                channel_idx = {'B': 0, 'G': 1, 'R': 2}[channel_mode]
+                mono = frame[:, :, channel_idx]
             else:
-                # Frame ya es uint8
+                mono = frame
+
+            # Convertir a contenedor 16-bit base para procesamiento uniforme
+            if mono.dtype == np.uint16:
+                mono16 = mono
+            elif mono.dtype == np.uint8:
+                mono16 = (mono.astype(np.uint16) << 8)
+            else:
+                mono_float = mono.astype(np.float32)
+                max_val = float(np.max(mono_float)) if mono_float.size else 0.0
+                mono16 = ((mono_float / max_val) * 65535.0).astype(np.uint16) if max_val > 0 else np.zeros_like(mono_float, dtype=np.uint16)
+
+            if use_16bit and img_format in ('png', 'tiff'):
+                success = cv2.imwrite(filepath, mono16)
+            else:
+                mono8 = (mono16 / 256).astype(np.uint8)
                 if img_format == 'jpg':
-                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    success = cv2.imwrite(filepath, mono8, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 elif img_format == 'png':
-                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+                    success = cv2.imwrite(filepath, mono8, [cv2.IMWRITE_PNG_COMPRESSION, 6])
                 else:
-                    success = cv2.imwrite(filepath, frame)
-            
+                    success = cv2.imwrite(filepath, mono8)
+            if success:
+                dtype_saved = "uint16" if (use_16bit and img_format in ('png', 'tiff')) else "uint8"
+                logger.debug(
+                    f"[CameraTab] Z-Stack guardado canal={channel_mode}, format={img_format}, "
+                    f"dtype={dtype_saved}, shape={mono16.shape}"
+                )
             return success
             
         except Exception as e:
@@ -716,13 +839,21 @@ class CameraTab(QWidget):
         self.log_message(f"❌ Error en volumetría: {error_msg}")
     
     def _on_focus_clicked(self):
-        """Handler para botón Enfocar."""
+        """Handler para botón Enfocar Objetos usando métrica S."""
+        logger.info("[CameraTab] _on_focus_clicked: Iniciando rutina de enfoque")
+        
         if not self.parent_gui or not getattr(self.parent_gui, 'cfocus_enabled', False):
             self.log_message("❌ Error: C-Focus no conectado")
+            logger.error("[CameraTab] C-Focus no conectado para autofoco")
             QMessageBox.warning(self.parent_gui, "Error", "Conecta C-Focus primero")
             return
         
-        self.log_message("🎯 Iniciando rutina de enfoque (sin captura)...")
+        self.log_message("=" * 50)
+        self.log_message("🎯 INICIANDO RUTINA DE ENFOQUE AUTOMÁTICO")
+        self.log_message("   Método: SmartFocusScorer con métrica S")
+        self.log_message("=" * 50)
+        logger.info("[CameraTab] Ejecutando autofoco con SmartFocusScorer")
+        
         self._run_autofocus(capture_after=False)
     
     # ==================================================================
@@ -742,13 +873,21 @@ class CameraTab(QWidget):
             return
         
         try:
-            # Forzar delay mínimo si el usuario se queja de lentitud
-            delay_before_val = float(self.delay_before_input.text())
+            # Leer delays tolerando QLineEdit/QSpinBox
+            delay_before_val = self._get_numeric_widget_value(self.delay_before_input, default=0.7)
+            delay_after_val = self._get_numeric_widget_value(self.delay_after_input, default=0.1)
+            if delay_before_val < 0 or delay_after_val < 0:
+                raise ValueError("Las demoras no pueden ser negativas")
+
             if delay_before_val > 0.5:
                 self.log_message(f"⚠️ Aviso: Delay antes ({delay_before_val}s) se sumará a la pausa de trayectoria.")
+
+            class_name = self.class_name_input.text().strip().replace(' ', '_')
+            if not class_name:
+                raise ValueError("El nombre de clase no puede estar vacío")
             
             config = {
-                'class_name': self.class_name_input.text().strip().replace(' ', '_'),
+                'class_name': class_name,
                 'save_folder': self.microscopy_folder_input.text(),
                 'img_width': int(self.img_width_input.text()),
                 'img_height': int(self.img_height_input.text()),
@@ -760,7 +899,7 @@ class CameraTab(QWidget):
                     'B': self.channel_b_check.isChecked()
                 },
                 'delay_before': delay_before_val,
-                'delay_after': float(self.delay_after_input.text()),
+                'delay_after': delay_after_val,
                 'n_points': self._trajectory_n_points,
                 # Si el usuario activa "Sólo trayectoria XY", forzamos autofoco en False
                 'autofocus_enabled': False if (self.xy_only_cb and self.xy_only_cb.isChecked()) else self.autofocus_enabled_cb.isChecked(),
@@ -782,8 +921,8 @@ class CameraTab(QWidget):
                     channels=''.join([c for c in ['R','G','B'] if config['channels'][c]]),
                     format=config['img_format'].upper(),
                     bit_depth=16 if config['use_16bit'] else 8,
-                    delay_before=int(config['delay_before']),
-                    delay_after=int(config['delay_after'])
+                    delay_before=int(round(config['delay_before'] * 1000)),
+                    delay_after=int(round(config['delay_after'] * 1000))
                 )
                 pm.update_detection(
                     min_circularity=self.circularity_spin.value(),
@@ -909,20 +1048,60 @@ class CameraTab(QWidget):
                 # Actualizar rango en Z-Stack UI si está calibrado
                 if self.parent_gui and hasattr(self.parent_gui, 'cfocus_controller'):
                     calib_info = self.parent_gui.cfocus_controller.get_calibration_info()
-                    if calib_info['is_calibrated'] and self.zstack_cfocus_range_label:
+                    if calib_info['is_calibrated']:
                         z_min = calib_info['z_min']
                         z_max = calib_info['z_max']
-                        self.zstack_cfocus_range_label.setText(f"{z_min:.2f} - {z_max:.2f} µm")
-                        self.zstack_cfocus_range_label.setStyleSheet("color: #27AE60; font-weight: bold;")
+                        
+                        # Actualizar label informativo
+                        if 'zstack_cfocus_range_label' in self._widgets:
+                            self._widgets['zstack_cfocus_range_label'].setText(f"{z_min:.2f} - {z_max:.2f} µm")
+                            self._widgets['zstack_cfocus_range_label'].setStyleSheet("color: #27AE60; font-weight: bold;")
+                        
+                        # Reflejar límites hardware en los spinboxes de solo lectura
+                        if self.zstack_z_min_spin:
+                            self.zstack_z_min_spin.setRange(z_min, z_max)
+                            self.zstack_z_min_spin.setValue(z_min)
+                            logger.info(f"[CameraTab] Z_min configurado: {z_min:.2f} µm")
+                        
+                        if self.zstack_z_max_spin:
+                            self.zstack_z_max_spin.setRange(z_min, z_max)
+                            self.zstack_z_max_spin.setValue(z_max)
+                            logger.info(f"[CameraTab] Z_max configurado: {z_max:.2f} µm")
+                        
+                        logger.info(f"[CameraTab] Rango C-Focus actualizado en UI: {z_min:.2f} - {z_max:.2f} µm")
+                        self._update_zstack_storage_estimate()
+                    else:
+                        # Si aún no hay calibración, mostrar rango de hardware para referencia rápida
+                        z_hw = float(calib_info.get('z_range_hw', 0.0) or 0.0)
+                        if z_hw > 0:
+                            if 'zstack_cfocus_range_label' in self._widgets:
+                                self._widgets['zstack_cfocus_range_label'].setText(f"0.00 - {z_hw:.2f} µm (HW)")
+                                self._widgets['zstack_cfocus_range_label'].setStyleSheet("color: #F39C12; font-weight: bold;")
+                            if self.zstack_z_min_spin:
+                                self.zstack_z_min_spin.setRange(0.0, z_hw)
+                                self.zstack_z_min_spin.setValue(0.0)
+                            if self.zstack_z_max_spin:
+                                self.zstack_z_max_spin.setRange(0.0, z_hw)
+                                self.zstack_z_max_spin.setValue(z_hw)
+                            logger.info(f"[CameraTab] Rango hardware C-Focus en UI: 0.00 - {z_hw:.2f} µm")
+                            self._update_zstack_storage_estimate()
             else:
                 self.cfocus_status_label.setText("C-Focus: No conectado")
                 self.cfocus_status_label.setStyleSheet("color: #888; font-style: italic;")
                 self.log_message("C-Focus desconectado")
                 
                 # Resetear rango en Z-Stack UI
-                if self.zstack_cfocus_range_label:
-                    self.zstack_cfocus_range_label.setText("0.0 - 0.0 µm")
-                    self.zstack_cfocus_range_label.setStyleSheet("color: #888; font-style: italic;")
+                if 'zstack_cfocus_range_label' in self._widgets:
+                    self._widgets['zstack_cfocus_range_label'].setText("0.0 - 0.0 µm")
+                    self._widgets['zstack_cfocus_range_label'].setStyleSheet("color: #888; font-style: italic;")
+
+                if self.zstack_z_min_spin:
+                    self.zstack_z_min_spin.setRange(0.0, 200.0)
+                    self.zstack_z_min_spin.setValue(0.0)
+                if self.zstack_z_max_spin:
+                    self.zstack_z_max_spin.setRange(0.0, 200.0)
+                    self.zstack_z_max_spin.setValue(76.0)
+                self._update_zstack_storage_estimate()
     
     def _on_test_detection(self):
         """Handler para test de detección."""
@@ -987,7 +1166,8 @@ class CameraTab(QWidget):
         params = detector.get_parameters()
         device_str = "GPU" if "cuda" in params['device'] else "CPU"
         model_str = "U2NETP" if params['model_loaded'] else "Contornos"
-        self.u2net_status_label.setText(f"Modelo: {model_str} | Device: {device_str}")
+        if self.u2net_status_label:
+            self.u2net_status_label.setText(f"Modelo: {model_str} | Device: {device_str}")
         
         # Mostrar confirmación en UI y log
         params = detector.get_parameters()
@@ -997,7 +1177,7 @@ class CameraTab(QWidget):
     
     def _update_u2net_params(self, restore_defaults=False):
         """Actualiza parámetros individuales del detector U2NET."""
-        from core.detection.u2net_detector import U2NetDetector, DetectionMode
+        from core.detection.u2net_detector import U2NetDetector
         
         logger.info(f"[CameraTab] _update_u2net_params() LLAMADO (restore_defaults={restore_defaults})")
         
@@ -1107,12 +1287,14 @@ class CameraTab(QWidget):
                 # Validar rango contra límites del C-Focus
                 cfocus_limits = None
                 if self.parent_gui and hasattr(self.parent_gui, 'cfocus_enabled') and self.parent_gui.cfocus_enabled:
-                    cfocus = getattr(self.parent_gui, 'cfocus', None)
+                    cfocus = getattr(self.parent_gui, 'cfocus_controller', None)
                     if cfocus:
+                        calib = cfocus.get_calibration_info() if hasattr(cfocus, 'get_calibration_info') else {}
+                        current_z = cfocus.read_z() if hasattr(cfocus, 'read_z') else None
                         cfocus_limits = {
-                            'z_min': cfocus.z_min,
-                            'z_max': cfocus.z_max,
-                            'current_z': cfocus.get_position()
+                            'z_min': calib.get('z_min', 0.0),
+                            'z_max': calib.get('z_max', 0.0),
+                            'current_z': current_z if current_z is not None else calib.get('z_center', 0.0)
                         }
                 
                 is_valid, msg = self.orchestrator.validate_autofocus_params(config, cfocus_limits)
@@ -1137,40 +1319,61 @@ class CameraTab(QWidget):
                     )
     
     def _run_autofocus(self, capture_after=False):
-        """Ejecuta detección + autofoco usando CameraOrchestrator."""
+        """Ejecuta detección + autofoco usando SmartFocusScorer con métrica S."""
+        logger.info("[CameraTab] _run_autofocus: Iniciando (capture_after=%s)", capture_after)
+        
         # Obtener frame actual
         current_frame = None
         if self.camera_service and self.camera_service.current_frame is not None:
             current_frame = self.camera_service.current_frame
-        elif self.camera_worker and self.camera_worker.current_frame is not None:
-            current_frame = self.camera_worker.current_frame
+            logger.debug("[CameraTab] Frame obtenido desde camera_service")
+        elif self.camera_service and self.camera_service.worker and self.camera_service.worker.current_frame is not None:
+            current_frame = self.camera_service.worker.current_frame
+            logger.debug("[CameraTab] Frame obtenido desde camera_worker")
         
         if current_frame is None:
             self.log_message("❌ No hay frame disponible")
+            logger.error("[CameraTab] No hay frame disponible para autofoco")
             return
         
-        # Validar orchestrator
+        # Validar orchestrator y scorer
         if self.orchestrator is None:
             self.log_message("❌ CameraOrchestrator no disponible")
+            logger.error("[CameraTab] CameraOrchestrator no disponible")
             if capture_after:
                 self._do_capture_image()
+            return
+        
+        if not self.orchestrator.scorer:
+            self.log_message("❌ SmartFocusScorer no disponible")
+            logger.error("[CameraTab] SmartFocusScorer no está inicializado")
             return
         
         # Actualizar parámetros de detección
         self._update_detection_params()
         min_area = self.min_pixels_spin.value()
         max_area = self.max_pixels_spin.value()
-        self.log_message(f"🔍 Detectando objetos (área: {min_area}-{max_area} px)...")
+        
+        self.log_message(f"🔍 Detectando objetos salientes...")
+        self.log_message(f"   Área filtro: {min_area}-{max_area} px")
+        self.log_message(f"   Scorer: {self.orchestrator.scorer.__class__.__name__}")
+        logger.info(f"[CameraTab] Parámetros autofoco - min_area={min_area}, max_area={max_area}")
         
         # Actualizar frame en orchestrator
         self.orchestrator.set_current_frame(current_frame)
+        logger.debug("[CameraTab] Frame actualizado en orchestrator")
         
-        # Delegar a orchestrator
+        # Delegar a orchestrator (usa SmartFocusScorer internamente con métrica S)
+        self.log_message("🎯 Ejecutando barrido Z para encontrar mejor plano focal...")
+        logger.info("[CameraTab] Delegando autofoco a CameraOrchestrator")
+        
         self.orchestrator.run_autofocus(
             capture_after=capture_after,
             min_area=min_area,
             max_area=max_area
         )
+        
+        logger.info("[CameraTab] Autofoco delegado correctamente")
     
     # ==================================================================
     # CALLBACKS DE SERVICIO
@@ -1180,6 +1383,17 @@ class CameraTab(QWidget):
         """Callback cuando la cámara se conecta."""
         if success:
             self.set_connected(True, info)
+            
+            # Actualizar campos de resolución con la resolución REAL de la cámara
+            if self.camera_service:
+                width, height = self.camera_service.get_resolution()
+                if self.img_width_input:
+                    self.img_width_input.setText(str(width))
+                    logger.info(f"[CameraTab] img_width actualizado a {width}px (resolución real)")
+                if self.img_height_input:
+                    self.img_height_input.setText(str(height))
+                    logger.info(f"[CameraTab] img_height actualizado a {height}px (resolución real)")
+                self.log_message(f"📐 Resolución detectada: {width}x{height}px")
         else:
             self.log_message(f"❌ Fallo al conectar: {info}")
             QMessageBox.critical(self.parent_gui, "Error", f"Fallo al conectar:\n{info}")
@@ -1276,11 +1490,16 @@ class CameraTab(QWidget):
     # UTILIDADES
     # ==================================================================
     
-    def _browse_folder(self):
+    def _on_browse_folder(self):
         """Abre diálogo para seleccionar carpeta."""
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de guardado")
         if folder:
             self.save_folder_input.setText(folder)
+            # Actualizar label de Z-Stack para mostrar dónde se guardarán los datos
+            if 'zstack_save_folder_label' in self._widgets:
+                self._widgets['zstack_save_folder_label'].setText(folder)
+                self._widgets['zstack_save_folder_label'].setStyleSheet("color: #27AE60; font-weight: bold;")
+                logger.info(f"[CameraTab] Carpeta Z-Stack actualizada: {folder}")
     
     def _browse_microscopy_folder(self):
         """Abre diálogo para seleccionar carpeta de microscopía."""
@@ -1319,6 +1538,106 @@ class CameraTab(QWidget):
                 
         except ValueError:
             self.storage_estimate_label.setText("~0 MB")
+
+    def _on_zstack_channel_toggled(self, channel_widget, checked: bool):
+        """Mantiene selección monobanda (exactamente 1 canal activo)."""
+        if not checked:
+            # Evitar estado inválido sin canal seleccionado
+            if not any([
+                self.zstack_channel_r_check.isChecked() if self.zstack_channel_r_check else False,
+                self.zstack_channel_g_check.isChecked() if self.zstack_channel_g_check else False,
+                self.zstack_channel_b_check.isChecked() if self.zstack_channel_b_check else False,
+            ]):
+                channel_widget.blockSignals(True)
+                channel_widget.setChecked(True)
+                channel_widget.blockSignals(False)
+            self._update_zstack_storage_estimate()
+            return
+
+        # Si se activa uno, desactivar los demás (checkboxes tipo radio)
+        for widget in (self.zstack_channel_r_check, self.zstack_channel_g_check, self.zstack_channel_b_check):
+            if widget is not None and widget is not channel_widget:
+                widget.blockSignals(True)
+                widget.setChecked(False)
+                widget.blockSignals(False)
+
+        self._update_zstack_storage_estimate()
+
+    def _on_capture_mode_toggled(self, zstack_mode: bool):
+        """Ajusta UI al modo de captura seleccionado."""
+        if zstack_mode:
+            self.log_message("ℹ️ Z-Stack: monobanda activa. Puedes usar TIFF/PNG/JPG.")
+            self._on_zstack_format_changed(self.image_format_combo.currentText() if self.image_format_combo else "TIFF")
+        else:
+            if self.image_format_combo:
+                self.image_format_combo.setEnabled(True)
+            if self.use_16bit_check:
+                self.use_16bit_check.setEnabled(True)
+        self._update_zstack_storage_estimate()
+
+    def _on_zstack_format_changed(self, fmt_text: str):
+        """Ajusta opciones de profundidad al formato seleccionado en modo Z-Stack."""
+        if not self.capture_zstack_radio or not self.capture_zstack_radio.isChecked():
+            return
+        fmt = (fmt_text or "").strip().upper()
+        if fmt == "JPG":
+            if self.use_16bit_check:
+                self.use_16bit_check.setChecked(False)
+                self.use_16bit_check.setEnabled(False)
+            self.log_message("ℹ️ Z-Stack JPG: guardado en 8-bit (limitación del formato).")
+        else:
+            if self.use_16bit_check:
+                self.use_16bit_check.setEnabled(True)
+        self._update_zstack_storage_estimate()
+
+    def _update_zstack_storage_estimate(self):
+        """Estimación rápida de tamaño para stack monobanda."""
+        if not self.zstack_storage_estimate_label:
+            return
+        try:
+            z_min = self.zstack_z_min_spin.value() if self.zstack_z_min_spin else 0.0
+            z_max = self.zstack_z_max_spin.value() if self.zstack_z_max_spin else 0.0
+            z_step = self.zstack_z_step_spin.value() if self.zstack_z_step_spin else 0.1
+            if z_step <= 0 or z_max < z_min:
+                self.zstack_storage_estimate_label.setText("~0 MB")
+                return
+
+            n_images = int((z_max - z_min) / z_step) + 1
+            if self.zstack_n_images_spin:
+                self.zstack_n_images_spin.setValue(n_images)
+
+            if self.camera_service:
+                width, height = self.camera_service.get_resolution()
+            else:
+                width, height = 1920, 1080
+
+            fmt = self.image_format_combo.currentText().strip().upper() if self.image_format_combo else "TIFF"
+            use_16bit = self.use_16bit_check.isChecked() if self.use_16bit_check else True
+            if fmt == "JPG":
+                effective_bpp = 1
+                bit_label = "8-bit"
+            else:
+                effective_bpp = 2 if use_16bit else 1
+                bit_label = "16-bit" if use_16bit else "8-bit"
+
+            total_bytes = max(1, n_images) * width * height * effective_bpp
+            if total_bytes < 1024 * 1024:
+                size_text = f"~{total_bytes / 1024:.1f} KB"
+            elif total_bytes < 1024 * 1024 * 1024:
+                size_text = f"~{total_bytes / (1024 * 1024):.1f} MB"
+            else:
+                size_text = f"~{total_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+            channel = 'G'
+            if self.zstack_channel_r_check and self.zstack_channel_r_check.isChecked():
+                channel = 'R'
+            elif self.zstack_channel_b_check and self.zstack_channel_b_check.isChecked():
+                channel = 'B'
+            self.zstack_storage_estimate_label.setText(
+                f"{size_text} ({n_images} img, mono-{channel}, {bit_label}, {fmt})"
+            )
+        except Exception:
+            self.zstack_storage_estimate_label.setText("~0 MB")
     
     def set_test_tab_reference(self, test_tab):
         """Configura la referencia a TestTab para sincronizar trayectoria."""
@@ -1348,7 +1667,6 @@ class CameraTab(QWidget):
     def on_detection_ready(self, saliency_map, objects):
         """Callback cuando hay nuevos resultados de detección."""
         logger.info(f"[CameraTab] ✅ RECIBIDO detection_ready: {len(objects)} objetos")
-        print(f"[CameraTab] ✅ RECIBIDO detection_ready: {len(objects)} objetos")
         
         if hasattr(self, 'saliency_widget') and self.saliency_widget:
             self.saliency_widget.update_detection(saliency_map, objects)
@@ -1357,13 +1675,11 @@ class CameraTab(QWidget):
         # CRÍTICO: Actualizar lista de objetos en ventana de cámara
         if self.camera_view_window and self.camera_view_window.isVisible():
             logger.info(f"[CameraTab] Ventana de cámara visible, actualizando lista de objetos...")
-            print(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service con {len(objects)} objetos")
             self.camera_view_window.update_detection_from_service(saliency_map, objects)
             self.log_message(f"✅ {len(objects)} objetos detectados por SAM")
             logger.info(f"[CameraTab] Lista de objetos actualizada en ventana de cámara")
         else:
             logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible: window={self.camera_view_window}, visible={self.camera_view_window.isVisible() if self.camera_view_window else 'N/A'}")
-            print(f"[CameraTab] ⚠️ VENTANA DE CÁMARA NO VISIBLE - objetos NO se mostrarán")
     
     def on_detection_status(self, status: str):
         """Callback cuando cambia el estado del servicio de detección."""
@@ -1410,3 +1726,24 @@ class CameraTab(QWidget):
         if folder and self.camera_service:
             img_format = self.image_format_combo.currentText().lower()
             self.camera_service.capture_image(folder, img_format)
+
+    def _set_numeric_widget_value(self, widget, value: float):
+        """Setea valores numéricos tanto en QLineEdit como en spinboxes."""
+        if widget is None:
+            return
+        if hasattr(widget, 'setValue'):
+            widget.setValue(value)
+            return
+        if hasattr(widget, 'setText'):
+            widget.setText(f"{value:.3f}".rstrip('0').rstrip('.'))
+
+    def _get_numeric_widget_value(self, widget, default: float = 0.0) -> float:
+        """Lee valores numéricos tanto de QLineEdit como de spinboxes."""
+        if widget is None:
+            return default
+        if hasattr(widget, 'value'):
+            return float(widget.value())
+        if hasattr(widget, 'text'):
+            text_value = widget.text().strip()
+            return float(text_value) if text_value else default
+        return default

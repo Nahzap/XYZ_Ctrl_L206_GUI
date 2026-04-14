@@ -120,6 +120,7 @@ class CFocusController:
         self.mcl_dll = None
         self.handle = 0
         self.z_range = 0.0
+        self.z_range_hw = 0.0  # Rango nativo reportado por hardware (inmutable durante sesión)
         self.is_connected = False
         
         self.settle_time = 0.15
@@ -153,6 +154,7 @@ class CFocusController:
                 return False, "Error: No se pudo inicializar handle (dispositivo no conectado o en uso)"
             
             self.z_range = self.mcl_dll.MCL_GetCalibration(3, self.handle)
+            self.z_range_hw = self.z_range
             
             if self.z_range <= 0:
                 self.disconnect()
@@ -182,6 +184,12 @@ class CFocusController:
             finally:
                 self.handle = 0
                 self.is_connected = False
+                self.z_range = 0.0
+                self.z_range_hw = 0.0
+                self.z_min_calibrated = 0.0
+                self.z_max_calibrated = 0.0
+                self.z_center_calibrated = None
+                self.z_range_calibrated = 0.0
     
     def move_z(self, position_um: float) -> bool:
         """
@@ -258,6 +266,7 @@ class CFocusController:
             'z_max': self.z_max_calibrated,
             'z_center': self.z_center_calibrated,
             'z_range': self.z_range_calibrated,
+            'z_range_hw': self.z_range_hw,
             'is_calibrated': self.z_center_calibrated is not None
         }
     
@@ -389,22 +398,28 @@ class CFocusController:
         
         logger.info("[CFocus] ===== INICIANDO CALIBRACIÓN DE LÍMITES =====")
         
-        # Obtener rango del hardware
-        z_max_hw = self.z_range
+        # Obtener rango del hardware original (no usar rango calibrado anterior)
+        z_max_hw = self.z_range_hw if self.z_range_hw > 0 else self.z_range
         logger.info(f"[CFocus] Rango hardware: 0 - {z_max_hw:.2f} µm")
         
         # Mover a Z=0 (límite inferior)
         logger.info("[CFocus] Moviendo a Z=0 (límite inferior)...")
-        self.move_z(0.0)
+        if not self.move_z(0.0):
+            raise RuntimeError("No se pudo mover a límite inferior (Z=0)")
         time.sleep(0.5)
         z_min_actual = self.read_z()
+        if z_min_actual is None:
+            raise RuntimeError("No se pudo leer Z en límite inferior")
         logger.info(f"[CFocus] ✓ Límite inferior confirmado: Z={z_min_actual:.2f} µm")
         
         # Mover a Z_max (límite superior)
         logger.info(f"[CFocus] Moviendo a Z={z_max_hw:.2f} (límite superior)...")
-        self.move_z(z_max_hw)
+        if not self.move_z(z_max_hw):
+            raise RuntimeError(f"No se pudo mover a límite superior (Z={z_max_hw:.2f})")
         time.sleep(0.5)
         z_max_actual = self.read_z()
+        if z_max_actual is None:
+            raise RuntimeError("No se pudo leer Z en límite superior")
         logger.info(f"[CFocus] ✓ Límite superior confirmado: Z={z_max_actual:.2f} µm")
         
         # Calcular centro
@@ -416,11 +431,12 @@ class CFocusController:
         self.z_max_calibrated = z_max_actual
         self.z_center_calibrated = z_center
         self.z_range_calibrated = z_range_actual
-        self.z_range = z_range_actual  # Actualizar z_range con valor real
+        # Mantener z_range como referencia de hardware y usar z_range_calibrated para span útil
         
         # Mover al centro
         logger.info(f"[CFocus] Moviendo al CENTRO: Z={z_center:.2f} µm...")
-        self.move_z(z_center)
+        if not self.move_z(z_center):
+            raise RuntimeError(f"No se pudo mover al centro calibrado (Z={z_center:.2f})")
         time.sleep(0.3)
         
         # Configurar modo BPoF con el centro calibrado
@@ -443,6 +459,7 @@ class CFocusController:
         logger.info(f"[CFocus] Límites: {z_min_actual:.2f} - {z_max_actual:.2f} µm")
         logger.info(f"[CFocus] Centro: {z_center:.2f} µm")
         logger.info(f"[CFocus] Rango: {z_range_actual:.2f} µm")
+        logger.info(f"[CFocus] Referencia hardware preservada: 0 - {z_max_hw:.2f} µm")
         
         return result
     

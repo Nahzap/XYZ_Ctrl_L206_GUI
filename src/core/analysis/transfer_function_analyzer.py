@@ -12,6 +12,7 @@ MEJORAS 2025-12-17:
 import logging
 import traceback
 from datetime import datetime
+from copy import deepcopy
 import pandas as pd
 import numpy as np
 from matplotlib.figure import Figure
@@ -471,6 +472,32 @@ class TransferFunctionAnalyzer:
         """Limpia la lista de funciones de transferencia."""
         self.identified_functions = []
         logger.info("Lista de funciones de transferencia limpiada")
+
+    def restore_identified_functions(self, entries):
+        """
+        Restaura lista de funciones identificadas desde persistencia.
+
+        Args:
+            entries: Lista de dicts serializables.
+        """
+        if not isinstance(entries, list):
+            logger.warning("restore_identified_functions recibió datos inválidos")
+            return
+
+        restored = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if "motor" not in entry or "sensor" not in entry:
+                continue
+            restored.append(deepcopy(entry))
+
+        self.identified_functions = restored
+        logger.info(f"Funciones de transferencia restauradas: {len(restored)}")
+
+    def get_identified_functions_serializable(self):
+        """Retorna copia serializable de funciones identificadas."""
+        return deepcopy(self.identified_functions)
     
     def _save_calibration_to_json(self, motor: str, sensor: str, intercepto: float, pendiente: float):
         """

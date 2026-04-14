@@ -551,6 +551,63 @@ class TestTab(QWidget):
             )
             self.test_service.set_controller_b(config)
             logger.info(f"Controlador B guardado en TestTab y TestService")
+
+    def get_controller_preferences(self):
+        """Retorna preferencias de sensor/inversión por motor."""
+        sensor_map = {
+            'A': 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1',
+            'B': 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2',
+        }
+        invert_map = {
+            'A': bool(self.motor_a_invert.isChecked()),
+            'B': bool(self.motor_b_invert.isChecked()),
+        }
+        return sensor_map, invert_map
+
+    def apply_controller_preferences(self, sensor_map=None, invert_map=None):
+        """Aplica preferencias guardadas de sensor/inversión."""
+        sensor_map = sensor_map or {}
+        invert_map = invert_map or {}
+
+        sensor_a = sensor_map.get('A')
+        if sensor_a == 'sensor_2':
+            self.motor_a_sensor2.setChecked(True)
+        elif sensor_a == 'sensor_1':
+            self.motor_a_sensor1.setChecked(True)
+
+        sensor_b = sensor_map.get('B')
+        if sensor_b == 'sensor_1':
+            self.motor_b_sensor1.setChecked(True)
+        elif sensor_b == 'sensor_2':
+            self.motor_b_sensor2.setChecked(True)
+
+        if 'A' in invert_map:
+            self.motor_a_invert.setChecked(bool(invert_map.get('A')))
+        if 'B' in invert_map:
+            self.motor_b_invert.setChecked(bool(invert_map.get('B')))
+
+    def _serializable_controller(self, controller_data):
+        """Convierte controlador de UI a formato serializable."""
+        if not isinstance(controller_data, dict):
+            return None
+        return {
+            'Kp': float(controller_data.get('Kp', 0.0)),
+            'Ki': float(controller_data.get('Ki', 0.0)),
+            'K': float(controller_data.get('K', 0.0)),
+            'tau': float(controller_data.get('tau', 0.0)),
+            'U_max': float(controller_data.get('U_max', 100.0)),
+            'gamma': float(controller_data.get('gamma', 0.0)),
+            'K_sign': float(controller_data.get('K_sign', 1.0)),
+            'Ms': float(controller_data.get('Ms', 0.0)),
+            'wb': float(controller_data.get('wb', 0.0)),
+        }
+
+    def get_serializable_controllers(self):
+        """Retorna controladores A/B en formato serializable."""
+        return {
+            'A': self._serializable_controller(self.controller_a),
+            'B': self._serializable_controller(self.controller_b),
+        }
     
     def clear_controller(self, motor: str):
         """Limpia el controlador de un motor."""

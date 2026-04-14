@@ -243,38 +243,106 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     zstack_params_layout = QGridLayout()
     zstack_params_layout.setContentsMargins(20, 5, 5, 5)
     
-    # Número de imágenes
-    zstack_params_layout.addWidget(QLabel("Imágenes:"), 0, 0)
-    widgets['zstack_n_images_spin'] = QSpinBox()
-    widgets['zstack_n_images_spin'].setRange(3, 10000)
-    widgets['zstack_n_images_spin'].setValue(200)
-    widgets['zstack_n_images_spin'].setToolTip("Número total de imágenes a capturar en el Z-Stack (sin límite)")
-    widgets['zstack_n_images_spin'].setFixedWidth(70)
-    zstack_params_layout.addWidget(widgets['zstack_n_images_spin'], 0, 1)
+    # FILA 1: Z Mínimo y Z Máximo (solo lectura desde hardware calibrado)
+    zstack_params_layout.addWidget(QLabel("Z Min (µm):"), 0, 0)
+    widgets['zstack_z_min_spin'] = QDoubleSpinBox()
+    widgets['zstack_z_min_spin'].setRange(0.0, 200.0)
+    widgets['zstack_z_min_spin'].setValue(0.0)
+    widgets['zstack_z_min_spin'].setDecimals(2)
+    widgets['zstack_z_min_spin'].setSingleStep(0.5)
+    widgets['zstack_z_min_spin'].setToolTip("Límite mínimo del hardware (solo lectura, definido por calibración)")
+    widgets['zstack_z_min_spin'].setFixedWidth(80)
+    widgets['zstack_z_min_spin'].setEnabled(False)
+    zstack_params_layout.addWidget(widgets['zstack_z_min_spin'], 0, 1)
     
-    # Paso Z para el scan (COMANDA las slices)
-    zstack_params_layout.addWidget(QLabel("Paso Z (µm):"), 0, 2)
+    zstack_params_layout.addWidget(QLabel("Z Max (µm):"), 0, 2)
+    widgets['zstack_z_max_spin'] = QDoubleSpinBox()
+    widgets['zstack_z_max_spin'].setRange(0.0, 200.0)
+    widgets['zstack_z_max_spin'].setValue(76.0)
+    widgets['zstack_z_max_spin'].setDecimals(2)
+    widgets['zstack_z_max_spin'].setSingleStep(0.5)
+    widgets['zstack_z_max_spin'].setToolTip("Límite máximo del hardware (solo lectura, definido por calibración)")
+    widgets['zstack_z_max_spin'].setFixedWidth(80)
+    widgets['zstack_z_max_spin'].setEnabled(False)
+    zstack_params_layout.addWidget(widgets['zstack_z_max_spin'], 0, 3)
+    
+    # FILA 2: Paso Z y Número de Imágenes (calculado)
+    zstack_params_layout.addWidget(QLabel("Paso Z (µm):"), 1, 0)
     widgets['zstack_z_step_spin'] = QDoubleSpinBox()
     widgets['zstack_z_step_spin'].setRange(0.001, 10.0)
     widgets['zstack_z_step_spin'].setValue(0.05)
     widgets['zstack_z_step_spin'].setDecimals(3)
     widgets['zstack_z_step_spin'].setSingleStep(0.01)
-    widgets['zstack_z_step_spin'].setToolTip("Paso Z que COMANDA las slices del Z-Stack (C-Focus soporta hasta 0.001µm)")
+    widgets['zstack_z_step_spin'].setToolTip("Paso Z entre imágenes consecutivas")
     widgets['zstack_z_step_spin'].setFixedWidth(80)
-    zstack_params_layout.addWidget(widgets['zstack_z_step_spin'], 0, 3)
+    widgets['zstack_z_step_spin'].setEnabled(True)
+    zstack_params_layout.addWidget(widgets['zstack_z_step_spin'], 1, 1)
     
-    # Indicador de rango Z del C-Focus (segunda fila)
-    zstack_params_layout.addWidget(QLabel("Rango C-Focus:"), 1, 0)
+    zstack_params_layout.addWidget(QLabel("N° Imágenes:"), 1, 2)
+    widgets['zstack_n_images_spin'] = QSpinBox()
+    widgets['zstack_n_images_spin'].setRange(3, 10000)
+    widgets['zstack_n_images_spin'].setValue(200)
+    widgets['zstack_n_images_spin'].setToolTip("Número calculado: (Z_max - Z_min) / Paso_Z + 1")
+    widgets['zstack_n_images_spin'].setFixedWidth(80)
+    widgets['zstack_n_images_spin'].setEnabled(False)  # READONLY - calculado automáticamente
+    widgets['zstack_n_images_spin'].setStyleSheet("QSpinBox { background-color: #2a2a2a; }")
+    zstack_params_layout.addWidget(widgets['zstack_n_images_spin'], 1, 3)
+    
+    # Función para calcular N imágenes automáticamente
+    def update_n_images():
+        z_min = widgets['zstack_z_min_spin'].value()
+        z_max = widgets['zstack_z_max_spin'].value()
+        z_step = widgets['zstack_z_step_spin'].value()
+        if z_step > 0 and z_max >= z_min:
+            n_images = int((z_max - z_min) / z_step) + 1
+            widgets['zstack_n_images_spin'].setValue(n_images)
+    
+    widgets['zstack_z_min_spin'].valueChanged.connect(update_n_images)
+    widgets['zstack_z_max_spin'].valueChanged.connect(update_n_images)
+    widgets['zstack_z_step_spin'].valueChanged.connect(update_n_images)
+    
+    # FILA 3: Indicador de rango calibrado C-Focus
+    zstack_params_layout.addWidget(QLabel("Rango C-Focus:"), 2, 0)
     widgets['zstack_cfocus_range_label'] = QLabel("0.0 - 0.0 µm")
     widgets['zstack_cfocus_range_label'].setStyleSheet("color: #888; font-style: italic;")
-    widgets['zstack_cfocus_range_label'].setToolTip("Rango calibrado del C-Focus (min - max)")
-    zstack_params_layout.addWidget(widgets['zstack_cfocus_range_label'], 1, 1, 1, 3)
+    widgets['zstack_cfocus_range_label'].setToolTip("Rango calibrado del C-Focus (solo lectura)")
+    zstack_params_layout.addWidget(widgets['zstack_cfocus_range_label'], 2, 1, 1, 3)
     
-    # Checkboxes
+    # FILA 4: Carpeta de destino (MOSTRAR DÓNDE SE GUARDAN LOS DATOS)
+    zstack_params_layout.addWidget(QLabel("Guardar en:"), 3, 0)
+    widgets['zstack_save_folder_label'] = QLabel("(usar carpeta principal)")
+    widgets['zstack_save_folder_label'].setStyleSheet("color: #3498db; font-style: italic;")
+    widgets['zstack_save_folder_label'].setToolTip("Las imágenes Z-Stack se guardarán en la carpeta seleccionada arriba")
+    zstack_params_layout.addWidget(widgets['zstack_save_folder_label'], 3, 1, 1, 3)
+    
+    # FILA 5: Canal monobanda (R/G/B)
+    zstack_params_layout.addWidget(QLabel("Canal (mono):"), 4, 0)
+    channel_layout = QHBoxLayout()
+    widgets['zstack_channel_r_check'] = QCheckBox("R")
+    widgets['zstack_channel_r_check'].setStyleSheet("color: #E74C3C; font-weight: bold;")
+    channel_layout.addWidget(widgets['zstack_channel_r_check'])
+    widgets['zstack_channel_g_check'] = QCheckBox("G")
+    widgets['zstack_channel_g_check'].setStyleSheet("color: #27AE60; font-weight: bold;")
+    widgets['zstack_channel_g_check'].setChecked(True)
+    channel_layout.addWidget(widgets['zstack_channel_g_check'])
+    widgets['zstack_channel_b_check'] = QCheckBox("B")
+    widgets['zstack_channel_b_check'].setStyleSheet("color: #3498DB; font-weight: bold;")
+    channel_layout.addWidget(widgets['zstack_channel_b_check'])
+    channel_layout.addStretch()
+    zstack_params_layout.addLayout(channel_layout, 4, 1, 1, 3)
+
+    # FILA 6: Checkboxes
     widgets['zstack_save_json_check'] = QCheckBox("Guardar JSON con metadatos")
     widgets['zstack_save_json_check'].setChecked(True)
     widgets['zstack_save_json_check'].setToolTip("Guarda archivo JSON con información de Z, scores y parámetros")
-    zstack_params_layout.addWidget(widgets['zstack_save_json_check'], 2, 0, 1, 2)
+    zstack_params_layout.addWidget(widgets['zstack_save_json_check'], 5, 0, 1, 2)
+
+    # FILA 7: Estimación de tamaño
+    zstack_params_layout.addWidget(QLabel("Tamaño aprox.:"), 6, 0)
+    widgets['zstack_storage_estimate_label'] = QLabel("~0 MB")
+    widgets['zstack_storage_estimate_label'].setStyleSheet("font-weight: bold; color: #F39C12;")
+    widgets['zstack_storage_estimate_label'].setToolTip("Estimación sin compresión para stack monobanda 16-bit")
+    zstack_params_layout.addWidget(widgets['zstack_storage_estimate_label'], 6, 1, 1, 3)
     
     zstack_params.setLayout(zstack_params_layout)
     widgets['zstack_params_widget'] = zstack_params
@@ -282,16 +350,19 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     method_layout.addWidget(zstack_params)
     
     # Conectar radio button para mostrar/ocultar parámetros
-    widgets['capture_zstack_radio'].toggled.connect(
-        lambda checked: zstack_params.setVisible(checked)
-    )
+    def toggle_zstack_params(checked: bool):
+        zstack_params.setVisible(checked)
+
+    widgets['capture_zstack_radio'].toggled.connect(toggle_zstack_params)
+    # Estado inicial coherente con selección por defecto
+    toggle_zstack_params(widgets['capture_zstack_radio'].isChecked())
     
     method_group.setLayout(method_layout)
     layout.addWidget(method_group)
     
     # Botones de captura
     btn_layout = QHBoxLayout()
-    widgets['capture_btn'] = QPushButton("📸 Capturar Z-Stack")
+    widgets['capture_btn'] = QPushButton("📸 Captura Simple")
     widgets['capture_btn'].setStyleSheet("""
         QPushButton { font-size: 14px; font-weight: bold; padding: 10px; background-color: #E67E22; }
         QPushButton:hover { background-color: #F39C12; }
@@ -300,6 +371,17 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     widgets['capture_btn'].setEnabled(False)
     widgets['capture_btn'].clicked.connect(capture_cb)
     btn_layout.addWidget(widgets['capture_btn'])
+    
+    # Función para actualizar texto del botón según modo de captura
+    def update_capture_btn_text(checked):
+        if checked:  # Z-Stack seleccionado
+            widgets['capture_btn'].setText("📸 Capturar Z-Stack")
+        else:  # Captura simple
+            widgets['capture_btn'].setText("📸 Captura Simple")
+    
+    # Conectar cambio de radio button
+    widgets['capture_zstack_radio'].toggled.connect(update_capture_btn_text)
+    update_capture_btn_text(widgets['capture_zstack_radio'].isChecked())
     
     widgets['focus_btn'] = QPushButton("🎯 Enfocar Objs")
     widgets['focus_btn'].setStyleSheet("""

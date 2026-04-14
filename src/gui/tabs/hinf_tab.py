@@ -101,6 +101,7 @@ class HInfTab(QWidget):
         self.bode_window = None
         
         self._setup_ui()
+        self.current_slot_key = None  # Ej: "A_2"
         logger.debug("HInfTab inicializado")
     
     def set_hardware_callbacks(self, send_command, get_sensor_value, get_mode_label):
@@ -244,6 +245,7 @@ class HInfTab(QWidget):
         
         load_prev_btn = QPushButton("📂 Cargar Controlador Previo")
         load_prev_btn.setStyleSheet("background: #8E44AD; font-weight: bold;")
+        load_prev_btn.clicked.connect(self.load_previous_controller)
         btn_layout.addWidget(load_prev_btn)
         
         layout.addLayout(btn_layout, 0, 3, 2, 1)
@@ -390,6 +392,7 @@ class HInfTab(QWidget):
         if len(tf_list) == 1:
             tf = tf_list[0]
             self.set_plant_params(tf['K'], tf['tau'])
+            self.current_slot_key = f"{tf['motor']}_{tf['sensor']}"
             
             tau_slow = tf.get('tau_slow', 1000.0)
             msg = (
@@ -411,6 +414,7 @@ class HInfTab(QWidget):
         # Si hay múltiples, mostrar solo la más reciente
         tf = tf_list[-1]  # La más reciente
         self.set_plant_params(tf['K'], tf['tau'])
+        self.current_slot_key = f"{tf['motor']}_{tf['sensor']}"
         
         msg = (
             f"✅ Parámetros cargados (última función):\n"
@@ -461,6 +465,8 @@ class HInfTab(QWidget):
     def load_previous_controller(self):
         """Carga un controlador H∞ guardado desde archivo pickle."""
         hinf_load_previous_controller(self)
+        if hasattr(self.parent_gui, '_save_session_state'):
+            self.parent_gui._save_session_state()
     
     # ============================================================
     # CONTROL H∞ EN TIEMPO REAL (usando callbacks de hardware)
@@ -488,12 +494,149 @@ class HInfTab(QWidget):
     def synthesize_hinf_controller(self):
         """Sintetiza el controlador H∞ usando control.mixsyn() - Método estándar."""
         hinf_synthesize_controller(self)
+        if self.synthesized_controller is not None and hasattr(self.parent_gui, '_save_session_state'):
+            self.parent_gui._save_session_state()
 
 
     def set_test_tab_reference(self, test_tab):
         """Configura la referencia a TestTab para transferencias."""
         self.test_tab_reference = test_tab
         logger.debug(f"TestTab reference configurada en HInfTab")
+
+    def get_active_slot_key(self):
+        """Retorna slot activo (motor_sensor) para persistencia."""
+        return self.current_slot_key or "DEFAULT"
+
+    def set_active_slot_key(self, slot_key):
+        """Permite fijar slot activo desde persistencia."""
+        if isinstance(slot_key, str) and slot_key:
+            self.current_slot_key = slot_key
+
+    def _tf_to_num_den(self, system):
+        """Convierte sistema control.TransferFunction/StateSpace a num/den serializable."""
+        if system is None:
+            return None, None
+
+        if hasattr(system, 'A') and not hasattr(system, 'num'):
+            tf_system = ct.ss2tf(system)
+            num = np.array(tf_system.num[0][0]).flatten().tolist()
+            den = np.array(tf_system.den[0][0]).flatten().tolist()
+            return num, den
+
+        num = np.array(system.num[0][0]).flatten().tolist()
+        den = np.array(system.den[0][0]).flatten().tolist()
+        return num, den
+
+    def build_hinf_snapshot(self):
+        """
+        Construye snapshot serializable del estado H∞ actual.
+
+        Returns:
+            dict o None si no hay síntesis válida.
+        """
+        if self.synthesized_controller is None or self.synthesized_plant is None:
+            return None
+
+        try:
+            controller_num, controller_den = self._tf_to_num_den(self.synthesized_controller)
+            plant_num, plant_den = self._tf_to_num_den(self.synthesized_plant)
+            snapshot = {
+                'slot_key': self.get_active_slot_key(),
+                'plant': {
+                    'K': float(self.K_input.text()),
+                    'tau': float(self.tau_input.text()),
+                    'num': plant_num,
+                    'den': plant_den,
+                },
+                'weights': {
+                    'method': self.method_combo.currentText(),
+                    'Ms': float(self.w1_Ms.text()),
+                    'wb': float(self.w1_wb.text()),
+                    'eps': float(self.w1_eps.text()),
+                    'U_max': float(self.w2_umax.text()),
+                    'w_unc': float(self.w3_wunc.text()),
+                    'eps_T': float(self.w3_epsT.text()),
+                    'invert_pwm': bool(self.invert_pwm.isChecked()),
+                },
+                'result': {
+                    'gamma': float(self.gamma) if self.gamma is not None else 0.0,
+                    'Kp': float(getattr(self, 'Kp_designed', 0.0)),
+                    'Ki': float(getattr(self, 'Ki_designed', 0.0)),
+                    'K_value': float(getattr(self, 'K_value', self.K_input.text())),
+                    'tau_value': float(getattr(self, 'tau_value', self.tau_input.text())),
+                    'Umax_designed': float(getattr(self, 'Umax_designed', self.w2_umax.text())),
+                    'controller_num': controller_num,
+                    'controller_den': controller_den,
+                }
+            }
+            return snapshot
+        except Exception as e:
+            logger.error(f"No se pudo construir snapshot H∞: {e}")
+            return None
+
+    def apply_hinf_snapshot(self, snapshot):
+        """Restaura estado H∞ desde snapshot serializable."""
+        if not isinstance(snapshot, dict):
+            return False
+
+        try:
+            self.set_active_slot_key(snapshot.get('slot_key', 'DEFAULT'))
+
+            plant = snapshot.get('plant', {})
+            weights = snapshot.get('weights', {})
+            result = snapshot.get('result', {})
+
+            if 'K' in plant:
+                self.K_input.setText(str(plant.get('K')))
+            if 'tau' in plant:
+                self.tau_input.setText(str(plant.get('tau')))
+
+            if 'method' in weights:
+                idx = self.method_combo.findText(str(weights.get('method')))
+                if idx >= 0:
+                    self.method_combo.setCurrentIndex(idx)
+            if 'Ms' in weights:
+                self.w1_Ms.setText(str(weights.get('Ms')))
+            if 'wb' in weights:
+                self.w1_wb.setText(str(weights.get('wb')))
+            if 'eps' in weights:
+                self.w1_eps.setText(str(weights.get('eps')))
+            if 'U_max' in weights:
+                self.w2_umax.setText(str(weights.get('U_max')))
+            if 'w_unc' in weights:
+                self.w3_wunc.setText(str(weights.get('w_unc')))
+            if 'eps_T' in weights:
+                self.w3_epsT.setText(str(weights.get('eps_T')))
+            self.invert_pwm.setChecked(bool(weights.get('invert_pwm', True)))
+
+            controller_num = result.get('controller_num')
+            controller_den = result.get('controller_den')
+            plant_num = plant.get('num')
+            plant_den = plant.get('den')
+            if not all([controller_num, controller_den, plant_num, plant_den]):
+                return False
+
+            self.synthesized_controller = ct.TransferFunction(controller_num, controller_den)
+            self.synthesized_plant = ct.TransferFunction(plant_num, plant_den)
+            self.gamma = float(result.get('gamma', 0.0))
+
+            self.Kp_designed = float(result.get('Kp', 0.0))
+            self.Ki_designed = float(result.get('Ki', 0.0))
+            self.K_value = float(result.get('K_value', plant.get('K', 0.0)))
+            self.tau_value = float(result.get('tau_value', plant.get('tau', 0.0)))
+            self.Umax_designed = float(result.get('Umax_designed', weights.get('U_max', 100.0)))
+
+            self.control_btn.setEnabled(True)
+            self.transfer_btn.setEnabled(True)
+
+            self.results_text.append(
+                f"\n♻️ Modelo H∞ restaurado ({self.get_active_slot_key()}) | "
+                f"Kp={self.Kp_designed:.4f}, Ki={self.Ki_designed:.4f}, γ={self.gamma:.4f}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error restaurando snapshot H∞: {e}\n{traceback.format_exc()}")
+            return False
     
     def transfer_to_test(self):
         """Transfiere el controlador sintetizado a TestTab."""
@@ -634,4 +777,6 @@ class HInfTab(QWidget):
                                    f"Revisa la pestaña 'Prueba' para usar el controlador.")
             
             logger.info(f"Transferencia completada a {motor_names}")
+            if hasattr(self.parent_gui, '_save_session_state'):
+                self.parent_gui._save_session_state()
     

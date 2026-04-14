@@ -25,6 +25,7 @@ from collections import deque
 from datetime import datetime
 import csv
 import traceback
+from pathlib import Path
 
 # --- Importaciones PyQt5 (PRIMERO) ---
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QGridLayout,
@@ -83,6 +84,7 @@ from core.controllers import HInfController
 
 # Fase 9: Trayectorias
 from core.trajectory import TrajectoryGenerator
+from core.persistence import SessionStore
 
 # Fase 10: Pestañas GUI (Tabs modulares) - Integrado en Fase 12
 from gui.tabs import (ControlTab, RecordingTab, AnalysisTab, 
@@ -139,6 +141,7 @@ class ArduinoGUI(QMainWindow):
         
         # Inicializar analizador de transferencia (Fase 7)
         self.tf_analyzer = TransferFunctionAnalyzer()
+        self.session_store = SessionStore()
         
         # Inicializar controlador H∞ (Fase 8)
         self.hinf_designer = HInfController()
@@ -374,6 +377,9 @@ class ArduinoGUI(QMainWindow):
         # Conectar señal de datos seriales y arrancar thread
         self.serial_thread.data_received.connect(self.update_data)
         self.serial_thread.start()
+
+        # Restaurar sesión persistida (análisis + H∞ + TestTab)
+        self._load_session_state()
         
         # Actualizar estado inicial de conexión en ControlTab
         self._update_connection_status()
@@ -590,6 +596,122 @@ class ArduinoGUI(QMainWindow):
     def _on_analysis_completed(self, results: dict):
         """Callback cuando AnalysisTab completa análisis."""
         logger.info(f"AnalysisTab: Análisis completado - K={results.get('K', 0):.4f}")
+        try:
+            self._persist_analysis_result(results)
+            self._save_session_state()
+        except Exception as e:
+            logger.error(f"Error persistiendo resultado de análisis: {e}")
+
+    def _persist_analysis_result(self, results: dict):
+        """Guarda en sesión el contexto y resultado del último análisis."""
+        context = results.get('analysis_context') or self.analysis_tab.get_current_analysis_context()
+        if not isinstance(context, dict):
+            return
+
+        slot_key = context.get('slot_key') or SessionStore.slot_key(
+            context.get('motor', 'A'), context.get('sensor', '1')
+        )
+
+        payload = {
+            **context,
+            "last_identification": {
+                "K": float(results.get("K", 0.0)),
+                "tau": float(results.get("tau", 0.0)),
+                "tau_slow": float(results.get("tau_slow", 1000.0)),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "v_ss": float(results.get("v_ss", 0.0)),
+                "U": float(results.get("U", 0.0)),
+                "calibration_msg": results.get("calibracion_msg", ""),
+            },
+        }
+        self.session_store.set_analysis_slot(slot_key, payload)
+        self.session_store.set_identified_functions(
+            self.tf_analyzer.get_identified_functions_serializable()
+        )
+
+    def _persist_hinf_state(self):
+        """Guarda snapshot H∞ actual en sesión."""
+        snapshot = self.hinf_tab.build_hinf_snapshot()
+        if snapshot:
+            slot_key = snapshot.get("slot_key", self.hinf_tab.get_active_slot_key())
+            self.session_store.set_hinf_slot(slot_key, snapshot)
+
+    def _persist_test_state(self):
+        """Guarda controladores transferidos y preferencias de TestTab."""
+        controllers = self.test_tab.get_serializable_controllers()
+        self.session_store.set_test_controller("A", controllers.get("A"))
+        self.session_store.set_test_controller("B", controllers.get("B"))
+        sensor_map, invert_map = self.test_tab.get_controller_preferences()
+        self.session_store.set_test_preferences(sensor_map, invert_map)
+
+    def _save_session_state(self):
+        """Guarda estado global de sesión en disco."""
+        context = self.analysis_tab.get_current_analysis_context()
+        if isinstance(context, dict):
+            slot_key = context.get("slot_key") or SessionStore.slot_key(
+                context.get("motor", "A"), context.get("sensor", "1")
+            )
+            current_slots = self.session_store.get_session().get("analysis", {}).get("slots", {})
+            previous = current_slots.get(slot_key, {})
+            payload = {**context}
+            if "last_identification" in previous:
+                payload["last_identification"] = previous["last_identification"]
+            self.session_store.set_analysis_slot(slot_key, payload)
+
+        self._persist_hinf_state()
+        self._persist_test_state()
+        self.session_store.set_identified_functions(
+            self.tf_analyzer.get_identified_functions_serializable()
+        )
+        self.session_store.save()
+
+    def _load_session_state(self):
+        """Restaura estado persistido al iniciar la aplicación."""
+        data = self.session_store.load()
+        analysis_data = data.get("analysis", {})
+        hinf_data = data.get("hinf", {})
+        test_data = data.get("test", {})
+
+        # 1) Restaurar funciones de transferencia identificadas
+        identified = analysis_data.get("identified_functions", [])
+        self.tf_analyzer.restore_identified_functions(identified)
+        self.analysis_tab.update_tf_list()
+
+        # 2) Restaurar contexto de análisis del slot más relevante
+        slots = analysis_data.get("slots", {})
+        selected_slot = hinf_data.get("last_slot")
+        if not selected_slot and isinstance(slots, dict) and slots:
+            selected_slot = next(iter(slots.keys()))
+        if selected_slot and selected_slot in slots:
+            self.analysis_tab.apply_analysis_context(slots[selected_slot])
+            csv_path = slots[selected_slot].get("csv_path")
+            if csv_path and not Path(csv_path).exists():
+                logger.warning(f"CSV de sesión no encontrado: {csv_path}")
+
+        # 3) Restaurar modelo H∞ del último slot
+        hinf_slots = hinf_data.get("slots", {})
+        if selected_slot and selected_slot in hinf_slots:
+            restored = self.hinf_tab.apply_hinf_snapshot(hinf_slots[selected_slot])
+            if restored:
+                logger.info(f"Modelo H∞ restaurado para slot {selected_slot}")
+        elif isinstance(hinf_slots, dict) and hinf_slots:
+            first_slot = next(iter(hinf_slots.keys()))
+            restored = self.hinf_tab.apply_hinf_snapshot(hinf_slots[first_slot])
+            if restored:
+                logger.info(f"Modelo H∞ restaurado para slot {first_slot}")
+
+        # 4) Restaurar preferencias y controladores transferidos
+        self.test_tab.apply_controller_preferences(
+            test_data.get("sensor_map", {}),
+            test_data.get("invert_map", {}),
+        )
+        controllers = test_data.get("controllers", {})
+        if isinstance(controllers.get("A"), dict):
+            self.test_tab.set_controller("A", controllers["A"])
+        if isinstance(controllers.get("B"), dict):
+            self.test_tab.set_controller("B", controllers["B"])
+        if controllers:
+            logger.info("Controladores de TestTab restaurados desde sesión")
     
     def _on_show_plot(self, fig, title="Gráfico"):
         """Callback para mostrar plot desde AnalysisTab."""
@@ -825,13 +947,30 @@ class ArduinoGUI(QMainWindow):
             result = self.cfocus_controller.calibrate_limits()
             
             if result:
+                calib_info = self.cfocus_controller.get_calibration_info()
+                hw_range = float(calib_info.get('z_range_hw', 0.0) or 0.0)
+                span = float(result.get('z_range', 0.0) or 0.0)
+                span_ratio = (span / hw_range) if hw_range > 0 else 0.0
+
                 msg = (f"✅ Calibración completada:\n"
                        f"   Mín: {result['z_min']:.2f} µm\n"
                        f"   Máx: {result['z_max']:.2f} µm\n"
                        f"   Centro: {result['z_center']:.2f} µm\n"
-                       f"   Rango: {result['z_range']:.2f} µm")
+                       f"   Rango: {result['z_range']:.2f} µm\n"
+                       f"   Rango HW: {hw_range:.2f} µm")
                 self.camera_tab.log_message(msg)
                 logger.info(f"[Main] Calibración exitosa: {result}")
+                logger.info(
+                    f"[Main] Verificación calibración -> hw_range={hw_range:.2f}µm, "
+                    f"span={span:.2f}µm, span_ratio={span_ratio:.3f}"
+                )
+                if hw_range > 0 and span_ratio < 0.6:
+                    warn_msg = (
+                        "⚠️ Calibración con span útil bajo respecto al rango hardware. "
+                        "Verificar topes mecánicos/referencias."
+                    )
+                    self.camera_tab.log_message(warn_msg)
+                    logger.warning(f"[Main] {warn_msg}")
                 
                 # CRÍTICO: Configurar AutofocusService después de calibrar
                 self.initialize_autofocus()
@@ -873,6 +1012,10 @@ class ArduinoGUI(QMainWindow):
     def closeEvent(self, event):
         """Maneja el cierre de la aplicación."""
         logger.info("=== CERRANDO APLICACIÓN ===")
+        try:
+            self._save_session_state()
+        except Exception as e:
+            logger.error(f"No se pudo guardar sesión al cerrar: {e}")
         logger.debug("Enviando comando de apagado de motores (A,0,0)")
         self.send_command('A,0,0')
         

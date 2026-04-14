@@ -3,17 +3,17 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-01-15T12:56:39.385439",
+  "last_updated": "2026-04-13T16:56:47.165032",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
-    "points": 1024,
+    "points": 506,
     "x_range": {
-      "min": 10000.0,
+      "min": 10500.0,
       "max": 19500.0,
       "unit": "µm"
     },
     "y_range": {
-      "min": 10000.0,
+      "min": 10500.0,
       "max": 19500.0,
       "unit": "µm"
     },
@@ -34,17 +34,17 @@
   },
   "microscopy": {
     "description": "Parámetros de microscopía automatizada",
-    "class_name": "Quillaja_Saponaria",
-    "total_points": 1024,
+    "class_name": "Eucriphya_Glutinosa",
+    "total_points": 506,
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 2000,
-        "max": 120000,
+        "min": 5000,
+        "max": 200000,
         "unit": "px"
       }
     },
-    "channels": "G",
+    "channels": "RGB",
     "channels_available": [
       "R",
       "G",
@@ -64,7 +64,7 @@
       16
     ],
     "delays": {
-      "before_capture": 0,
+      "before_capture": 1,
       "after_capture": 0,
       "unit": "ms"
     },

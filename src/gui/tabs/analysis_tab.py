@@ -6,6 +6,7 @@ Usa TransferFunctionAnalyzer para la lógica de identificación.
 """
 
 import logging
+from pathlib import Path
 import pandas as pd
 from matplotlib.figure import Figure
 
@@ -278,6 +279,7 @@ class AnalysisTab(QWidget):
         self.update_tf_list()
         
         # Emitir señal con resultados
+        result['analysis_context'] = self.get_current_analysis_context()
         self.analysis_completed.emit(result)
         
         # Mostrar gráfico
@@ -346,3 +348,59 @@ class AnalysisTab(QWidget):
     def get_identified_functions(self):
         """Retorna lista de funciones identificadas."""
         return self.tf_analyzer.identified_functions
+
+    def get_current_analysis_context(self):
+        """Retorna parámetros actuales de análisis para persistencia."""
+        motor = 'A' if self.motor_a_radio.isChecked() else 'B'
+        sensor = '1' if self.sensor_1_radio.isChecked() else '2'
+
+        def _to_float(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        filename = self.filename_input.text().strip()
+        return {
+            'motor': motor,
+            'sensor': sensor,
+            'slot_key': f"{motor}_{sensor}",
+            'csv_path': filename,
+            'csv_exists': bool(filename and Path(filename).exists()),
+            't_start_s': _to_float(self.t_inicio_input.text()),
+            't_end_s': _to_float(self.t_fin_input.text()),
+            'distance_min_mm': _to_float(self.distancia_min_input.text().strip() or None),
+            'distance_max_mm': _to_float(self.distancia_max_input.text().strip() or None),
+        }
+
+    def apply_analysis_context(self, context):
+        """Restaura parámetros de análisis desde persistencia."""
+        if not isinstance(context, dict):
+            return
+
+        motor = str(context.get('motor', 'A')).upper()
+        sensor = str(context.get('sensor', '1'))
+
+        # Motor
+        self.motor_a_radio.setChecked(motor == 'A')
+        self.motor_b_radio.setChecked(motor == 'B')
+        self._toggle_motor(motor)
+
+        # Sensor
+        self.sensor_1_radio.setChecked(sensor == '1')
+        self.sensor_2_radio.setChecked(sensor == '2')
+        self._toggle_sensor(sensor)
+
+        csv_path = context.get('csv_path')
+        if isinstance(csv_path, str):
+            self.filename_input.setText(csv_path)
+
+        if context.get('t_start_s') is not None:
+            self.t_inicio_input.setText(str(context.get('t_start_s')))
+        if context.get('t_end_s') is not None:
+            self.t_fin_input.setText(str(context.get('t_end_s')))
+
+        dmin = context.get('distance_min_mm')
+        dmax = context.get('distance_max_mm')
+        self.distancia_min_input.setText("" if dmin is None else str(dmin))
+        self.distancia_max_input.setText("" if dmax is None else str(dmax))

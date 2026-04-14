@@ -44,8 +44,8 @@ class MicroscopyConfig:
     delay_after: float = 0.2
     save_folder: str = ""
     class_name: str = "sample"
-    img_width: int = 1920
-    img_height: int = 1200
+    img_width: int = 0  # 0 = usar resolución del frame
+    img_height: int = 0  # 0 = usar resolución del frame
     channels: List[str] = None
     learning_mode: bool = True
     learning_target: int = 50

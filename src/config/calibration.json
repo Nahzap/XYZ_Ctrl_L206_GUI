@@ -1,16 +1,16 @@
 {
     "_comment": "Archivo de calibración del sistema XYZ. Editar según mediciones reales.",
-    "_updated": "2026-01-15 12:54:01",
+    "_updated": "2026-04-13 15:27:46",
     "calibration": {
         "x_axis": {
             "description": "Motor A, Sensor 2 - Eje X",
-            "intercept_um": 20887.372013651875,
-            "slope_um_per_adc": 11.376564277588168
+            "intercept_um": 21550.19059720457,
+            "slope_um_per_adc": 12.706480304955527
         },
         "y_axis": {
             "description": "Motor B, Sensor 1 - Eje Y",
-            "intercept_um": 22452.574525745258,
-            "slope_um_per_adc": 13.550135501355014
+            "intercept_um": 22459.239130434784,
+            "slope_um_per_adc": 13.58695652173913
         }
     },
     "control": {

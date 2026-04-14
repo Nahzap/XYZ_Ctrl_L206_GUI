@@ -102,28 +102,45 @@ class CameraOrchestrator(QObject):
         
         self.status_message.emit("🔍 Detectando objetos...")
         
-        # Preparar frame para detección
+        # CRÍTICO: Usar el MISMO frame para detección Y autofoco
+        # NO convertir ni normalizar - usar frame RAW directamente
+        # SmartFocusScorer debe manejar internamente la conversión uint16->uint8
+        
         frame = current_frame.copy()
         
-        # Convertir frame uint16 -> uint8
-        if frame.dtype == np.uint16:
-            frame_max = frame.max()
-            if frame_max > 0:
-                frame_uint8 = (frame / frame_max * 255).astype(np.uint8)
+        # Convertir a BGR si es necesario (pero mantener dimensiones originales)
+        if len(frame.shape) == 2:
+            # Grayscale -> BGR (para SmartFocusScorer)
+            if frame.dtype == np.uint16:
+                # Normalizar uint16 -> uint8 MANTENIENDO dimensiones
+                frame_max = frame.max()
+                if frame_max > 0:
+                    gray_uint8 = (frame / frame_max * 255).astype(np.uint8)
+                else:
+                    gray_uint8 = np.zeros(frame.shape, dtype=np.uint8)
+                frame_bgr = cv2.cvtColor(gray_uint8, cv2.COLOR_GRAY2BGR)
             else:
-                frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
-            frame_uint8 = frame.astype(np.uint8)
+            # Ya es color
+            if frame.dtype == np.uint16:
+                frame_max = frame.max()
+                if frame_max > 0:
+                    frame_bgr = (frame / frame_max * 255).astype(np.uint8)
+                else:
+                    frame_bgr = np.zeros(frame.shape[:2] + (3,), dtype=np.uint8)
+            else:
+                frame_bgr = frame.astype(np.uint8)
         
-        # Convertir a BGR si es necesario
-        if len(frame_uint8.shape) == 2:
-            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
-        else:
-            frame_bgr = frame_uint8
+        # Detectar objetos en frame con dimensiones RAW
+        h_frame, w_frame = frame_bgr.shape[:2]
+        logger.info(f"[CameraOrchestrator] Frame para detección: {w_frame}x{h_frame} (mantiene dimensiones RAW)")
         
-        # Detectar objetos
         result = self.scorer.assess_image(frame_bgr)
         all_objects = result.objects if result.objects else []
+        
+        # Las coordenadas de bbox ahora están en las dimensiones correctas del frame RAW
+        logger.info(f"[CameraOrchestrator] ✅ Bounding boxes en escala correcta ({w_frame}x{h_frame})")
         
         # Filtrar por rango de área
         objects = [obj for obj in all_objects if min_area <= obj.area <= max_area]

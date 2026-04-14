@@ -278,8 +278,16 @@ class CameraViewWindow(QWidget):
         self.selected_object_index = None
     
     def _on_detection_done(self, prob_map, objects, time_ms, frame_bgr):
-        """Guarda resultado de detección - PRE-CALCULA contornos para overlay liviano."""
+        """Guarda resultado de detección - PRE-CALCULA contornos para overlay liviano.
+        
+        CRÍTICO: Durante autofoco, NO actualizar detection_result para mantener ROIs fijos.
+        """
         if prob_map is None:
+            return
+        
+        # NO actualizar detección durante autofoco (mantener ROIs fijos)
+        if self.autofocus_active:
+            logger.debug("[CameraWindow] Detección ignorada - autofoco activo (ROIs congelados)")
             return
         
         # Pre-calcular contornos UNA VEZ (no en cada frame)
@@ -386,6 +394,12 @@ class CameraViewWindow(QWidget):
                 self.last_frame = raw_frame
                 # Calcular score en tiempo real si hay scorer configurado
                 self._update_realtime_score(raw_frame)
+                
+                # CRÍTICO: NO re-detectar objetos durante autofoco
+                # Los ROIs deben permanecer FIJOS durante todo el Z-scan
+                if not self.autofocus_active:
+                    # Solo detectar cuando NO hay autofoco activo
+                    pass  # La detección se dispara manualmente desde CameraTab
             
             # SIEMPRE dibujar overlay (Z y Score siempre visibles)
             q_image = self._draw_overlay_on_qimage(q_image)
@@ -613,6 +627,17 @@ class CameraViewWindow(QWidget):
         boxes = []
         contours = []
         
+        # CRÍTICO: Detectar dimensiones REALES del frame desde los objetos o desde last_frame
+        detected_frame_w = 1920
+        detected_frame_h = 1200
+        
+        # Intentar obtener dimensiones del frame actual
+        if self.last_frame is not None:
+            h, w = self.last_frame.shape[:2]
+            detected_frame_w = w
+            detected_frame_h = h
+            logger.info(f"[CameraWindow] Dimensiones de frame detectadas: {w}x{h}")
+        
         for obj in objects:
             boxes.append({
                 'bbox': obj.bounding_box if hasattr(obj, 'bounding_box') else obj.bbox,
@@ -627,14 +652,17 @@ class CameraViewWindow(QWidget):
                 contours.append(obj.contour)
         
         # Actualizar detection_result para overlay (REEMPLAZA el anterior)
+        # USAR dimensiones REALES del frame, no hardcoded
         self.detection_result = {
             'contours': contours,
             'boxes': boxes,
-            'frame_size': (1920, 1200),  # Placeholder, se ajusta en overlay
+            'frame_size': (detected_frame_w, detected_frame_h),  # ✅ Dimensiones REALES
             'n_objects': len(objects),
             'n_in_range': len(objects),
             'filter_range': (0, 999999)
         }
+        
+        logger.info(f"[CameraWindow] detection_result actualizado con frame_size=({detected_frame_w}x{detected_frame_h})")
         
         # Actualizar tabla de objetos (REEMPLAZA la anterior)
         logger.info(f"[CameraWindow] Llamando a _update_objects_list con {len(boxes)} boxes")
@@ -736,13 +764,19 @@ class CameraViewWindow(QWidget):
     # === MÉTODOS PARA OVERLAY DE AUTOFOCO ===
     
     def set_autofocus_active(self, active: bool):
-        """Activa/desactiva el overlay de autofoco."""
+        """Activa/desactiva el overlay de autofoco.
+        
+        IMPORTANTE: Cuando activa=True, congela la detección para mantener ROIs fijos.
+        Los bounding boxes NO deben moverse durante el Z-scan.
+        """
         self.autofocus_active = active
         if not active:
             self.current_z_position = 0.0
             self.current_focus_score = 0.0
             self.autofocus_status_msg = ""
-        logger.info(f"[CameraWindow] Autofocus overlay: {'ACTIVO' if active else 'INACTIVO'}")
+        
+        # Log para debugging
+        logger.info(f"[CameraWindow] Autofoco {'ACTIVADO' if active else 'DESACTIVADO'} - Detección {'CONGELADA' if active else 'ACTIVA'}")
     
     def update_autofocus_score(self, z_position: float, score: float):
         """Actualiza el score de autofoco mostrado en el overlay.

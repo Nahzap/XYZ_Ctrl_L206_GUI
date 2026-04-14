@@ -33,6 +33,23 @@ except Exception as e:
 
 
 # =========================================================================
+# BASLER CAMERA SDK
+# =========================================================================
+BASLER_AVAILABLE = False
+pylon = None
+
+try:
+    from pypylon import pylon as _pylon
+    pylon = _pylon
+    BASLER_AVAILABLE = True
+    logger.info("[HardwareAvailability] Basler SDK (pypylon) disponible")
+except ImportError:
+    logger.warning("[HardwareAvailability] pypylon no instalado - cámara Basler deshabilitada")
+except Exception as e:
+    logger.warning(f"[HardwareAvailability] Error configurando Basler SDK: {e}")
+
+
+# =========================================================================
 # PYTORCH / CUDA
 # =========================================================================
 TORCH_AVAILABLE = False
@@ -53,6 +70,8 @@ except ImportError:
 __all__ = [
     'THORLABS_AVAILABLE',
     'Thorlabs',
+    'BASLER_AVAILABLE',
+    'pylon',
     'TORCH_AVAILABLE',
     'CUDA_AVAILABLE',
 ]

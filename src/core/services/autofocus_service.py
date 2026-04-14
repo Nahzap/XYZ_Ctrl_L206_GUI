@@ -66,13 +66,18 @@ class AutofocusService(QThread):
         
         # Parámetros de búsqueda (configurables desde UI)
         # NOTA: Estos parámetros son para BÚSQUEDA de BPoF, NO para captura de volumen
-        self.z_scan_range = 20.0  # µm - distancia máxima de búsqueda desde posición actual (±20µm)
-        self.use_full_range = True  # Si True, ignora z_scan_range y escanea TODO el rango calibrado (0-80µm)
-        self.z_step_coarse = 0.5  # µm - paso grueso para fase de búsqueda inicial (hill climbing)
-        self.z_step_fine = 0.1    # µm - paso fino para refinamiento alrededor del pico
-        self.settle_time = 0.10   # segundos - tiempo de estabilización
-        self.capture_settle_time = 0.50  # segundos - tiempo para captura final (500ms)
-        self.roi_margin = 20      # px - margen adicional alrededor del bbox para sharpness
+        self.z_scan_range = 70.0       # µm - rango total de escaneo (ajustable por usuario)
+        self.use_full_range = True     # Si True, escanea todo el rango calibrado; si False, usa z_scan_range
+        self.z_step_coarse = 1.0       # µm - paso grueso OPTIMIZADO para velocidad (reducir pasos totales)
+        self.z_step_fine = 0.05        # µm - paso fino para refinamiento preciso del BPoF
+        self.refine_window = 2.0       # µm - ventana de refinamiento (±1.0µm del pico coarse)
+        # Tiempos de espera optimizados para velocidad
+        # settle_time: Espera mínima para estabilización del piezo
+        # CRÍTICO: Debe ser > 0 para permitir que el piezo se asiente
+        # Valor recomendado: 0.01-0.03s (10-30ms) para velocidad óptima
+        self.settle_time = 0.01        # s - tiempo de estabilización del piezo OPTIMIZADO para velocidad
+        self.capture_settle_time = 0.3  # s - estabilización para captura final (reducido de 0.5s)
+        self.roi_margin = 1000    # px - margen adicional alrededor del ROI CUADRADO para sharpness local
         
         # Límites de iteraciones para evitar bucles infinitos
         self.max_coarse_iterations = 50  # Máximo de iteraciones en fase gruesa
@@ -268,8 +273,12 @@ class AutofocusService(QThread):
                 logger.warning(f"[Autofocus] Fallo al mover a Z={z_current:.2f}µm")
                 continue
             
+            # Esperar estabilización del piezo (settle_time optimizado)
             time.sleep(self.settle_time)
-            score = self._get_stable_score(bbox, contour, n_samples=2)
+            score = self._get_stable_score(bbox, contour)
+            
+            # CRÍTICO: Emitir score para actualizar overlay en UI (indicador S)
+            self.score_updated.emit(z_current, score)
             
             # Actualizar mejor posición
             if score > best_score:
@@ -326,8 +335,12 @@ class AutofocusService(QThread):
             if not move_success:
                 logger.warning(f"[Autofocus] Fallo al mover a Z={z_refine:.2f}µm, abortando refinamiento")
                 break
+            # Esperar estabilización del piezo (settle_time optimizado)
             time.sleep(self.settle_time)
-            score = self._get_stable_score(bbox, contour, n_samples=2)
+            score = self._get_stable_score(bbox, contour)
+            
+            # CRÍTICO: Emitir score para actualizar overlay en UI (indicador S)
+            self.score_updated.emit(z_refine, score)
             
             if score > best_score:
                 best_z = z_refine
@@ -532,54 +545,64 @@ class AutofocusService(QThread):
         time.sleep(self.settle_time)
         return self._get_stable_score(bbox, n_samples=2)  # Solo 2 muestras para velocidad
     
-    def _get_stable_score(self, bbox: Tuple[int, int, int, int], contour: np.ndarray = None, n_samples: int = 3) -> float:
+    def _get_stable_score(self, bbox: Tuple[int, int, int, int], contour: np.ndarray = None, n_samples: int = 1) -> float:
         """
-        Obtiene un score estable promediando múltiples lecturas.
-        Calcula sharpness SOLO sobre los píxeles de la máscara (contorno).
+        Obtiene score de sharpness del frame actual.
+        
+        OPTIMIZACIÓN: Usa single-shot (n_samples=1) para velocidad máxima.
+        La estabilidad viene del settle_time antes de capturar, no de múltiples muestras.
         """
-        scores = []
-        for i in range(n_samples):
-            frame = self.get_frame_callback()
-            if frame is not None:
-                # Verificar que el frame tiene contenido
-                if frame.size == 0:
-                    logger.warning(f"[Autofocus] Frame {i} vacío")
-                    continue
-                    
-                score = self._calculate_sharpness(frame, bbox, contour)
-                scores.append(score)
-            else:
-                logger.warning(f"[Autofocus] Frame {i} es None")
-            time.sleep(0.02)  # Pequeña pausa entre lecturas
+        frame = self.get_frame_callback()
+        if frame is not None and frame.size > 0:
+            return self._calculate_sharpness(frame, bbox, contour)
         
-        if scores:
-            median_score = float(np.median(scores))
-            return median_score
-        
-        logger.warning(f"[Autofocus] No se obtuvieron scores válidos para bbox={bbox}")
+        logger.warning(f"[Autofocus] Frame inválido para bbox={bbox}")
         return 0.0
     
     def _calculate_sharpness(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], 
                               contour: np.ndarray = None) -> float:
         """
-        Calcula el índice de nitidez sobre un ROI expandido alrededor del objeto.
+        Calcula el índice de nitidez sobre un ROI CUADRADO expandido alrededor del objeto.
         
-        El ROI se expande con self.roi_margin píxeles para capturar mejor el contexto
-        y calcular sharpness de forma más robusta.
+        ESTRATEGIA:
+        1. Convertir bbox rectangular a ROI CUADRADO (max(w,h))
+        2. Expandir con self.roi_margin píxeles para contexto local
+        3. Calcular sharpness SOLO sobre esta región acotada
+        
+        Esto previene que S se dispare con valores erráticos (20000+) causados
+        por ROIs muy grandes o asimétricos.
         """
         x, y, w, h = bbox
         h_frame, w_frame = frame.shape[:2]
         
-        # EXPANDIR bbox con margen para mejor cálculo de sharpness
+        # PASO 1: Hacer ROI CUADRADO - usar el lado más grande para simetría
+        # Esto previene ROIs asimétricos que pueden causar valores de S erráticos
+        side = max(w, h)
+        
+        # Centrar el cuadrado en el bbox original
+        center_x = x + w // 2
+        center_y = y + h // 2
+        x_square = center_x - side // 2
+        y_square = center_y - side // 2
+        
+        # PASO 2: EXPANDIR ROI cuadrado con margen
         margin = self.roi_margin
-        x_expanded = max(0, x - margin)
-        y_expanded = max(0, y - margin)
-        w_expanded = min(w + 2*margin, w_frame - x_expanded)
-        h_expanded = min(h + 2*margin, h_frame - y_expanded)
+        x_expanded = max(0, x_square - margin)
+        y_expanded = max(0, y_square - margin)
+        
+        # Calcular dimensiones expandidas (cuadradas)
+        side_expanded = side + 2 * margin
+        
+        # Limitar al tamaño del frame
+        w_expanded = min(side_expanded, w_frame - x_expanded)
+        h_expanded = min(side_expanded, h_frame - y_expanded)
         
         if w_expanded <= 0 or h_expanded <= 0:
             logger.warning(f"[Autofocus] ROI expandido inválido: w={w_expanded}, h={h_expanded}")
             return 0.0
+        
+        # Log de dimensiones para debugging
+        logger.debug(f"[Autofocus] ROI original bbox=({x},{y},{w},{h}) -> Cuadrado side={side} -> Expandido ({w_expanded}x{h_expanded})")
         
         # Extraer ROI EXPANDIDO (región del objeto + margen)
         roi = frame[y_expanded:y_expanded+h_expanded, x_expanded:x_expanded+w_expanded]
@@ -638,6 +661,6 @@ class AutofocusService(QThread):
         
         # Combinar métricas
         combined = (lap_var * 0.25) + (tenengrad * 0.50) + (norm_var * 0.25)
-        logger.debug(f"[Autofocus] S={combined:.1f} (lap={lap_var:.1f}, ten={tenengrad:.1f}, nv={norm_var:.1f}, px={n_pixels})")
+        logger.debug(f"[Autofocus] S={combined:.1f} (lap={lap_var:.1f}, ten={tenengrad:.1f}, nv={norm_var:.1f}, px={n_pixels}, roi={w_expanded}x{h_expanded})")
         
         return float(combined)

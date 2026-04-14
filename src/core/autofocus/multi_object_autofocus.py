@@ -381,12 +381,16 @@ class MultiObjectAutofocusController:
             else:
                 frame = frame.astype(np.uint8)
         
-        target_width = config.get('img_width', 1920)
-        target_height = config.get('img_height', 1080)
+        # Usar dimensiones del frame original por defecto (NO hardcodear)
         h, w = frame.shape[:2]
+        target_width = config.get('img_width', w)
+        target_height = config.get('img_height', h)
         
         if w != target_width or h != target_height:
+            logger.info(f"[MultiObjectAutofocus] Redimensionando: {w}x{h} → {target_width}x{target_height}")
             frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        else:
+            logger.debug(f"[MultiObjectAutofocus] Sin redimensionamiento (frame ya es {w}x{h})")
         
         channels = config.get('channels', {'R': False, 'G': True, 'B': False})
         selected_channels = [c for c in ['R', 'G', 'B'] if channels.get(c, False)]

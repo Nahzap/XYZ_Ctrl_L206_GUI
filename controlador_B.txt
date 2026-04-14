@@ -1,0 +1,27 @@
+======================================================================
+CONTROLADOR H∞ - Sistema de Control L206
+======================================================================
+
+Nombre: controlador_B
+Fecha: 2026-04-08 11:31:00
+
+PLANTA G(s):
+  Numerador: [1.2272]
+  Denominador: [0.038 1.   ]
+
+CONTROLADOR C(s):
+  Numerador: [2.27573262e+08 5.98877014e+09]
+  Denominador: [1.00000000e+00 1.00259597e+09 2.50649254e+08]
+  (Convertido desde StateSpace de orden 2)
+
+PARÁMETROS PI EQUIVALENTES:
+  Kp = 1.214508
+  Ki = 4.074316
+  Gamma (γ) = 0.666668
+
+PARÁMETROS DE SÍNTESIS:
+  K = 1.2272 µm/s/PWM
+  τ = 0.0380 s
+  Ms = 1.5
+  ωb = 5 rad/s
+  U_max = 150 PWM
