@@ -1,8 +1,25 @@
 """Configuración del sistema de logging."""
 import logging
 import sys
-import os
 from datetime import datetime
+
+
+class SafeUnicodeStreamHandler(logging.StreamHandler):
+    """StreamHandler que no falla con cp1252 en consola Windows (emojis, µm, etc.)."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            try:
+                stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                enc = getattr(stream, "encoding", None) or "utf-8"
+                safe = (msg + self.terminator).encode(enc, errors="replace").decode(enc, errors="replace")
+                stream.write(safe)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging():
@@ -25,7 +42,7 @@ def setup_logging():
         format='%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
-            logging.StreamHandler(sys.stdout),
+            SafeUnicodeStreamHandler(sys.stdout),
             logging.FileHandler(
                 log_filename, 
                 mode='w',  # 'w' = write (reinicia), 'a' = append (acumula)

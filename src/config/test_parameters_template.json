@@ -3,17 +3,22 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-06-25T12:29:17.720231",
+  "last_updated": "2026-06-25T16:54:06.371431",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
-    "points": 100,
+    "points": 418,
+    "fov": {
+      "x": 162.9,
+      "y": 122.1,
+      "unit": "µm"
+    },
     "x_range": {
       "min": 12000.0,
       "max": 15000.0,
       "unit": "µm"
     },
     "y_range": {
-      "min": 12000.0,
+      "min": 12400.0,
       "max": 15000.0,
       "unit": "µm"
     },
@@ -34,17 +39,17 @@
   },
   "microscopy": {
     "description": "Parámetros de microscopía automatizada",
-    "class_name": "Eucriphya_Glutinosa",
-    "total_points": 506,
+    "class_name": "Escalonia_pulverulenta",
+    "total_points": 418,
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 5000,
-        "max": 200000,
+        "min": 12000,
+        "max": 500000,
         "unit": "px"
       }
     },
-    "channels": "RGB",
+    "channels": "G",
     "channels_available": [
       "R",
       "G",
@@ -64,8 +69,8 @@
       16
     ],
     "delays": {
-      "before_capture": 1,
-      "after_capture": 0,
+      "before_capture": 2000,
+      "after_capture": 500,
       "unit": "ms"
     },
     "learning_mode": {

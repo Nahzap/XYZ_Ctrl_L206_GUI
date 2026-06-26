@@ -18,6 +18,7 @@ Fecha: 2026-03-05
 
 import gc
 import logging
+import time
 import traceback
 import numpy as np
 from PyQt5.QtGui import QImage
@@ -222,6 +223,7 @@ class BaslerWorker(BaseCameraWorker):
             logger.info("[BaslerWorker] Loop de adquisición iniciado")
             
             while self.running and self.camera.IsGrabbing():
+                t_grab = time.perf_counter()
                 # Timeout de 1000ms (optimizado para latencia)
                 grabResult = self.camera.RetrieveResult(
                     1000, pylon.TimeoutHandling_Return
@@ -248,6 +250,23 @@ class BaslerWorker(BaseCameraWorker):
                     
                     # Emitir frame (QImage para display, raw para procesamiento)
                     self.new_frame_ready.emit(q_image, self.current_frame)
+                    
+                    grab_ms = (time.perf_counter() - t_grab) * 1000.0
+                    if self.frame_count == 1:
+                        logger.info(
+                            "[BaslerWorker] Primer frame live: %dx%d dtype=%s grab=%.1fms",
+                            w, h, frame.dtype, grab_ms,
+                        )
+                    elif self.frame_count % 30 == 0:
+                        logger.info(
+                            "[BaslerWorker] Live frame #%d: %dx%d grab=%.1fms",
+                            self.frame_count, w, h, grab_ms,
+                        )
+                    elif grab_ms > 150.0:
+                        logger.warning(
+                            "[BaslerWorker] Grab lento frame #%d: %.1fms",
+                            self.frame_count, grab_ms,
+                        )
                     
                     # Liberar resultado
                     grabResult.Release()

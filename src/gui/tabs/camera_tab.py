@@ -10,6 +10,7 @@ Reducción: 1472 → ~450 líneas
 """
 
 import logging
+import time
 import numpy as np
 import cv2
 from datetime import datetime
@@ -270,6 +271,7 @@ class CameraTab(QWidget):
         self.z_step_coarse_spin = self._widgets.get('z_step_coarse_spin')
         self.z_step_fine_spin = self._widgets.get('z_step_fine_spin')
         self.n_captures_spin = self._widgets.get('n_captures_spin')
+        self.z_step_capture_spin = self._widgets.get('z_step_capture_spin')
         self.z_settle_spin = self._widgets.get('z_settle_spin')
         self.roi_margin_spin = self._widgets.get('roi_margin_spin')
         self.estimated_images_label = self._widgets.get('estimated_images_label')
@@ -329,7 +331,7 @@ class CameraTab(QWidget):
             # Cargar parámetros de autofoco
             af_config = micro_defaults.get('autofocus', {})
             if self.autofocus_enabled_cb:
-                self.autofocus_enabled_cb.setChecked(af_config.get('enabled', True))
+                self.autofocus_enabled_cb.setChecked(af_config.get('enabled', False))
             if self.min_pixels_spin:
                 self.min_pixels_spin.setValue(af_config.get('area_range', {}).get('min', 5000))
             if self.max_pixels_spin:
@@ -450,18 +452,30 @@ class CameraTab(QWidget):
     
     def _on_view_clicked(self):
         """Handler para botón Ver Cámara."""
+        logger.info("[CameraTab] _on_view_clicked: abriendo ventana de cámara")
         if not self.camera_service or not self.camera_service.is_connected:
+            logger.warning("[CameraTab] Ver cámara rechazado: cámara no conectada")
             self.log_message("❌ Error: Conecta la cámara primero")
             QMessageBox.warning(self.parent_gui, "Error", "Conecta la cámara primero")
             return
         
+        streaming = self.camera_service.is_streaming()
+        logger.info("[CameraTab] Estado cámara: conectada=True streaming=%s", streaming)
+        
         if self.camera_view_window is None:
+            logger.info("[CameraTab] Creando CameraViewWindow...")
+            t0 = time.perf_counter()
             self.camera_view_window = CameraViewWindow(self.parent_gui)
+            logger.info(
+                "[CameraTab] CameraViewWindow creada en %.1fms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
             
             # Configurar SmartFocusScorer desde orchestrator
             if self.orchestrator and self.orchestrator.scorer:
                 self.camera_view_window.set_scorer(self.orchestrator.scorer)
                 self.log_message("🔍 SmartFocusScorer configurado")
+                logger.info("[CameraTab] SmartFocusScorer asignado a ventana de cámara")
             
             # Conectar señales con MicroscopyService
             if self.parent_gui and hasattr(self.parent_gui, 'microscopy_service'):
@@ -472,16 +486,21 @@ class CameraTab(QWidget):
                     self.parent_gui.microscopy_service.set_paused
                 )
                 self.log_message("🔗 Botones de control conectados a MicroscopyService")
+                logger.info("[CameraTab] Señales microscopía conectadas a CameraViewWindow")
         
+        logger.info("[CameraTab] Actualizando parámetros de detección antes de mostrar ventana")
         self._update_detection_params()
         self.camera_view_window.show()
         self.camera_view_window.raise_()
         self.camera_view_window.activateWindow()
         self.log_message("📹 Ventana de cámara abierta")
+        logger.info("[CameraTab] Ventana de cámara visible")
     
     def _on_start_live_clicked(self):
         """Handler para botón Iniciar Live."""
+        logger.info("[CameraTab] _on_start_live_clicked")
         if self.camera_service is None:
+            logger.error("[CameraTab] start_live: CameraService no disponible")
             self.log_message("❌ Error: CameraService no disponible")
             return
         
@@ -490,8 +509,13 @@ class CameraTab(QWidget):
             fps = int(self.fps_input.text())
             buffer_size = int(self.buffer_input.text())
         except ValueError:
+            logger.warning("[CameraTab] Parámetros live inválidos, usando defaults")
             exposure_s, fps, buffer_size = 0.01, 60, 2
         
+        logger.info(
+            "[CameraTab] Solicitando live: exp=%ss fps=%d buffer=%d",
+            exposure_s, fps, buffer_size,
+        )
         self.camera_service.start_live(exposure_s, fps, buffer_size)
         
         self.start_live_btn.setEnabled(False)
@@ -960,6 +984,25 @@ class CameraTab(QWidget):
             self.log_message(f"   Formato: {fmt} ({bits})")
         self.log_message("=" * 40)
         
+        # Sincronizar parámetros de autofoco antes de iniciar
+        self._update_detection_params()
+        if config['autofocus_enabled']:
+            if not self.camera_service or not self.camera_service.is_streaming():
+                self.log_message("❌ Error: Inicia vista en vivo antes de microscopía con autofoco")
+                logger.error("[CameraTab] Microscopía con AF rechazada: cámara sin stream")
+                return
+            if self.parent_gui and hasattr(self.parent_gui, 'initialize_autofocus'):
+                if not self.parent_gui.initialize_autofocus():
+                    self.log_message("❌ Error: Configura C-Focus y cámara antes del autofoco")
+                    logger.error("[CameraTab] initialize_autofocus falló antes de microscopía")
+                    return
+            logger.info(
+                "[CameraTab] Microscopía con autofoco: coarse=%.2f fine=%.2f capture_step=%.2f",
+                config['z_step_coarse'],
+                config['z_step_fine'],
+                self.z_step_capture_spin.value() if self.z_step_capture_spin else 2.0,
+            )
+        
         # Actualizar UI
         self.microscopy_start_btn.setEnabled(False)
         self.microscopy_stop_btn.setEnabled(True)
@@ -1271,12 +1314,18 @@ class CameraTab(QWidget):
             
             # Crear config y actualizar usando orchestrator
             config = AutofocusConfig(
+                use_full_range=self.full_scan_cb.isChecked() if self.full_scan_cb else True,
                 z_scan_range=z_scan_range,
                 z_step_coarse=z_step_coarse,
                 z_step_fine=z_step_fine,
                 settle_time=settle_s,
+                capture_settle_time=max(settle_s * 5, 0.3),
                 roi_margin=roi_margin,
-                n_captures=n_captures
+                n_captures=n_captures,
+                z_step_capture=(
+                    self.z_step_capture_spin.value()
+                    if self.z_step_capture_spin else 2.0
+                ),
             )
             
             self.orchestrator.update_autofocus_params(config)
@@ -1313,15 +1362,27 @@ class CameraTab(QWidget):
                         f"Algoritmo: Hill climbing (pasos adaptativos)\n"
                         f"Paso grueso: {z_step_coarse}µm, Paso fino: {z_step_fine}µm\n\n"
                         f"Capturas multi-focales: {n_captures} imágenes\n"
-                        f"BPoF en el centro ± {z_step_coarse}µm (coarse step)\n\n"
+                        f"BPoF en el centro (f{n_captures // 2}) ± paso captura\n\n"
                         f"NOTA: Autofoco busca 1 posición óptima (BPoF).\n"
                         f"Las {n_captures} capturas son para trayectoria XY."
                     )
     
     def _run_autofocus(self, capture_after=False):
-        """Ejecuta detección + autofoco usando SmartFocusScorer con métrica S."""
+        """Ejecuta detección + autofoco manual desde la UI."""
         logger.info("[CameraTab] _run_autofocus: Iniciando (capture_after=%s)", capture_after)
-        
+
+        parent = self.parent_gui
+        if parent and hasattr(parent, 'initialize_autofocus'):
+            parent.initialize_autofocus()
+
+        if self.camera_service and not self.camera_service.is_streaming():
+            self.log_message("❌ Inicia la vista en vivo de la cámara antes del autofoco")
+            logger.error("[CameraTab] Vista en vivo no activa")
+            return
+
+        if self.orchestrator and self.orchestrator.autofocus:
+            self.orchestrator.autofocus.microscopy_mode = False
+
         # Obtener frame actual
         current_frame = None
         if self.camera_service and self.camera_service.current_frame is not None:
@@ -1400,9 +1461,29 @@ class CameraTab(QWidget):
             self.set_connected(False)
     
     def on_camera_frame(self, q_image, raw_frame=None):
-        """Callback cuando llega un frame de cámara."""
-        if self.camera_view_window and self.camera_view_window.isVisible():
-            self.camera_view_window.update_frame(q_image, raw_frame)
+        """Callback cuando llega un frame de cámara (hilo UI, QueuedConnection)."""
+        if not self.camera_view_window or not self.camera_view_window.isVisible():
+            return
+
+        if not hasattr(self, '_ui_frame_count'):
+            self._ui_frame_count = 0
+            self._ui_frame_log_time = 0.0
+            logger.info(
+                "[CameraTab] Primer frame entregado a ventana: qimage=%dx%d",
+                q_image.width() if q_image else 0,
+                q_image.height() if q_image else 0,
+            )
+
+        self._ui_frame_count += 1
+        now = time.perf_counter()
+        if now - self._ui_frame_log_time >= 5.0:
+            logger.info(
+                "[CameraTab] Frames entregados a ventana: %d",
+                self._ui_frame_count,
+            )
+            self._ui_frame_log_time = now
+
+        self.camera_view_window.update_frame(q_image, raw_frame)
     
     # Alias para compatibilidad interna
     _on_camera_frame = on_camera_frame

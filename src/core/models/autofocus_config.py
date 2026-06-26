@@ -34,6 +34,7 @@ class AutofocusConfig:
     """
     
     # Parámetros de búsqueda de BPoF
+    use_full_range: bool = True             # escaneo completo del rango calibrado
     z_scan_range: float = 20.0              # µm - rango de búsqueda (±20µm)
     z_step_coarse: float = 0.5              # µm - paso grueso
     z_step_fine: float = 0.1                # µm - paso fino
@@ -44,7 +45,7 @@ class AutofocusConfig:
     max_fine_iterations: int = 100          # límite fase fina
     
     # Parámetros de captura multi-focal (Z-stack)
-    n_captures: int = 5                     # número de capturas
+    n_captures: int = 3                     # número de capturas (impar)
     z_step_capture: float = 2.0             # µm - paso entre capturas
     z_range_capture: float = 10.0           # µm - rango total
     

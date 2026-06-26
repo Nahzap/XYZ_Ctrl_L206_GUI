@@ -591,8 +591,9 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     # Checkbox para habilitar autofoco
     widgets['autofocus_enabled_cb'] = QCheckBox("Habilitar autofoco por objeto")
     widgets['autofocus_enabled_cb'].setToolTip(
-        "Pre-detecta objetos con U2-Net y captura una imagen enfocada por cada uno.\n"
-        "Genera N imágenes por punto, donde N = objetos detectados."
+        "Solo para microscopía automatizada: si hay objeto válido en el punto,\n"
+        "el algoritmo dispara autofoco Z (requiere cámara en vivo + C-Focus).\n"
+        "El botón 'Enfocar' ejecuta autofoco manual en cualquier momento."
     )
     layout.addWidget(widgets['autofocus_enabled_cb'])
     
@@ -748,7 +749,10 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['n_captures_spin'].setRange(1, 11)
     widgets['n_captures_spin'].setValue(3)
     widgets['n_captures_spin'].setSingleStep(2)  # Solo impares
-    widgets['n_captures_spin'].setToolTip("Número de capturas multi-focales (siempre impar: 1, 3, 5, 7...)\nBPoF en el centro, ±coarse arriba/abajo")
+    widgets['n_captures_spin'].setToolTip(
+        "Número de capturas multi-focales (siempre impar: 1, 3, 5, 7...)\n"
+        "BPoF en el centro (f1 para n=3), ±paso captura arriba/abajo"
+    )
     widgets['n_captures_spin'].setFixedWidth(100)
     widgets['n_captures_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['n_captures_spin'], 4, 1)
@@ -762,9 +766,23 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['z_settle_spin'].setFixedWidth(100)
     widgets['z_settle_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['z_settle_spin'], 4, 3)
-    
-    # Fila 5: ROI margin
-    detection_form.addWidget(QLabel("ROI Margin:"), 5, 0)
+
+    detection_form.addWidget(QLabel("Paso captura:"), 5, 0)
+    widgets['z_step_capture_spin'] = QDoubleSpinBox()
+    widgets['z_step_capture_spin'].setRange(0.1, 20.0)
+    widgets['z_step_capture_spin'].setValue(2.0)
+    widgets['z_step_capture_spin'].setSuffix(" µm")
+    widgets['z_step_capture_spin'].setDecimals(2)
+    widgets['z_step_capture_spin'].setSingleStep(0.1)
+    widgets['z_step_capture_spin'].setToolTip(
+        "Separación Z entre capas multi-focales (BPoF ± este paso)"
+    )
+    widgets['z_step_capture_spin'].setFixedWidth(100)
+    widgets['z_step_capture_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_step_capture_spin'], 5, 1)
+
+    # Fila 6: ROI margin
+    detection_form.addWidget(QLabel("ROI Margin:"), 6, 0)
     widgets['roi_margin_spin'] = QSpinBox()
     widgets['roi_margin_spin'].setRange(0, 9999)
     widgets['roi_margin_spin'].setValue(20)
@@ -772,7 +790,7 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['roi_margin_spin'].setToolTip("Margen adicional alrededor del bbox para cálculo de sharpness (sin límite)")
     widgets['roi_margin_spin'].setFixedWidth(100)
     widgets['roi_margin_spin'].valueChanged.connect(update_params_cb)
-    detection_form.addWidget(widgets['roi_margin_spin'], 5, 1)
+    detection_form.addWidget(widgets['roi_margin_spin'], 6, 1)
     
     layout.addLayout(detection_form)
     

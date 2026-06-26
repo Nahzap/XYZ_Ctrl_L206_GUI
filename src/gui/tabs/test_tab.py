@@ -25,7 +25,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTextEdit, QScrollArea,
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
 from config.constants import (
-    POSITION_TOLERANCE_UM, SETTLING_CYCLES
+    POSITION_TOLERANCE_UM, SETTLING_CYCLES,
+    DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
 )
 from core.services.test_service import TestService, ControllerConfig
 from gui.utils.trajectory_preview import show_trajectory_preview
@@ -255,6 +256,8 @@ class TestTab(QWidget):
         self.stop_dual_btn = self._widgets.get('stop_dual_btn')
         
         # Trayectorias
+        self.fov_x_input = self._widgets.get('fov_x_input')
+        self.fov_y_input = self._widgets.get('fov_y_input')
         self.points_input = self._widgets.get('points_input')
         self.x_start_input = self._widgets.get('x_start_input')
         self.x_end_input = self._widgets.get('x_end_input')
@@ -282,7 +285,14 @@ class TestTab(QWidget):
             
             # Cargar valores en los widgets
             if self.points_input:
-                self.points_input.setText(str(defaults.get('points', 1024)))
+                saved_points = defaults.get('points')
+                self.points_input.setText(str(saved_points) if saved_points else "--")
+            if self.fov_x_input:
+                fov = defaults.get('fov', {})
+                self.fov_x_input.setText(str(fov.get('x', DEFAULT_FOV_X_UM)))
+            if self.fov_y_input:
+                fov = defaults.get('fov', {})
+                self.fov_y_input.setText(str(fov.get('y', DEFAULT_FOV_Y_UM)))
             if self.x_start_input:
                 self.x_start_input.setText(str(defaults.get('x_range', {}).get('min', 10000.0)))
             if self.x_end_input:
@@ -299,7 +309,8 @@ class TestTab(QWidget):
             logger.warning(f"No se pudieron cargar parámetros por defecto: {e}")
     
     def _save_trajectory_parameters(self, n_points: int, x_min: float, x_max: float,
-                                    y_min: float, y_max: float, delay: float):
+                                    y_min: float, y_max: float, delay: float,
+                                    fov_x: float, fov_y: float):
         """Guarda parámetros de trayectoria en ParameterManager."""
         try:
             pm = get_parameter_manager()
@@ -309,7 +320,9 @@ class TestTab(QWidget):
                 x_max=x_max,
                 y_min=y_min,
                 y_max=y_max,
-                delay=delay
+                delay=delay,
+                fov_x=fov_x,
+                fov_y=fov_y
             )
             logger.info("📝 Parámetros de trayectoria guardados")
         except Exception as e:
@@ -335,25 +348,27 @@ class TestTab(QWidget):
         
         try:
             # Leer parámetros de la UI
-            n_points = int(self.points_input.text())
+            fov_x = float(self.fov_x_input.text())
+            fov_y = float(self.fov_y_input.text())
             x_min = float(self.x_start_input.text())
             x_max = float(self.x_end_input.text())
             y_min = float(self.y_start_input.text())
             y_max = float(self.y_end_input.text())
             step_delay = float(self.delay_input.text())
             
-            logger.info(f"Parámetros: {n_points} puntos, X=[{x_min},{x_max}], Y=[{y_min},{y_max}], delay={step_delay}s")
-            
-            # Guardar parámetros para autocompletado futuro
-            self._save_trajectory_parameters(n_points, x_min, x_max, y_min, y_max, step_delay)
+            logger.info(
+                f"Parámetros: FOV={fov_x}x{fov_y} µm, "
+                f"X=[{x_min},{x_max}], Y=[{y_min},{y_max}], delay={step_delay}s"
+            )
             
             # Generar trayectoria
-            result = self.trajectory_gen.generate_zigzag_by_points(
-                n_points=n_points,
+            result = self.trajectory_gen.generate_zigzag_by_fov(
                 x_min=x_min,
                 x_max=x_max,
                 y_min=y_min,
                 y_max=y_max,
+                fov_x=fov_x,
+                fov_y=fov_y,
                 step_delay=step_delay
             )
             
@@ -361,16 +376,23 @@ class TestTab(QWidget):
                 self.current_trajectory = result['points']
                 self.trajectory_step_delay = step_delay
                 self.trajectory_index = 0
+                n_points = result['n_points']
+                
+                # Guardar parámetros para autocompletado futuro
+                self._save_trajectory_parameters(
+                    n_points, x_min, x_max, y_min, y_max, step_delay, fov_x, fov_y
+                )
                 
                 # Actualizar UI
+                if self.points_input:
+                    self.points_input.setText(str(n_points))
                 self.set_trajectory_status(True, len(self.current_trajectory))
                 self.results_text.append(f"✅ {result['message']}")
-                self.results_text.append(f"   Grid: {result['n_rows']}x{result['n_cols']}")
                 
                 # Guardar figura para vista previa
                 self._trajectory_figure = result.get('figure')
                 
-                logger.info(f"✅ Trayectoria generada: {len(self.current_trajectory)} puntos")
+                logger.info(f"✅ {result['message']}")
             else:
                 self.results_text.append(f"❌ {result['message']}")
                 logger.error(f"Error generando trayectoria: {result['message']}")

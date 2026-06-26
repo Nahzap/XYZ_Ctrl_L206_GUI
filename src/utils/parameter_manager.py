@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 
+from config.constants import DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,20 +79,26 @@ class ParameterManager:
             return False
     
     def update_trajectory(self, points: int, x_min: float, x_max: float, 
-                         y_min: float, y_max: float, delay: float):
+                         y_min: float, y_max: float, delay: float,
+                         fov_x: float = DEFAULT_FOV_X_UM,
+                         fov_y: float = DEFAULT_FOV_Y_UM):
         """Actualiza parámetros de trayectoria."""
         if 'trajectory' not in self.parameters:
             self.parameters['trajectory'] = {}
         
         self.parameters['trajectory'].update({
             'points': points,
+            'fov': {'x': fov_x, 'y': fov_y, 'unit': 'µm'},
             'x_range': {'min': x_min, 'max': x_max, 'unit': 'µm'},
             'y_range': {'min': y_min, 'max': y_max, 'unit': 'µm'},
             'delay_between_points': delay,
             'delay_unit': 'seconds'
         })
         
-        logger.info(f"📝 Trayectoria actualizada: {points} puntos, X=[{x_min},{x_max}], Y=[{y_min},{y_max}]")
+        logger.info(
+            f"📝 Trayectoria actualizada: {points} puntos, "
+            f"FOV={fov_x}x{fov_y} µm, X=[{x_min},{x_max}], Y=[{y_min},{y_max}]"
+        )
         self.save()
     
     def update_microscopy(self, class_name: str, total_points: int, 
@@ -140,7 +148,8 @@ class ParameterManager:
     def get_trajectory_defaults(self) -> Dict[str, Any]:
         """Obtiene valores por defecto de trayectoria."""
         return self.parameters.get('trajectory', {
-            'points': 1024,
+            'points': None,
+            'fov': {'x': DEFAULT_FOV_X_UM, 'y': DEFAULT_FOV_Y_UM},
             'x_range': {'min': 10000.0, 'max': 19500.0},
             'y_range': {'min': 10000.0, 'max': 19500.0},
             'delay_between_points': 0.5
@@ -151,7 +160,7 @@ class ParameterManager:
         return self.parameters.get('microscopy', {
             'class_name': 'Quillaja_Saponaria',
             'total_points': 1024,
-            'autofocus': {'enabled': True, 'area_range': {'min': 5000, 'max': 120000}},
+            'autofocus': {'enabled': False, 'area_range': {'min': 5000, 'max': 120000}},
             'channels': 'G',
             'format': 'PNG',
             'bit_depth': 16,
@@ -177,7 +186,8 @@ class ParameterManager:
             "last_updated": datetime.now().isoformat(),
             
             "trajectory": {
-                "points": 1024,
+                "points": None,
+                "fov": {"x": DEFAULT_FOV_X_UM, "y": DEFAULT_FOV_Y_UM, "unit": "µm"},
                 "x_range": {"min": 10000.0, "max": 19500.0, "unit": "µm"},
                 "y_range": {"min": 10000.0, "max": 19500.0, "unit": "µm"},
                 "delay_between_points": 0.5,
@@ -188,7 +198,7 @@ class ParameterManager:
                 "class_name": "Quillaja_Saponaria",
                 "total_points": 1024,
                 "autofocus": {
-                    "enabled": True,
+                    "enabled": False,
                     "area_range": {"min": 5000, "max": 120000, "unit": "px"}
                 },
                 "channels": "G",

@@ -4,15 +4,20 @@ Solo visualización - los controles de detección están en CameraTab.
 """
 
 import logging
+import time
 import numpy as np
 import cv2
-import time
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QListWidget, QListWidgetItem, QSplitter
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QImage
 from gui.styles.dark_theme import DARK_STYLESHEET
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('MotorControl_L206')
+
+# Máx. FPS de pintado en UI (evita congelar con cámaras de alta resolución)
+_MAX_DISPLAY_FPS = 20.0
+_PERF_LOG_EVERY_N_FRAMES = 60
+_SLOW_FRAME_WARN_MS = 80.0
 
 
 class DetectionWorker(QThread):
@@ -270,9 +275,12 @@ class CameraViewWindow(QWidget):
         # Referencia al controlador C-Focus para leer Z en tiempo real
         self.cfocus_controller = None
         
-        # Throttling para cálculo de score (evita congelar UI)
+        # Throttling para lectura de Z (no calcular enfoque en vivo)
         self._last_score_update = 0
-        self._score_update_interval = 0.2  # Actualizar score cada 200ms (5 Hz)
+        self._score_update_interval = 0.2  # Actualizar Z cada 200ms (5 Hz)
+        self._last_display_time = 0.0
+        self._skipped_display_frames = 0
+        self._last_perf_log_time = 0.0
         
         # Selección de objeto para resaltar ROI
         self.selected_object_index = None
@@ -383,56 +391,123 @@ class CameraViewWindow(QWidget):
     # === ACTUALIZACIÓN DE FRAME ===
     
     def update_frame(self, q_image, raw_frame=None):
-        """Actualiza visualización - frame EN VIVO con overlay LIVIANO.
-        
-        El overlay de Z y Score SIEMPRE se muestra y se actualiza en cada frame.
-        """
+        """Actualiza visualización en vivo. Throttled para no bloquear la UI."""
+        t0 = time.perf_counter()
+
         try:
-            self.frame_count += 1
-            
             if raw_frame is not None:
                 self.last_frame = raw_frame
-                # Calcular score en tiempo real si hay scorer configurado
+
+            # Throttle: descartar frames de pintado si la UI va saturada
+            now = time.perf_counter()
+            min_interval = 1.0 / _MAX_DISPLAY_FPS
+            if now - self._last_display_time < min_interval:
+                self._skipped_display_frames += 1
+                if self.frame_count == 0:
+                    logger.debug(
+                        "[CameraWindow] Frame recibido antes del primer pintado "
+                        "(throttle activo, max %.0f FPS display)",
+                        _MAX_DISPLAY_FPS,
+                    )
+                return
+
+            self._last_display_time = now
+            self.frame_count += 1
+
+            if self.frame_count == 1:
+                logger.info(
+                    "[CameraWindow] Primer frame pintado: qimage=%dx%d fmt=%s raw=%s",
+                    q_image.width(),
+                    q_image.height(),
+                    q_image.format(),
+                    getattr(raw_frame, "shape", None),
+                )
+
+            if raw_frame is not None:
                 self._update_realtime_score(raw_frame)
-                
-                # CRÍTICO: NO re-detectar objetos durante autofoco
-                # Los ROIs deben permanecer FIJOS durante todo el Z-scan
-                if not self.autofocus_active:
-                    # Solo detectar cuando NO hay autofoco activo
-                    pass  # La detección se dispara manualmente desde CameraTab
-            
-            # SIEMPRE dibujar overlay (Z y Score siempre visibles)
-            q_image = self._draw_overlay_on_qimage(q_image)
-            
-            # Mostrar frame
-            pixmap = QPixmap.fromImage(q_image)
-            scaled = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # Overlay costoso SOLO si hay autofoco activo o detecciones que dibujar
+            need_overlay = (
+                self.autofocus_active
+                or (
+                    self.detection_result is not None
+                    and (self.show_contours_cb.isChecked() or self.show_boxes_cb.isChecked())
+                )
+            )
+            display_image = self._draw_overlay_on_qimage(q_image) if need_overlay else q_image
+
+            t_paint_start = time.perf_counter()
+            pixmap = QPixmap.fromImage(display_image)
+            scaled = pixmap.scaled(
+                self.video_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
             self.video_label.setPixmap(scaled)
-            
-            n_obj = self.detection_result.get('n_objects', 0) if self.detection_result else 0
-            mode = "🔴 AF" if self.autofocus_active else "🎥"
-            self.info_label.setText(f"{mode} LIVE | Frame: {self.frame_count} | S:{self.current_focus_score:.0f}")
-            
+            t_paint_ms = (time.perf_counter() - t_paint_start) * 1000.0
+
+            mode = "AF" if self.autofocus_active else "LIVE"
+            if self.autofocus_active:
+                s_info = f" | S:{self.current_focus_score:.0f}"
+            else:
+                s_info = f" | Z:{self.current_z_position:.1f}um"
+            self.info_label.setText(
+                f"{mode} | Frame: {self.frame_count}{s_info} | skip:{self._skipped_display_frames}"
+            )
+
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            if total_ms > _SLOW_FRAME_WARN_MS:
+                logger.warning(
+                    "[CameraWindow] Frame lento #%d: total=%.1fms paint=%.1fms "
+                    "overlay=%s qimage=%dx%d label=%dx%d",
+                    self.frame_count,
+                    total_ms,
+                    t_paint_ms,
+                    need_overlay,
+                    q_image.width(),
+                    q_image.height(),
+                    self.video_label.width(),
+                    self.video_label.height(),
+                )
+            elif self.frame_count % _PERF_LOG_EVERY_N_FRAMES == 0:
+                logger.info(
+                    "[CameraWindow] Perf frame #%d: total=%.1fms paint=%.1fms "
+                    "skipped=%d overlay=%s",
+                    self.frame_count,
+                    total_ms,
+                    t_paint_ms,
+                    self._skipped_display_frames,
+                    need_overlay,
+                )
+
         except Exception as e:
-            logger.error(f"Error update_frame: {e}")
+            logger.error(
+                "[CameraWindow] Error update_frame frame=%d: %s",
+                self.frame_count,
+                e,
+                exc_info=True,
+            )
     
     def _update_realtime_score(self, raw_frame):
-        """Calcula el score de enfoque con THROTTLING para no bloquear UI.
-        
-        Solo actualiza cada _score_update_interval segundos (default 200ms).
-        También actualiza la posición Z si el C-Focus está conectado.
+        """Actualiza SOLO la posición Z en vivo (lectura rápida del C-Focus).
+
+        IMPORTANTE: El índice de enfoque (métrica S) NO se calcula aquí.
+        El cálculo de enfoque es una operación costosa que solo debe ejecutarse
+        cuando se invoca explícitamente el autofoco (AutofocusService), no en
+        cada frame del live. Durante el autofoco, el score llega por la señal
+        score_updated -> update_autofocus_score().
         """
         import time as time_module
-        
+
         current_time = time_module.time()
-        
-        # Throttling: solo actualizar si pasó suficiente tiempo
+
+        # Throttling de la lectura de Z
         if current_time - self._last_score_update < self._score_update_interval:
             return
-        
+
         self._last_score_update = current_time
-        
-        # Actualizar posición Z si C-Focus está disponible (lectura rápida)
+
+        # Solo lectura de Z (operación ligera). NO calcular enfoque en vivo.
         if self.cfocus_controller is not None and self.cfocus_controller.is_connected:
             try:
                 z_pos = self.cfocus_controller.read_z()
@@ -440,17 +515,6 @@ class CameraViewWindow(QWidget):
                     self.current_z_position = z_pos
             except Exception:
                 pass  # Silenciar errores de lectura Z
-        
-        # Calcular sharpness si hay scorer (operación costosa, por eso el throttling)
-        if self.scorer is None:
-            return
-        
-        try:
-            # Calcular sharpness global del frame
-            score = self.scorer.calculate_sharpness(raw_frame)
-            self.current_focus_score = score
-        except Exception as e:
-            logger.debug(f"Error calculando score en tiempo real: {e}")
     
     def set_cfocus_controller(self, controller):
         """Configura el controlador C-Focus para lectura de Z en tiempo real."""
@@ -475,8 +539,14 @@ class CameraViewWindow(QWidget):
             
             # Dibujar overlays de detección solo si hay detection_result
             if self.detection_result is not None:
-                # Escala entre frame original y QImage
-                orig_w, orig_h = self.detection_result.get('frame_size', (1920, 1200))
+                # Escala entre frame original y QImage.
+                # frame_size se guarda desde frame.shape real; el fallback también
+                # deriva del último frame (nunca de dimensiones fijas de cámara).
+                orig_w, orig_h = self.detection_result.get('frame_size', (0, 0))
+                if (orig_w <= 0 or orig_h <= 0) and self.last_frame is not None:
+                    orig_h, orig_w = self.last_frame.shape[:2]
+                if orig_w <= 0 or orig_h <= 0:
+                    orig_w, orig_h = result.width(), result.height()
                 scale_x = result.width() / orig_w
                 scale_y = result.height() / orig_h
                 
@@ -543,9 +613,10 @@ class CameraViewWindow(QWidget):
             painter.setFont(font_large)
             painter.setPen(QPen(QColor(255, 50, 50)))  # Rojo brillante
             
-            # Mostrar Z y Score (siempre actualizados)
+            # Z siempre visible; S solo durante autofoco (no se calcula en vivo)
             painter.drawText(12, 35, f"Z: {self.current_z_position:.1f} µm")
-            painter.drawText(12, 65, f"S: {self.current_focus_score:.1f}")
+            s_text = f"S: {self.current_focus_score:.1f}" if self.autofocus_active else "S: --"
+            painter.drawText(12, 65, s_text)
             
             # Indicador de estado de autofoco (pequeño, a la derecha)
             if self.autofocus_active:
@@ -627,11 +698,9 @@ class CameraViewWindow(QWidget):
         boxes = []
         contours = []
         
-        # CRÍTICO: Detectar dimensiones REALES del frame desde los objetos o desde last_frame
-        detected_frame_w = 1920
-        detected_frame_h = 1200
-        
-        # Intentar obtener dimensiones del frame actual
+        # Dimensiones REALES del frame (automático desde frame.shape, sin hardcodear)
+        detected_frame_w = 0
+        detected_frame_h = 0
         if self.last_frame is not None:
             h, w = self.last_frame.shape[:2]
             detected_frame_w = w
@@ -797,5 +866,19 @@ class CameraViewWindow(QWidget):
         """
         self.autofocus_status_msg = message[:30] if message else ""
     
+    def showEvent(self, event):
+        """Log al mostrar ventana."""
+        super().showEvent(event)
+        logger.info(
+            "[CameraWindow] showEvent: ventana visible size=%dx%d",
+            self.width(),
+            self.height(),
+        )
+
     def closeEvent(self, event):
+        logger.info(
+            "[CameraWindow] closeEvent: frames_pintados=%d skipped=%d",
+            self.frame_count,
+            self._skipped_display_frames,
+        )
         super().closeEvent(event)

@@ -43,6 +43,10 @@ _DEFAULT_SYSTEM = {
     'recorrido_um': 20000.0
 }
 
+# FOV calibrado de la cámara (µm por captura)
+DEFAULT_FOV_X_UM = 162.9
+DEFAULT_FOV_Y_UM = 122.1
+
 
 def _load_calibration() -> dict:
     """Carga la calibración desde el archivo JSON."""

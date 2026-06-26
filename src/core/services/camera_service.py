@@ -25,7 +25,9 @@ from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 import cv2
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from utils.microscopy_filename import build_single_capture_filename
+
+from PyQt5.QtCore import QObject, pyqtSignal, Qt
 
 from hardware.camera import CameraWorkerFactory, BaseCameraWorker
 from config.hardware_availability import THORLABS_AVAILABLE, BASLER_AVAILABLE
@@ -79,6 +81,10 @@ class CameraService(QObject):
         self.worker: Optional[BaseCameraWorker] = None
         self._camera_type = camera_type
         self._pending_capture = False  # Flag para captura después de autofoco
+        self._frames_received = 0
+        self._frames_emitted = 0
+        self._last_frame_log_time = 0.0
+        self._resolution_logged = False
         
         logger.info(f"[CameraService] Inicializado con camera_type='{camera_type}'")
 
@@ -133,7 +139,9 @@ class CameraService(QObject):
             
             # Conectar señales (igual para todos los workers gracias a BaseCameraWorker)
             self.worker.connection_success.connect(self._on_worker_connected)
-            self.worker.new_frame_ready.connect(self._on_new_frame)
+            self.worker.new_frame_ready.connect(
+                self._on_new_frame, Qt.QueuedConnection
+            )
             self.worker.status_update.connect(self.status_changed.emit)
             
             logger.info(f"[CameraService] Worker creado: {self.worker.__class__.__name__}")
@@ -172,14 +180,23 @@ class CameraService(QObject):
             logger.warning("[CameraService] start_live llamado sin cámara conectada")
             return
 
+        if self.worker.isRunning():
+            logger.warning("[CameraService] start_live: worker ya en ejecución, ignorando")
+            return
+
         # Configurar parámetros en el worker
         self.worker.exposure = exposure_s
         self.worker.fps = fps
         self.worker.buffer_size = buffer_size
+        self._frames_received = 0
+        self._frames_emitted = 0
 
-        # CameraWorker emite "Iniciando vista en vivo..." via status_update
         logger.info(
-            f"[CameraService] Iniciando live view: exp={exposure_s}s, fps={fps}, buffer={buffer_size}"
+            "[CameraService] Iniciando live view: exp=%ss fps=%d buffer=%d worker=%s",
+            exposure_s,
+            fps,
+            buffer_size,
+            self.worker.__class__.__name__,
         )
         self.worker.start()
 
@@ -208,6 +225,28 @@ class CameraService(QObject):
 
     def _on_new_frame(self, q_image, raw_frame) -> None:
         """Reemite el frame nuevo para que la UI lo consuma."""
+        import time
+        self._frames_received += 1
+        now = time.perf_counter()
+
+        if self._frames_received == 1:
+            shape = getattr(raw_frame, "shape", None)
+            logger.info(
+                "[CameraService] Primer frame del worker: qimage=%dx%d raw_shape=%s",
+                q_image.width() if q_image else 0,
+                q_image.height() if q_image else 0,
+                shape,
+            )
+
+        if now - self._last_frame_log_time >= 5.0:
+            logger.info(
+                "[CameraService] Frames worker->UI: recibidos=%d emitidos=%d",
+                self._frames_received,
+                self._frames_emitted,
+            )
+            self._last_frame_log_time = now
+
+        self._frames_emitted += 1
         self.frame_ready.emit(q_image, raw_frame)
 
     # ==================================================================
@@ -512,10 +551,20 @@ class CameraService(QObject):
             save_folder = config.get('save_folder', '.')
             img_format = config.get('img_format', 'png').lower()
             use_16bit = config.get('use_16bit', True)  # Por defecto 16-bit
+            x_um = config.get('x_um')
+            y_um = config.get('y_um')
+            has_xy = x_um is not None and y_um is not None
+
+            def _microscopy_filename(ext: str) -> str:
+                if has_xy:
+                    return build_single_capture_filename(
+                        class_name, image_index, float(x_um), float(y_um), ext
+                    )
+                return f"{class_name}_{image_index:05d}.{ext}"
             
             # Determinar extensión y guardar según formato y profundidad de bits
             if img_format == 'tiff':
-                filename = f"{class_name}_{image_index:05d}.tiff"
+                filename = _microscopy_filename('tiff')
                 filepath = os.path.join(save_folder, filename)
                 
                 if use_16bit:
@@ -533,7 +582,7 @@ class CameraService(QObject):
                     bits_str = "8-bit"
                     
             elif img_format == 'png':
-                filename = f"{class_name}_{image_index:05d}.png"
+                filename = _microscopy_filename('png')
                 filepath = os.path.join(save_folder, filename)
                 
                 if use_16bit:
@@ -553,7 +602,7 @@ class CameraService(QObject):
                     
             else:  # jpg
                 # JPG solo soporta 8-bit
-                filename = f"{class_name}_{image_index:05d}.jpg"
+                filename = _microscopy_filename('jpg')
                 filepath = os.path.join(save_folder, filename)
                 
                 if original_dtype == np.uint16:
@@ -597,6 +646,18 @@ class CameraService(QObject):
             return self.worker.current_frame
         return None
 
+    def is_streaming(self) -> bool:
+        """True si la cámara transmite frames (vista en vivo activa)."""
+        if self.worker is None:
+            return False
+        frame = self.worker.current_frame
+        return (
+            self.worker.isRunning()
+            and getattr(self.worker, "running", False)
+            and frame is not None
+            and getattr(frame, "size", 0) > 0
+        )
+
     def get_frame_info(self) -> Dict[str, Any]:
         """Retorna información del frame actual."""
         if self.worker is None or self.worker.current_frame is None:
@@ -623,5 +684,9 @@ class CameraService(QObject):
         
         frame = self.worker.current_frame
         h, w = frame.shape[:2]
-        logger.info(f"[CameraService] Resolución real de cámara: {w}x{h}")
+        if not self._resolution_logged:
+            logger.info("[CameraService] Resolución real de cámara: %dx%d", w, h)
+            self._resolution_logged = True
+        else:
+            logger.debug("[CameraService] Resolución de cámara: %dx%d", w, h)
         return (w, h)

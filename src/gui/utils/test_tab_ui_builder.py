@@ -15,7 +15,14 @@ from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QCheckBox, QRadioButton, QFrame, QButtonGroup, QWidget)
 from PyQt5.QtCore import Qt
 
+from config.constants import DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
+
 logger = logging.getLogger('MotorControl_L206')
+
+_READONLY_INPUT_STYLE = (
+    "background: #E8E8E8; color: #333333; border: 1px solid #CCCCCC;"
+)
+_EDITABLE_INPUT_STYLE = "background: white; color: black;"
 
 
 def create_calibration_analysis_section(widgets: dict, show_analysis_callback) -> QWidget:
@@ -294,36 +301,59 @@ def create_trajectory_section(widgets: dict, generate_callback, preview_callback
     
     # Parámetros
     params_layout = QGridLayout()
-    
-    params_layout.addWidget(QLabel("Puntos:"), 0, 0)
-    widgets['points_input'] = QLineEdit("100")
-    widgets['points_input'].setStyleSheet("background: white; color: black;")
-    params_layout.addWidget(widgets['points_input'], 0, 1)
-    
+
+    fov_x_label = QLabel("FOV X (µm):")
+    fov_x_label.setToolTip(
+        "Campo de visión calibrado en X (µm por captura). "
+        "Ajustar al cambiar objetivo o configuración del sensor."
+    )
+    params_layout.addWidget(fov_x_label, 0, 0)
+    widgets['fov_x_input'] = QLineEdit(str(DEFAULT_FOV_X_UM))
+    widgets['fov_x_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
+    params_layout.addWidget(widgets['fov_x_input'], 0, 1)
+
     params_layout.addWidget(QLabel("X inicio (µm):"), 0, 2)
     widgets['x_start_input'] = QLineEdit("10000")
-    widgets['x_start_input'].setStyleSheet("background: white; color: black;")
+    widgets['x_start_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
     params_layout.addWidget(widgets['x_start_input'], 0, 3)
-    
+
     params_layout.addWidget(QLabel("X fin (µm):"), 0, 4)
     widgets['x_end_input'] = QLineEdit("20000")
-    widgets['x_end_input'].setStyleSheet("background: white; color: black;")
+    widgets['x_end_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
     params_layout.addWidget(widgets['x_end_input'], 0, 5)
-    
+
+    fov_y_label = QLabel("FOV Y (µm):")
+    fov_y_label.setToolTip(
+        "Campo de visión calibrado en Y (µm por captura). "
+        "Puede diferir de FOV X según la calibración del sensor."
+    )
+    params_layout.addWidget(fov_y_label, 1, 0)
+    widgets['fov_y_input'] = QLineEdit(str(DEFAULT_FOV_Y_UM))
+    widgets['fov_y_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
+    params_layout.addWidget(widgets['fov_y_input'], 1, 1)
+
     params_layout.addWidget(QLabel("Y inicio (µm):"), 1, 2)
     widgets['y_start_input'] = QLineEdit("10000")
-    widgets['y_start_input'].setStyleSheet("background: white; color: black;")
+    widgets['y_start_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
     params_layout.addWidget(widgets['y_start_input'], 1, 3)
-    
+
     params_layout.addWidget(QLabel("Y fin (µm):"), 1, 4)
     widgets['y_end_input'] = QLineEdit("20000")
-    widgets['y_end_input'].setStyleSheet("background: white; color: black;")
+    widgets['y_end_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
     params_layout.addWidget(widgets['y_end_input'], 1, 5)
-    
-    params_layout.addWidget(QLabel("Delay (s):"), 1, 0)
+
+    params_layout.addWidget(QLabel("Delay (s):"), 2, 0)
     widgets['delay_input'] = QLineEdit("0.5")
-    widgets['delay_input'].setStyleSheet("background: white; color: black;")
-    params_layout.addWidget(widgets['delay_input'], 1, 1)
+    widgets['delay_input'].setStyleSheet(_EDITABLE_INPUT_STYLE)
+    params_layout.addWidget(widgets['delay_input'], 2, 1)
+
+    points_label = QLabel("Puntos:")
+    points_label.setToolTip("Total calculado automáticamente a partir del FOV y el área.")
+    params_layout.addWidget(points_label, 2, 2)
+    widgets['points_input'] = QLineEdit("--")
+    widgets['points_input'].setReadOnly(True)
+    widgets['points_input'].setStyleSheet(_READONLY_INPUT_STYLE)
+    params_layout.addWidget(widgets['points_input'], 2, 3)
     
     layout.addLayout(params_layout)
     

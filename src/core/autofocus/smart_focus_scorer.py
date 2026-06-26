@@ -116,48 +116,15 @@ class SmartFocusScorer:
     
     def calculate_sharpness(self, image: np.ndarray, roi: Optional[Tuple[int, int, int, int]] = None) -> float:
         """
-        Calcula el índice de nitidez usando Laplacian Variance (método más rápido y sensible).
-        
-        Args:
-            image: Imagen de entrada (BGR o grayscale)
-            roi: Región de interés (x, y, w, h). Si None, usa toda la imagen.
-            
-        Returns:
-            float: Índice de nitidez (mayor = mejor enfoque)
+        Calcula el índice de nitidez usando la métrica unificada (focus_metric).
         """
-        # Extraer ROI si se especifica
-        if roi is not None:
-            x, y, w, h = roi
-            h_img, w_img = image.shape[:2]
-            x = max(0, min(x, w_img - 1))
-            y = max(0, min(y, h_img - 1))
-            w = min(w, w_img - x)
-            h = min(h, h_img - y)
-            
-            if w <= 0 or h <= 0:
-                return 0.0
-            
-            image = image[y:y+h, x:x+w]
-        
-        # Convertir a grayscale si es necesario
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        
-        # Normalizar si es uint16
-        if gray.dtype == np.uint16:
-            gray = (gray / 256).astype(np.uint8)
-        
-        # Laplacian Variance - Método estándar de autofocus
-        # Más sensible a cambios de enfoque que gradient
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
-        variance = laplacian.var()
-        
-        # Escalar para mejor rango dinámico
-        sharpness = variance * 10.0
-        
-        return float(sharpness)
+        from core.autofocus.focus_metric import calculate_focus_score
+
+        if roi is None:
+            h, w = image.shape[:2]
+            roi = (0, 0, w, h)
+
+        return calculate_focus_score(image, roi, roi_margin=getattr(self, 'roi_margin', 20))
     
     def evaluate_focus(self, 
                       image: np.ndarray, 

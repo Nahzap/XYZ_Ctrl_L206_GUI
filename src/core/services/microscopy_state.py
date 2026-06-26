@@ -281,8 +281,13 @@ class MicroscopyStateManager:
         Returns:
             (x, y) en µm o None si no hay punto actual
         """
-        if 0 <= self._current_point < len(self._trajectory):
-            return self._trajectory[self._current_point]
+        return self.get_point_at(self._current_point)
+
+    def get_point_at(self, index: int) -> Optional[Tuple[float, float]]:
+        """Coordenadas (x, y) en µm del punto de trayectoria en `index` (0-based)."""
+        if 0 <= index < len(self._trajectory):
+            x, y = self._trajectory[index]
+            return float(x), float(y)
         return None
     
     def get_progress_info(self) -> dict:

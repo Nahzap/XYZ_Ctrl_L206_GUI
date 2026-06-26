@@ -297,7 +297,9 @@ class ArduinoGUI(QMainWindow):
         )
         # Conectar CameraService con CameraTab (solo orquestación desde main)
         self.camera_service.connected.connect(self.camera_tab._on_camera_connected)
-        self.camera_service.frame_ready.connect(self.camera_tab.on_camera_frame)
+        self.camera_service.frame_ready.connect(
+            self.camera_tab.on_camera_frame, Qt.QueuedConnection
+        )
         self.camera_service.status_changed.connect(self.camera_tab.log_message)
         self.camera_service.disconnected.connect(lambda: self.camera_tab.set_connected(False))
         # Conectar TestTab con CameraTab para sincronizar trayectoria

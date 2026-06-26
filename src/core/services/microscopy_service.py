@@ -31,6 +31,11 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QCoreApplication
 
 from core.services.microscopy_state import MicroscopyStateManager, MicroscopyState
 from core.validators import MicroscopyValidator, MicroscopyConfig, ValidationResult
+from utils.microscopy_filename import (
+    build_multifocal_filename,
+    build_point_basename,
+    build_single_capture_filename,
+)
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -375,6 +380,26 @@ class MicroscopyService(QObject):
         logger.info(f"[MicroscopyService] _capture check: use_autofocus={use_autofocus}, cfocus_enabled={cfocus_enabled}")
 
         if use_autofocus and cfocus_enabled:
+            frame = self._get_current_frame()
+            if frame is None:
+                logger.warning(
+                    "[MicroscopyService] Autofoco habilitado pero sin transmisión de cámara"
+                )
+                self.status_changed.emit(
+                    "⚠️ Sin cámara en vivo - captura sin autofoco en este punto"
+                )
+                use_autofocus = False
+            elif self._autofocus_service and not self._autofocus_service.get_frame_callback:
+                logger.warning(
+                    "[MicroscopyService] Autofoco habilitado pero no configurado "
+                    "(calibra C-Focus con cámara en vivo)"
+                )
+                self.status_changed.emit(
+                    "⚠️ Autofoco no configurado - captura sin autofoco en este punto"
+                )
+                use_autofocus = False
+
+        if use_autofocus and cfocus_enabled:
             self._capture_with_autofocus()
             return
         
@@ -386,6 +411,7 @@ class MicroscopyService(QObject):
         self.status_changed.emit("  Capturando imagen (Sin Autofoco)...")
         success = False
         if self._capture_microscopy_image:
+            self._inject_point_xy_into_config()
             success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
 
         if success:
@@ -764,236 +790,49 @@ class MicroscopyService(QObject):
         else:
             logger.error("[MicroscopyService] ❌ test_service NO disponible - NO se puede pausar control XY")
         
-        # CAPTURA RÁPIDA: N imágenes multi-focales
-        # NOTA: Ya NO actualizamos ROI aquí porque causa que los motores se muevan
-        # El ROI ya fue detectado correctamente en _capture_with_autofocus
-        self._quick_capture_multifocal(largest_object)
-    
+        # CAPTURA RÁPIDA: autofoco asíncrono (no bloquea transmisión de cámara)
+        self._start_algorithm_autofocus(largest_object)
+
+    def _start_algorithm_autofocus(self, obj) -> None:
+        """
+        Dispara autofoco solo cuando el algoritmo de microscopía lo requiere.
+
+        Usa AutofocusService en hilo propio (misma ruta que el botón manual de UI).
+        """
+        if not self._autofocus_service:
+            logger.error("[MicroscopyService] AutofocusService no disponible")
+            self._abort_autofocus_point("AutofocusService no disponible")
+            return
+
+        self._autofocus_service.microscopy_mode = True
+        started = self._autofocus_service.start_autofocus([obj])
+        if not started:
+            self._autofocus_service.microscopy_mode = False
+            self._abort_autofocus_point("No se pudo iniciar autofoco (revisa cámara en vivo y C-Focus)")
+
+    def _abort_autofocus_point(self, reason: str) -> None:
+        """Limpia estado XY y avanza si el autofoco algorítmico no pudo iniciar."""
+        logger.warning("[MicroscopyService] Autofoco abortado: %s", reason)
+        self.status_changed.emit(f"  ⚠️ Autofoco omitido: {reason}")
+        try:
+            self._advance_point()
+        finally:
+            if self._test_service:
+                self._test_service.resume_dual_control()
+
     def _quick_capture_multifocal(self, obj) -> None:
         """
-        Captura RÁPIDA de N imágenes multi-focales (configurado por usuario).
-        
-        Proceso:
-        1. Encuentra BPoF con búsqueda rápida local (±5µm desde posición actual)
-        2. Captura N imágenes centradas en BPoF con offsets (según n_captures configurado)
-        3. SIEMPRE vuelve a Z medio (centro calibrado)
-        
-        NOTA: El control XY YA está PAUSADO antes de llamar a este método.
+        Obsoleto: la captura multi-focal se hace vía start_autofocus + handle_autofocus_complete.
+
+        Se mantiene como alias por compatibilidad interna.
         """
-        # Control XY ya está pausado en _proceed_with_capture
-        logger.info("[MicroscopyService] 🔒 Iniciando captura multifocal con control XY PAUSADO")
-        
-        try:
-            cfocus = self._autofocus_service.cfocus_controller
-            bbox = obj.bounding_box
-            contour = getattr(obj, 'contour', None)
-            
-            # Obtener posición actual y centro calibrado
-            z_current = cfocus.read_z()
-            calib_info = cfocus.get_calibration_info()
-            
-            if not calib_info['is_calibrated']:
-                logger.error("[MicroscopyService] C-Focus no calibrado, no se puede hacer captura rápida")
-                self._advance_point()
-                return
-            
-            z_center_hw = calib_info['z_center']
-            z_min_hw = calib_info['z_min']
-            z_max_hw = calib_info['z_max']
-            
-            logger.info(f"[MicroscopyService] Captura rápida: Z actual={z_current:.2f}µm, Z centro={z_center_hw:.2f}µm")
-        
-            # PASO 1: Búsqueda de BPoF usando configuración de autofoco
-            # Si use_full_range=True, escanea TODO el rango calibrado (0-80µm)
-            # Si use_full_range=False, escanea ±z_scan_range desde posición actual
-            
-            use_full_range = self._autofocus_service.use_full_range if self._autofocus_service else False
-            
-            if use_full_range:
-                # ESCANEO COMPLETO: usar TODO el rango calibrado
-                z_search_min = z_min_hw
-                z_search_max = z_max_hw
-                search_range_total = z_max_hw - z_min_hw
-                logger.info(f"[MicroscopyService] ESCANEO COMPLETO: {z_search_min:.2f} → {z_search_max:.2f}µm (rango: {search_range_total:.2f}µm)")
-            else:
-                # ESCANEO LOCAL: ±z_scan_range desde posición actual
-                search_range = self._autofocus_service.z_scan_range if self._autofocus_service else 5.0
-                z_search_min = max(z_min_hw, z_current - search_range)
-                z_search_max = min(z_max_hw, z_current + search_range)
-                search_range_total = z_search_max - z_search_min
-                logger.info(f"[MicroscopyService] Escaneo local: {z_search_min:.2f} - {z_search_max:.2f}µm (±{search_range:.2f}µm desde Z={z_current:.2f}µm)")
-            
-            search_step = self._autofocus_service.z_step_coarse if self._autofocus_service else 0.5
-            
-            best_z = z_current
-            best_score = 0.0
-            
-            z = z_search_min
-            n_steps = int((z_search_max - z_search_min) / search_step) + 1
-            step_count = 0
-            
-            while z <= z_search_max:
-                step_count += 1
-                cfocus.move_z(z)
-                time.sleep(0.05)  # 50ms estabilización
-                
-                # Mantener la UI receptiva durante el escaneo
-                try:
-                    QCoreApplication.processEvents()
-                except Exception:
-                    pass
-                
-                frame = self._get_current_frame()
-                if frame is not None:
-                    score = self._autofocus_service._get_stable_score(bbox, contour, n_samples=1)
-                    if score > best_score:
-                        best_z = z
-                        best_score = score
-                    
-                    # Mensaje de progreso en línea única
-                    progress_pct = (step_count / n_steps) * 100
-                    distance_traveled = z - z_search_min
-                    msg = f"[MicroscopyService] SCAN: {distance_traveled:.2f}/{search_range_total:.2f}µm ({progress_pct:.1f}%) | Z={z:.2f}µm | Score={score:.1f} | Best={best_score:.1f}@{best_z:.2f}µm"
-                    print(msg, end='\r', flush=True)
-                    logger.debug(msg)
-                
-                z += search_step
-            
-            # Nueva línea después del progreso
-            print()
-            logger.info(f"[MicroscopyService] BPoF encontrado: Z={best_z:.2f}µm, Score={best_score:.1f} (recorrido: {search_range_total:.2f}µm)")
-        
-            # PASO 2: Capturar 3 imágenes (BPoF, +offset, -offset)
-            offset_z = self._autofocus_service.z_step_coarse  # Usar paso coarse como offset (ej: 0.5µm)
-            
-            z_positions = [
-                best_z,                    # BPoF (centro)
-                min(z_max_hw, best_z + offset_z),  # +offset (arriba)
-                max(z_min_hw, best_z - offset_z)   # -offset (abajo)
-            ]
-            
-            frames = []
-            scores = []
-            
-            for i, z_pos in enumerate(z_positions):
-                cfocus.move_z(z_pos)
-                time.sleep(0.1)  # 100ms estabilización para captura
-                try:
-                    QCoreApplication.processEvents()
-                except Exception:
-                    pass
-                
-                frame = self._get_current_frame()
-                if frame is not None:
-                    frames.append(frame.copy())
-                    score = self._autofocus_service._get_stable_score(bbox, contour, n_samples=1)
-                    scores.append(score)
-                    
-                    label = "BPoF" if i == 0 else f"{'+' if i == 1 else '-'}{offset_z}µm"
-                    logger.info(f"[MicroscopyService] Captura {i+1}/3 ({label}): Z={z_pos:.2f}µm, S={score:.1f}")
-            
-            # PASO 3: Guardar las 3 imágenes
-            success = self._save_3images(frames, z_positions, scores, best_z, self._state_manager.current_point)
-            
-            # PASO 4: SIEMPRE volver a Z medio (centro calibrado)
-            logger.info(f"[MicroscopyService] Volviendo a Z medio: {z_center_hw:.2f}µm")
-            cfocus.move_z(z_center_hw)
-            time.sleep(0.1)
-            try:
-                QCoreApplication.processEvents()
-            except Exception:
-                pass
-            
-            z_final = cfocus.read_z()
-            if z_final is not None:
-                logger.info(f"[MicroscopyService] ✓ Posición final: Z={z_final:.2f}µm (centro calibrado)")
-            else:
-                logger.warning("[MicroscopyService] ⚠️ No se pudo leer posición Z final (C-Focus desconectado?)")
-            
-            if success:
-                self.status_changed.emit(f"  ✓ 3 imágenes guardadas - vuelto a Z medio")
-            else:
-                self.status_changed.emit(f"  ⚠️ Error guardando imágenes")
-            
-            # FASE 3: Comando explícito para avanzar (después de captura)
-            self._state_manager.advance_point()
-            self.progress_changed.emit(self._state_manager.current_point, self._state_manager.total_points)
-            
-            # Delay de usuario (post-captura)
-            if self._delay_after_ms > 0:
-                time.sleep(self._delay_after_ms / 1000.0)
-            
-            # DECISIÓN: SIEMPRE reanudar automáticamente después de captura
-            # El modo aprendizaje solo pausa ANTES de capturar (para confirmar)
-            # Una vez confirmado y capturado, debe continuar automáticamente
-            logger.info("[MicroscopyService] ✅ Captura completada - reanudando trayectoria automáticamente")
-            if self._test_service:
-                self._test_service.resume_trajectory()
-        
-        finally:
-            # PASO FINAL: REACTIVAR control dual XY
-            if self._test_service:
-                logger.info("[MicroscopyService] ▶️  Reactivando control dual XY")
-                self._test_service.resume_dual_control()
-    
-    def _save_3images(self, frames: list, z_positions: list, scores: list, best_z: float, image_index: int) -> bool:
-        """
-        Guarda las 3 imágenes capturadas (BPoF + offsets).
-        
-        Args:
-            frames: Lista de 3 frames capturados
-            z_positions: Lista de 3 posiciones Z
-            scores: Lista de 3 scores de enfoque
-            best_z: Posición Z del BPoF
-            image_index: Índice de la imagen base
-            
-        Returns:
-            bool: True si se guardaron correctamente todas las imágenes
-        """
-        if not frames or len(frames) != 3 or self._microscopy_config is None:
-            logger.error(f"[MicroscopyService] Error: se esperaban 3 frames, recibidos {len(frames) if frames else 0}")
-            return False
-        
-        save_folder = self._microscopy_config.get('save_folder', '.')
-        class_name = self._microscopy_config.get('class_name', 'sample')
-        
-        logger.info(f"[MicroscopyService] Guardando 3 imágenes para punto {image_index + 1}")
-        
-        all_success = True
-        labels = ['BPoF', '+offset', '-offset']
-        
-        for i, (frame, z_pos, score, label) in enumerate(zip(frames, z_positions, scores, labels)):
-            try:
-                frame_copy = frame.copy()
-                
-                # Normalizar uint16 a uint8 si es necesario
-                if frame_copy.dtype == np.uint16:
-                    if frame_copy.max() > 0:
-                        frame_copy = (frame_copy / frame_copy.max() * 255).astype(np.uint8)
-                    else:
-                        frame_copy = frame_copy.astype(np.uint8)
-                
-                # Generar nombre de archivo con sufijo de índice focal
-                # Ejemplo: sample_0001_f0.png (BPoF), sample_0001_f1.png (+offset), sample_0001_f2.png (-offset)
-                filename = f"{class_name}_{image_index + 1:04d}_f{i}.png"
-                filepath = os.path.join(save_folder, filename)
-                
-                # Guardar imagen
-                cv2.imwrite(filepath, frame_copy)
-                
-                offset_str = f"(Z={z_pos:.1f}µm, offset={z_pos - best_z:+.1f}µm)" if i > 0 else f"(Z={z_pos:.1f}µm)"
-                logger.info(f"[MicroscopyService]   {label}: {filename} {offset_str}, S={score:.1f}")
-                
-            except Exception as e:
-                logger.error(f"[MicroscopyService] Error guardando imagen {i}: {e}")
-                all_success = False
-        
-        return all_success
+        self._start_algorithm_autofocus(obj)
 
     def _capture_without_autofocus_fallback(self) -> None:
         """Captura sencilla usada como fallback cuando no hay autofoco disponible."""
         success = False
         if self._capture_microscopy_image and self._microscopy_config:
+            self._inject_point_xy_into_config()
             success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
 
         if success:
@@ -1013,53 +852,94 @@ class MicroscopyService(QObject):
         self._advance_point()
 
     def handle_autofocus_complete(self, results: list = None) -> None:
-        """Debe llamarse cuando AutofocusService completa el autofoco en microscopia.
+        """Callback cuando AutofocusService termina durante microscopía automatizada.
 
-        Usa el frame ya capturado durante el autofoco (en BPoF) para guardar la imagen.
-        
-        Args:
-            results: Lista de FocusResult con frames ya capturados en BPoF
+        Usa los frames capturados en el hilo de autofoco (sin bloquear la cámara).
         """
         if not self._state_manager.is_active:
             return
 
-        self.status_changed.emit("📸 Guardando imagen con BPoF...")
-        success = False
-        
-        # Usar los frames ya capturados durante el autofoco (evita desenfoque)
-        if results and len(results) > 0:
-            result = results[0]
-            
-            # Guardar todas las capturas multi-focales si existen
-            if result.frames and len(result.frames) > 0:
-                success = self._save_multifocal_frames(result, self._state_manager.current_point)
-            # Fallback: guardar solo BPoF si no hay capturas multi-focales
-            elif result.frame is not None:
-                success = self._save_autofocus_frame(result, self._state_manager.current_point)
-                # También guardar frame alternativo si existe (legacy)
-                if result.frame_alt is not None:
-                    self._save_autofocus_frame_alt(result, self._state_manager.current_point)
-        else:
-            # Fallback: capturar frame actual (puede estar desenfocado)
-            logger.warning("[MicroscopyService] No hay frame en resultado de autofoco, usando frame actual")
-            if self._capture_microscopy_image and self._microscopy_config:
-                success = self._capture_microscopy_image(self._microscopy_config, self._state_manager.current_point)
+        try:
+            self.status_changed.emit("📸 Guardando imagen con BPoF...")
+            success = False
+            n_captures = 0
 
-        if success:
-            logger.info(
-                "[MicroscopyService] Imagen %d guardada con autofoco (BPoF)",
-                self._state_manager.current_point + 1,
-            )
-        else:
-            self.status_changed.emit(
-                f"  ERROR: Fallo guardar imagen {self._state_manager.current_point + 1} tras autofoco"
-            )
-            logger.error(
-                "[MicroscopyService] Fallo guardar imagen %d tras autofoco",
-                self._state_manager.current_point + 1,
+            if results and len(results) > 0:
+                result = results[0]
+                n_captures = len(result.frames) if result.frames else 0
+
+                if result.frames and n_captures > 0:
+                    success = self._save_multifocal_frames(
+                        result, self._state_manager.current_point
+                    )
+                elif result.frame is not None:
+                    success = self._save_autofocus_frame(
+                        result, self._state_manager.current_point
+                    )
+                    if result.frame_alt is not None:
+                        self._save_autofocus_frame_alt(
+                            result, self._state_manager.current_point
+                        )
+            else:
+                logger.warning(
+                    "[MicroscopyService] Sin frames en resultado de autofoco"
+                )
+
+            if success:
+                self.status_changed.emit(
+                    f"  ✓ {n_captures or 1} imagen(es) guardada(s) - vuelto a Z medio"
+                )
+                logger.info(
+                    "[MicroscopyService] Imagen %d guardada con autofoco (BPoF)",
+                    self._state_manager.current_point + 1,
+                )
+            else:
+                self.status_changed.emit(
+                    f"  ERROR: Fallo guardar imagen {self._state_manager.current_point + 1} tras autofoco"
+                )
+                logger.error(
+                    "[MicroscopyService] Fallo guardar imagen %d tras autofoco",
+                    self._state_manager.current_point + 1,
+                )
+
+            self._state_manager.advance_point()
+            self.progress_changed.emit(
+                self._state_manager.current_point, self._state_manager.total_points
             )
 
-        self._advance_point()
+            if self._delay_after_ms > 0:
+                time.sleep(self._delay_after_ms / 1000.0)
+
+            if self._test_service:
+                logger.info(
+                    "[MicroscopyService] Captura con autofoco completada - reanudando trayectoria"
+                )
+                self._test_service.resume_trajectory()
+        finally:
+            if self._autofocus_service:
+                self._autofocus_service.microscopy_mode = False
+            if self._test_service:
+                logger.info("[MicroscopyService] Reactivando control dual XY")
+                self._test_service.resume_dual_control()
+
+    def _get_point_xy_um(self, image_index: int) -> Tuple[float, float]:
+        """Coordenadas de trayectoria (µm) para el punto `image_index` (0-based)."""
+        pt = self._state_manager.get_point_at(image_index)
+        if pt is None:
+            logger.warning(
+                "[MicroscopyService] Sin coordenadas XY para punto %d — usando 0,0",
+                image_index,
+            )
+            return 0.0, 0.0
+        return pt
+
+    def _inject_point_xy_into_config(self) -> None:
+        """Inyecta x_um/y_um del punto actual en la config de captura."""
+        if self._microscopy_config is None:
+            return
+        x_um, y_um = self._get_point_xy_um(self._state_manager.current_point)
+        self._microscopy_config["x_um"] = x_um
+        self._microscopy_config["y_um"] = y_um
     
     def _save_autofocus_frame(self, result, image_index: int) -> bool:
         """Guarda el frame capturado durante el autofoco (BPoF).
@@ -1087,9 +967,9 @@ class MicroscopyService(QObject):
             # Obtener configuración
             save_folder = self._microscopy_config.get('save_folder', '.')
             class_name = self._microscopy_config.get('class_name', 'sample')
+            x_um, y_um = self._get_point_xy_um(image_index)
             
-            # Generar nombre de archivo
-            filename = f"{class_name}_{image_index + 1:04d}.png"
+            filename = build_single_capture_filename(class_name, image_index, x_um, y_um, "png")
             filepath = os.path.join(save_folder, filename)
             
             # Guardar imagen
@@ -1118,12 +998,21 @@ class MicroscopyService(QObject):
         save_folder = self._microscopy_config.get('save_folder', '.')
         class_name = self._microscopy_config.get('class_name', 'sample')
         n_captures = len(result.frames)
+        x_um, y_um = self._get_point_xy_um(image_index)
+        point_base = build_point_basename(class_name, image_index, x_um, y_um)
         
         logger.info(f"[MicroscopyService] Guardando {n_captures} capturas multi-focales para imagen {image_index + 1}")
         
         all_success = True
+        focus_records = []
+        bpof_idx = n_captures // 2
         for i, (frame, z_pos, score) in enumerate(zip(result.frames, result.z_positions, result.focus_scores)):
             try:
+                if frame is None:
+                    logger.error(f"[MicroscopyService] Frame {i} es None - no guardado")
+                    all_success = False
+                    continue
+
                 frame_copy = frame.copy()
                 
                 # Normalizar uint16 a uint8 si es necesario
@@ -1133,20 +1022,54 @@ class MicroscopyService(QObject):
                     else:
                         frame_copy = frame_copy.astype(np.uint8)
                 
-                # Generar nombre de archivo con sufijo de índice focal
-                # Ejemplo: sample_0001_f0.png, sample_0001_f1.png (BPoF), sample_0001_f2.png
-                filename = f"{class_name}_{image_index + 1:04d}_f{i}.png"
+                # Ej.: sample_0043_X12500um_Y15200um_f1.png (BPoF en f1 si n=3)
+                filename = build_multifocal_filename(
+                    class_name, image_index, x_um, y_um, i, "png"
+                )
                 filepath = os.path.join(save_folder, filename)
                 
                 # Guardar imagen
                 cv2.imwrite(filepath, frame_copy)
                 
-                focus_label = "BPoF" if i == n_captures // 2 else f"offset={z_pos - result.z_optimal:+.1f}µm"
-                logger.info(f"[MicroscopyService]   Frame {i+1}/{n_captures} ({focus_label}): {filename} (Z={z_pos:.1f}µm, S={score:.1f})")
+                is_bpof = (i == bpof_idx)
+                focus_label = "BPoF" if is_bpof else f"offset={z_pos - result.z_optimal:+.1f}µm"
+                logger.info(
+                    f"[MicroscopyService]   Frame {i+1}/{n_captures} ({focus_label}): "
+                    f"{filename} (Z={z_pos:.2f}µm, S={score:.1f})"
+                )
+                focus_records.append({
+                    "file": filename,
+                    "f_index": i,
+                    "z_um": round(float(z_pos), 3),
+                    "S": round(float(score), 2),
+                    "is_bpof": is_bpof,
+                })
                 
             except Exception as e:
                 logger.error(f"[MicroscopyService] Error guardando frame multi-focal {i}: {e}")
                 all_success = False
+
+        # Metadatos de enfoque para auditoría (Z y S por captura)
+        try:
+            meta_path = os.path.join(save_folder, f"{point_base}_focus.json")
+            meta = {
+                "class_name": class_name,
+                "image_index": image_index + 1,
+                "x_um": round(float(x_um), 3),
+                "y_um": round(float(y_um), 3),
+                "z_bpof_um": round(float(result.z_optimal), 3),
+                "S_bpof": round(float(result.focus_score), 2),
+                "bpof_file": build_multifocal_filename(
+                    class_name, image_index, x_um, y_um, bpof_idx, "png"
+                ),
+                "captures": focus_records,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+            logger.info(f"[MicroscopyService] Metadatos de enfoque: {meta_path}")
+        except Exception as e:
+            logger.warning(f"[MicroscopyService] No se pudo guardar metadatos de enfoque: {e}")
         
         return all_success
     
@@ -1176,9 +1099,10 @@ class MicroscopyService(QObject):
             # Obtener configuración
             save_folder = self._microscopy_config.get('save_folder', '.')
             class_name = self._microscopy_config.get('class_name', 'sample')
+            x_um, y_um = self._get_point_xy_um(image_index)
+            point_base = build_point_basename(class_name, image_index, x_um, y_um)
             
-            # Generar nombre de archivo con sufijo _alt
-            filename = f"{class_name}_{image_index + 1:04d}_alt.png"
+            filename = f"{point_base}_alt.png"
             filepath = os.path.join(save_folder, filename)
             
             # Guardar imagen

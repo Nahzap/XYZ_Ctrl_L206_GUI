@@ -224,6 +224,7 @@ class CameraOrchestrator(QObject):
             return False
         
         # Actualizar parámetros en servicio
+        self.autofocus.use_full_range = config.use_full_range
         self.autofocus.z_scan_range = config.z_scan_range
         self.autofocus.z_step_coarse = config.z_step_coarse
         self.autofocus.z_step_fine = config.z_step_fine
@@ -234,6 +235,7 @@ class CameraOrchestrator(QObject):
         self.autofocus.max_fine_iterations = config.max_fine_iterations
         self.autofocus.n_captures = config.n_captures
         self.autofocus.z_step_capture = config.z_step_capture
+        self.autofocus.capture_step = config.z_step_capture
         self.autofocus.z_range_capture = config.z_range_capture
         
         self.status_message.emit("✅ Parámetros de autofoco actualizados")

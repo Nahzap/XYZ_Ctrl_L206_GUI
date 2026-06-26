@@ -6,6 +6,7 @@ pruebas de controladores.
 """
 
 import logging
+import math
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
@@ -103,6 +104,111 @@ class TrajectoryGenerator:
                 'y_mid': (y_min + y_max) / 2.0
             }
             
+        except Exception as e:
+            error_msg = f"Error al generar trayectoria: {str(e)}"
+            logger.error(error_msg)
+            return {
+                'success': False,
+                'message': error_msg
+            }
+
+    def generate_zigzag_by_fov(self, x_min, x_max, y_min, y_max,
+                               fov_x, fov_y, step_delay, calibration=None):
+        """
+        Genera trayectoria zig-zag basada en FOV calibrado (cero overlap).
+
+        Args:
+            x_min, x_max: Límites en X (µm)
+            y_min, y_max: Límites en Y (µm)
+            fov_x, fov_y: Campo de visión calibrado por eje (µm)
+            step_delay: Tiempo entre pasos (s)
+            calibration: Dict con calibración (opcional)
+
+        Returns:
+            dict: Trayectoria generada con keys success, message, points,
+                figure, n_points, n_rows, n_cols, fov_x, fov_y, step_delay
+        """
+        logger.info("=== Generando trayectoria por FOV ===")
+        logger.debug(
+            f"FOV: {fov_x}x{fov_y} µm, X: [{x_min}, {x_max}], Y: [{y_min}, {y_max}]"
+        )
+
+        try:
+            if x_max <= x_min or y_max <= y_min:
+                return {
+                    'success': False,
+                    'message': "Los límites máximos deben ser mayores que los mínimos"
+                }
+
+            if fov_x <= 0 or fov_y <= 0:
+                return {
+                    'success': False,
+                    'message': "FOV X e Y deben ser positivos"
+                }
+
+            if step_delay < 0.1:
+                return {
+                    'success': False,
+                    'message': "Tiempo entre pasos debe ser al menos 0.1s"
+                }
+
+            delta_x = x_max - x_min
+            delta_y = y_max - y_min
+            n_x = math.ceil(delta_x / fov_x)
+            n_y = math.ceil(delta_y / fov_y)
+            n_points = n_x * n_y
+
+            if n_points > 20000:
+                return {
+                    'success': False,
+                    'message': (
+                        f"Demasiados puntos ({n_points}). "
+                        "Reduzca el área o aumente el FOV."
+                    )
+                }
+
+            trajectory = []
+            for j in range(n_y):
+                pos_y = y_min + j * fov_y
+                if j % 2 == 0:
+                    rango_x = range(n_x)
+                else:
+                    rango_x = range(n_x - 1, -1, -1)
+
+                for i in rango_x:
+                    pos_x = x_min + i * fov_x
+                    trajectory.append([pos_x, pos_y])
+
+            trajectory_array = np.array(trajectory)
+            logger.info(
+                f"✅ Trayectoria FOV generada: {n_points} puntos ({n_x}x{n_y})"
+            )
+
+            figure = self._create_trajectory_plot_array(
+                trajectory_array, x_min, x_max, y_min, y_max
+            )
+            self.current_trajectory = trajectory_array
+
+            message = (
+                f"Trayectoria generada: {n_points} puntos / "
+                f"Grid: {n_x}x{n_y} (Resolución FOV: {fov_x:.1f}x{fov_y:.1f}µm)"
+            )
+
+            return {
+                'success': True,
+                'message': message,
+                'points': trajectory_array,
+                'figure': figure,
+                'n_points': n_points,
+                'n_rows': n_y,
+                'n_cols': n_x,
+                'fov_x': fov_x,
+                'fov_y': fov_y,
+                'step_delay': step_delay,
+                'x_mid': (x_min + x_max) / 2.0,
+                'y_mid': (y_min + y_max) / 2.0
+            }
+
         except Exception as e:
             error_msg = f"Error al generar trayectoria: {str(e)}"
             logger.error(error_msg)
