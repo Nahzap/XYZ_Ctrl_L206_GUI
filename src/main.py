@@ -88,7 +88,7 @@ from core.persistence import SessionStore
 
 # Fase 10: Pestañas GUI (Tabs modulares) - Integrado en Fase 12
 from gui.tabs import (ControlTab, RecordingTab, AnalysisTab, 
-                      CameraTab, TestTab, HInfTab, ImgAnalysisTab)
+                      CameraTab, TestTab, HInfTab, ImgAnalysisTab, CanvasGenTab)
 
 # Fase 11: Detección U2-Net (Singleton - carga única)
 from core.detection import U2NetDetector
@@ -305,6 +305,9 @@ class ArduinoGUI(QMainWindow):
         # Conectar TestTab con CameraTab para sincronizar trayectoria
         self.camera_tab.set_test_tab_reference(self.test_tab)
         self.tabs.addTab(self.camera_tab, "🎥 ImgRec")
+
+        self.canvas_gen_tab = CanvasGenTab(parent=self, test_tab=self.test_tab)
+        self.tabs.addTab(self.canvas_gen_tab, "🧩 CanvasGen")
         
         # Conectar servicios de detección con CameraTab
         self._setup_detection_services()

@@ -3,10 +3,10 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-06-25T16:54:06.371431",
+  "last_updated": "2026-06-26T12:23:07.297065",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
-    "points": 418,
+    "points": 475,
     "fov": {
       "x": 162.9,
       "y": 122.1,
@@ -18,11 +18,11 @@
       "unit": "µm"
     },
     "y_range": {
-      "min": 12400.0,
+      "min": 12000.0,
       "max": 15000.0,
       "unit": "µm"
     },
-    "delay_between_points": 2.5,
+    "delay_between_points": 0.5,
     "delay_unit": "seconds"
   },
   "test_service": {
@@ -40,11 +40,11 @@
   "microscopy": {
     "description": "Parámetros de microscopía automatizada",
     "class_name": "Escalonia_pulverulenta",
-    "total_points": 418,
+    "total_points": 475,
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 12000,
+        "min": 50000,
         "max": 500000,
         "unit": "px"
       }
@@ -69,8 +69,8 @@
       16
     ],
     "delays": {
-      "before_capture": 2000,
-      "after_capture": 500,
+      "before_capture": 1750,
+      "after_capture": 750,
       "unit": "ms"
     },
     "learning_mode": {

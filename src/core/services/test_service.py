@@ -52,7 +52,22 @@ class TrajectoryConfig:
     """Configuración para ejecución de trayectoria."""
     tolerance_um: float = 25.0
     pause_s: float = 2.0
-    
+
+
+@dataclass
+class AcceptedPointSnapshot:
+    """Estado del último punto de trayectoria aceptado (para metadatos de captura)."""
+
+    index: int
+    x_nominal_um: float
+    y_nominal_um: float
+    x_actual_um: float
+    y_actual_um: float
+    error_x_um: float
+    error_y_um: float
+    move_dir_x: int = 0
+    move_dir_y: int = 0
+    status: str = ""
 
 class TestService(QObject):
     """
@@ -114,6 +129,7 @@ class TestService(QObject):
         self._trajectory_waiting = False
         self._traj_settling_counter = 0
         self._traj_near_attempts = 0
+        self._last_accepted_snapshot: Optional[AcceptedPointSnapshot] = None
         
         logger.info("TestService inicializado")
     
@@ -148,6 +164,85 @@ class TestService(QObject):
             logger.info(f"TestService: Controlador B configurado - Kp={config.Kp:.4f}, Ki={config.Ki:.4f}")
         else:
             logger.info("TestService: Controlador B limpiado")
+
+    def get_last_accepted_snapshot(self) -> Optional[AcceptedPointSnapshot]:
+        """Retorna metadatos del último punto de trayectoria aceptado."""
+        return self._last_accepted_snapshot
+
+    def read_current_position_um(
+        self,
+        target_x: Optional[float] = None,
+        target_y: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[float], float, float]:
+        """
+        Lee posición actual desde sensores (µm) y errores respecto al objetivo.
+
+        Returns:
+            (x_actual_um, y_actual_um, error_x_um, error_y_um)
+        """
+        x_actual = y_actual = None
+        error_x = error_y = 0.0
+
+        if self._controller_a and self._get_sensor_value:
+            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
+            if sensor_adc is not None:
+                x_actual = adc_to_um(sensor_adc, axis='x')
+                if target_x is not None:
+                    ref_adc = um_to_adc(target_x, axis='x')
+                    error_x = (ref_adc - sensor_adc) * CALIBRATION_X['slope']
+
+        if self._controller_b and self._get_sensor_value:
+            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
+            if sensor_adc is not None:
+                y_actual = adc_to_um(sensor_adc, axis='y')
+                if target_y is not None:
+                    ref_adc = um_to_adc(target_y, axis='y')
+                    error_y = (ref_adc - sensor_adc) * CALIBRATION_Y['slope']
+
+        return x_actual, y_actual, error_x, error_y
+
+    def _movement_direction(self, index: int) -> Tuple[int, int]:
+        """Dirección de movimiento respecto al punto anterior (-1, 0, +1)."""
+        if not self._trajectory or index <= 0 or index >= len(self._trajectory):
+            return 0, 0
+        prev = self._trajectory[index - 1]
+        curr = self._trajectory[index]
+        dir_x = 0 if abs(curr[0] - prev[0]) < 1.0 else (1 if curr[0] > prev[0] else -1)
+        dir_y = 0 if abs(curr[1] - prev[1]) < 1.0 else (1 if curr[1] > prev[1] else -1)
+        return dir_x, dir_y
+
+    def _build_accepted_snapshot(
+        self,
+        index: int,
+        target_x: float,
+        target_y: float,
+        error_x: float,
+        error_y: float,
+        status: str,
+        prefer_live_sensor: bool = True,
+    ) -> AcceptedPointSnapshot:
+        """Construye snapshot con lectura de sensor en el instante de aceptación."""
+        x_actual, y_actual, live_ex, live_ey = self.read_current_position_um(target_x, target_y)
+        if prefer_live_sensor and x_actual is not None and y_actual is not None:
+            error_x, error_y = live_ex, live_ey
+        elif x_actual is None:
+            x_actual = target_x - error_x
+        if y_actual is None:
+            y_actual = target_y - error_y
+
+        move_dir_x, move_dir_y = self._movement_direction(index)
+        return AcceptedPointSnapshot(
+            index=index,
+            x_nominal_um=target_x,
+            y_nominal_um=target_y,
+            x_actual_um=float(x_actual),
+            y_actual_um=float(y_actual),
+            error_x_um=float(error_x),
+            error_y_um=float(error_y),
+            move_dir_x=move_dir_x,
+            move_dir_y=move_dir_y,
+            status=status,
+        )
     
     def update_controller_a_sensor(self, sensor_key: str, invert: bool):
         """Actualiza configuración de sensor e inversión para controlador A."""
@@ -857,6 +952,15 @@ class TestService(QObject):
         # Resetear integrales para el siguiente punto
         self._dual_integral_a = 0.0
         self._dual_integral_b = 0.0
+
+        self._last_accepted_snapshot = self._build_accepted_snapshot(
+            self._trajectory_index,
+            target_x,
+            target_y,
+            error_x,
+            error_y,
+            status,
+        )
         
         # Emitir señales
         total = len(self._trajectory) if self._trajectory else 0

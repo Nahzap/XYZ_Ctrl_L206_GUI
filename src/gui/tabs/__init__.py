@@ -12,6 +12,7 @@ from .control_tab import ControlTab
 from .test_tab import TestTab
 from .hinf_tab import HInfTab
 from .img_analysis_tab import ImgAnalysisTab
+from .canvas_gen_tab import CanvasGenTab
 
 __all__ = [
     'BaseTab', 
@@ -21,5 +22,6 @@ __all__ = [
     'ControlTab',
     'TestTab',
     'HInfTab',
-    'ImgAnalysisTab'
+    'ImgAnalysisTab',
+    'CanvasGenTab',
 ]

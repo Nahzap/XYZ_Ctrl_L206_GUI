@@ -31,6 +31,11 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QCoreApplication
 
 from core.services.microscopy_state import MicroscopyStateManager, MicroscopyState
 from core.validators import MicroscopyValidator, MicroscopyConfig, ValidationResult
+from core.canvas.capture_position import (
+    CapturePositionMetadata,
+    merge_position_into_focus_dict,
+    save_position_sidecar,
+)
 from utils.microscopy_filename import (
     build_multifocal_filename,
     build_point_basename,
@@ -933,13 +938,83 @@ class MicroscopyService(QObject):
             return 0.0, 0.0
         return pt
 
+    def _build_capture_position(self, image_index: int) -> CapturePositionMetadata:
+        """Construye metadatos de posición real en el instante de captura."""
+        x_nom, y_nom = self._get_point_xy_um(image_index)
+        snapshot = (
+            self._test_service.get_last_accepted_snapshot()
+            if self._test_service is not None
+            else None
+        )
+
+        if self._test_service is not None:
+            x_act, y_act, err_x, err_y = self._test_service.read_current_position_um(x_nom, y_nom)
+            if x_act is not None and y_act is not None:
+                return CapturePositionMetadata.from_acceptance(
+                    x_nom,
+                    y_nom,
+                    float(x_act),
+                    float(y_act),
+                    move_dir_x=snapshot.move_dir_x if snapshot else 0,
+                    move_dir_y=snapshot.move_dir_y if snapshot else 0,
+                    status=snapshot.status if snapshot else "",
+                    source="sensor_capture",
+                )
+
+        if snapshot is not None:
+            return CapturePositionMetadata.from_acceptance(
+                snapshot.x_nominal_um,
+                snapshot.y_nominal_um,
+                snapshot.x_actual_um,
+                snapshot.y_actual_um,
+                move_dir_x=snapshot.move_dir_x,
+                move_dir_y=snapshot.move_dir_y,
+                status=snapshot.status,
+                source="sensor_accept",
+            )
+
+        return CapturePositionMetadata.from_nominal_only(x_nom, y_nom)
+
+    def _persist_capture_position(
+        self,
+        image_index: int,
+        save_folder: str,
+        point_base: str,
+    ) -> CapturePositionMetadata:
+        """Guarda sidecar JSON con posición real de captura."""
+        position = self._build_capture_position(image_index)
+        save_position_sidecar(save_folder, point_base, position)
+        logger.info(
+            "[MicroscopyService] Posición captura: nominal=(%.1f, %.1f) actual=(%.1f, %.1f) "
+            "err=(%+.1f, %+.1f) µm dir=(%d,%d)",
+            position.x_nominal_um,
+            position.y_nominal_um,
+            position.x_actual_um,
+            position.y_actual_um,
+            position.error_x_um,
+            position.error_y_um,
+            position.move_dir_x,
+            position.move_dir_y,
+        )
+        return position
+
     def _inject_point_xy_into_config(self) -> None:
-        """Inyecta x_um/y_um del punto actual en la config de captura."""
+        """Inyecta x_um/y_um del punto actual y metadatos de posición en la config."""
         if self._microscopy_config is None:
             return
-        x_um, y_um = self._get_point_xy_um(self._state_manager.current_point)
+        idx = self._state_manager.current_point
+        x_um, y_um = self._get_point_xy_um(idx)
         self._microscopy_config["x_um"] = x_um
         self._microscopy_config["y_um"] = y_um
+        position = self._build_capture_position(idx)
+        self._microscopy_config["capture_position"] = position.to_dict()
+        point_base = build_point_basename(
+            self._microscopy_config.get("class_name", "sample"),
+            idx,
+            x_um,
+            y_um,
+        )
+        self._microscopy_config["point_base"] = point_base
     
     def _save_autofocus_frame(self, result, image_index: int) -> bool:
         """Guarda el frame capturado durante el autofoco (BPoF).
@@ -968,6 +1043,8 @@ class MicroscopyService(QObject):
             save_folder = self._microscopy_config.get('save_folder', '.')
             class_name = self._microscopy_config.get('class_name', 'sample')
             x_um, y_um = self._get_point_xy_um(image_index)
+            point_base = build_point_basename(class_name, image_index, x_um, y_um)
+            self._persist_capture_position(image_index, save_folder, point_base)
             
             filename = build_single_capture_filename(class_name, image_index, x_um, y_um, "png")
             filepath = os.path.join(save_folder, filename)
@@ -1000,6 +1077,7 @@ class MicroscopyService(QObject):
         n_captures = len(result.frames)
         x_um, y_um = self._get_point_xy_um(image_index)
         point_base = build_point_basename(class_name, image_index, x_um, y_um)
+        position = self._persist_capture_position(image_index, save_folder, point_base)
         
         logger.info(f"[MicroscopyService] Guardando {n_captures} capturas multi-focales para imagen {image_index + 1}")
         
@@ -1065,6 +1143,7 @@ class MicroscopyService(QObject):
                 "captures": focus_records,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
             }
+            meta = merge_position_into_focus_dict(meta, position)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, ensure_ascii=False)
             logger.info(f"[MicroscopyService] Metadatos de enfoque: {meta_path}")

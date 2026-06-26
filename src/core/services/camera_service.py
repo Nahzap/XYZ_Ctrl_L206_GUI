@@ -616,6 +616,23 @@ class CameraService(QObject):
             if not success:
                 self.status_changed.emit(f"❌ Error: cv2.imwrite falló para {filename}")
                 return False
+
+            capture_position = config.get("capture_position")
+            point_base = config.get("point_base")
+            if capture_position and point_base:
+                try:
+                    from core.canvas.capture_position import (
+                        CapturePositionMetadata,
+                        save_position_sidecar,
+                    )
+
+                    position = CapturePositionMetadata.from_dict(capture_position)
+                    save_position_sidecar(save_folder, point_base, position)
+                except Exception as sidecar_exc:
+                    logger.warning(
+                        "[CameraService] No se pudo guardar sidecar de posición: %s",
+                        sidecar_exc,
+                    )
             
             # Calcular tamaño del archivo
             file_size_kb = os.path.getsize(filepath) / 1024
