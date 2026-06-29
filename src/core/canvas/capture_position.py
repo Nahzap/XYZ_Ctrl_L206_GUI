@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -24,6 +24,13 @@ class CapturePositionMetadata:
     status: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     source: str = "sensor"
+    n_steps: int = 0
+    t_move_ms: float = 0.0
+    point_steps: List[Dict[str, Any]] = field(default_factory=list)
+    step_metrics: Optional[Dict[str, float]] = None
+    fov_verify_passed: bool = False
+    t_fov_verify_ms: float = 0.0
+    fov_verify_ticks: int = 0
 
     @property
     def has_actual(self) -> bool:
@@ -52,6 +59,13 @@ class CapturePositionMetadata:
             status=str(data.get("status", "")),
             timestamp=str(data.get("timestamp", "")),
             source=str(data.get("source", "unknown")),
+            n_steps=int(data.get("n_steps", 0)),
+            t_move_ms=float(data.get("t_move_ms", 0.0)),
+            point_steps=list(data.get("point_steps", [])),
+            step_metrics=data.get("step_metrics"),
+            fov_verify_passed=bool(data.get("fov_verify_passed", False)),
+            t_fov_verify_ms=float(data.get("t_fov_verify_ms", 0.0)),
+            fov_verify_ticks=int(data.get("fov_verify_ticks", 0)),
         )
 
     @classmethod

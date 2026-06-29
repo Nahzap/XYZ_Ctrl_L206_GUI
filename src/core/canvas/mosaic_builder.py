@@ -29,6 +29,10 @@ class MosaicBuildOptions:
     registration_max_shift_px: int = 48
     registration_min_response: float = 0.08
     preview_max_side: int = 4096
+    feather_px: int = 12
+    preview_from_tiles_threshold_px: int = 25_000_000
+    output_mode: str = "hdf5"  # "hdf5" (sin canvas denso) | "memmap"
+    swap_stage_axes: bool = False  # cámara 90° respecto al stage: Y→horizontal canvas
 
 
 @dataclass
@@ -44,17 +48,14 @@ class MosaicBuildResult:
     coverage_percent: float
     registration_metrics: Dict[str, float] = field(default_factory=dict)
     canvas_offset_px: Tuple[int, int] = (0, 0)
+    hdf5_path: Optional[str] = None
 
 
-def _image_row_for_grid_row(grid_row: int, n_rows: int, tile_h: int) -> int:
-    """Fila en imagen nominal: y_min (grid row 0) queda abajo."""
-    return (n_rows - 1 - grid_row) * tile_h
-
-
-def _nominal_pixel_origin(tile: TileRecord, grid, n_rows: int, tw: int, th: int) -> Tuple[float, float]:
-    px = tile.col * tw + tile.offset_px_x
-    py = _image_row_for_grid_row(tile.row, n_rows, th) + tile.offset_px_y
-    return px, py
+def _physical_pixel_origin(tile: TileRecord, grid, tw: int, th: int, swap_axes: bool = False) -> Tuple[float, float]:
+    """Posición en px desde coordenadas físicas (µm), sin cuantizar a índice de celda."""
+    return grid.um_to_pixel(
+        tile.effective_x_um(), tile.effective_y_um(), tw, th, swap_axes=swap_axes
+    )
 
 
 def _compute_canvas_bounds(
@@ -63,13 +64,13 @@ def _compute_canvas_bounds(
     tw: int,
     th: int,
     padding: int,
+    swap_axes: bool = False,
 ) -> Tuple[int, int, int, int, List[TilePlacement]]:
-    """Calcula bounding box del canvas y colocaciones base."""
-    n_rows = grid.n_rows
+    """Bounding box compacto del canvas y colocaciones base."""
     placements: List[TilePlacement] = []
 
     for idx, tile in enumerate(tiles):
-        px, py = _nominal_pixel_origin(tile, grid, n_rows, tw, th)
+        px, py = _physical_pixel_origin(tile, grid, tw, th, swap_axes=swap_axes)
         placements.append(
             TilePlacement(
                 tile_id=idx,
@@ -98,6 +99,40 @@ def _compute_canvas_bounds(
     return offset_x, offset_y, width, height, placements
 
 
+def estimate_canvas_size_px(
+    inventory: CanvasInventory,
+    padding: int = 32,
+    swap_axes: bool = False,
+) -> Tuple[int, int]:
+    """Estima tamaño del canvas (ancho, alto) sin montarlo."""
+    tw, th = inventory.tile_width, inventory.tile_height
+    if tw <= 0 or th <= 0 or not inventory.tiles:
+        return tw + 2 * padding, th + 2 * padding
+    _, _, w, h, _ = _compute_canvas_bounds(
+        inventory.tiles, inventory.grid, tw, th, padding, swap_axes=swap_axes
+    )
+    return w, h
+
+
+def cleanup_orphan_canvas_temp_files(output_dir: str) -> list[str]:
+    """Elimina .dat / _acc.dat / _weight.dat de montajes memmap anteriores."""
+    removed: list[str] = []
+    if not os.path.isdir(output_dir):
+        return removed
+    for name in os.listdir(output_dir):
+        if not name.endswith(".dat"):
+            continue
+        if "_mosaic_" not in name:
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            os.remove(path)
+            removed.append(name)
+        except OSError:
+            pass
+    return removed
+
+
 def _fill_memmap_background(
     canvas: np.memmap,
     color_bgr: Tuple[int, int, int],
@@ -110,13 +145,41 @@ def _fill_memmap_background(
         canvas[y:y_end] = band[: y_end - y]
 
 
-def _make_preview(canvas: np.memmap, max_side: int = 4096) -> np.ndarray:
-    h, w = canvas.shape[:2]
-    step = max(1, int(np.ceil(max(h, w) / max_side)))
-    preview = canvas[::step, ::step].copy()
-    if preview.ndim == 2:
-        preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
-    return np.ascontiguousarray(preview)
+def _close_memmap(arr: Optional[np.memmap]) -> None:
+    if arr is None:
+        return
+    arr.flush()
+    if hasattr(arr, "_mmap"):
+        arr._mmap.close()
+
+
+def _load_tile_image(
+    tile: TileRecord,
+    tw: int,
+    th: int,
+    background_bgr: Tuple[int, int, int],
+) -> np.ndarray:
+    img = cv2.imread(tile.filepath, cv2.IMREAD_COLOR)
+    if img is None:
+        return np.full((th, tw, 3), background_bgr, dtype=np.uint8)
+    if img.shape[0] != th or img.shape[1] != tw:
+        img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+def _feather_alpha_mask(h: int, w: int, feather_px: int) -> np.ndarray:
+    alpha = np.ones((h, w), dtype=np.float32)
+    if feather_px < 2:
+        return alpha
+    fw = min(feather_px, w // 2, h // 2)
+    if fw < 2:
+        return alpha
+    ramp = np.linspace(0.15, 1.0, fw, dtype=np.float32)
+    alpha[:fw, :] *= ramp[:, None]
+    alpha[-fw:, :] *= ramp[::-1][:, None]
+    alpha[:, :fw] *= ramp[None, :]
+    alpha[:, -fw:] *= ramp[::-1][None, :]
+    return alpha
 
 
 def _paste_tile_simple(
@@ -138,17 +201,22 @@ def _paste_tile_simple(
     canvas[y1:y2, x1:x2] = img[sy1 : sy1 + (y2 - y1), sx1 : sx1 + (x2 - x1)]
 
 
-def _paste_tile_weighted(
-    acc: np.ndarray,
-    weight: np.ndarray,
+def _paste_tile_feather_blend(
+    canvas: np.ndarray,
     img: np.ndarray,
     px: int,
     py: int,
-    tile_weight: float,
+    background_bgr: Tuple[int, int, int],
     feather_px: int = 12,
+    bg_threshold: float = 12.0,
 ) -> None:
+    """
+    Blend local en la región intersectada — solo esa parche en RAM.
+
+    Sin acumuladores globales acc/weight; operaciones matriciales tile-sized.
+    """
     th, tw = img.shape[:2]
-    h, w = acc.shape[:2]
+    h, w = canvas.shape[:2]
     x1 = max(0, px)
     y1 = max(0, py)
     x2 = min(w, px + tw)
@@ -158,51 +226,86 @@ def _paste_tile_weighted(
 
     sx1 = x1 - px
     sy1 = y1 - py
-    patch = img[sy1 : sy1 + (y2 - y1), sx1 : sx1 + (x2 - x1)].astype(np.float32)
+    rh, rw = y2 - y1, x2 - x1
+    patch = img[sy1 : sy1 + rh, sx1 : sx1 + rw].astype(np.float32)
+    existing = np.array(canvas[y1:y2, x1:x2], dtype=np.float32)
 
-    w_mask = np.full((y2 - y1, x2 - x1), tile_weight, dtype=np.float32)
-    if feather_px > 0:
-        fw = min(feather_px, (x2 - x1) // 2, (y2 - y1) // 2)
-        if fw >= 2:
-            ramp = np.linspace(0.2, 1.0, fw, dtype=np.float32)
-            w_mask[:fw, :] *= ramp[:, None]
-            w_mask[-fw:, :] *= ramp[::-1][:, None]
-            w_mask[:, :fw] *= ramp[None, :]
-            w_mask[:, -fw:] *= ramp[::-1][None, :]
-
-    acc[y1:y2, x1:x2] += patch * w_mask[:, :, None]
-    weight[y1:y2, x1:x2] += w_mask
-
-
-def _finalize_weighted_canvas(
-    acc: np.ndarray,
-    weight: np.ndarray,
-    background_bgr: Tuple[int, int, int],
-) -> np.ndarray:
+    alpha = _feather_alpha_mask(rh, rw, feather_px)
     bg = np.array(background_bgr, dtype=np.float32)
-    mask = weight > 1e-6
-    out = np.broadcast_to(bg, acc.shape).copy()
-    out[mask] = acc[mask] / weight[mask, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    bg_dist = np.linalg.norm(existing - bg, axis=2)
+    is_bg = (bg_dist < bg_threshold) | (np.max(existing, axis=2) < 1.0)
+
+    alpha3 = np.where(is_bg[:, :, None], 1.0, alpha[:, :, None])
+    blended = existing * (1.0 - alpha3) + patch * alpha3
+    canvas[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
 
 
-def build_mosaic_to_memmap(
+def _make_preview_from_tiles(
+    tiles: List[TileRecord],
+    placements: List[TilePlacement],
+    tw: int,
+    th: int,
+    canvas_w: int,
+    canvas_h: int,
+    background_bgr: Tuple[int, int, int],
+    max_side: int,
+    overlap_blend: bool,
+    feather_px: int,
+) -> np.ndarray:
+    """Preview reducido componiendo tiles — no lee el canvas memmap completo."""
+    scale = max(canvas_w, canvas_h) / max(max_side, 1)
+    pw = max(1, int(np.ceil(canvas_w / scale)))
+    ph = max(1, int(np.ceil(canvas_h / scale)))
+    preview = np.full((ph, pw, 3), background_bgr, dtype=np.uint8)
+    tile_w_s = max(1, int(round(tw / scale)))
+    tile_h_s = max(1, int(round(th / scale)))
+
+    for idx, tile in enumerate(tiles):
+        if idx >= len(placements):
+            break
+        img = _load_tile_image(tile, tw, th, background_bgr)
+        img_small = cv2.resize(img, (tile_w_s, tile_h_s), interpolation=cv2.INTER_AREA)
+        px = int(round(placements[idx].final_px / scale))
+        py = int(round(placements[idx].final_py / scale))
+        if overlap_blend:
+            _paste_tile_feather_blend(
+                preview, img_small, px, py, background_bgr, feather_px=max(2, feather_px // 2)
+            )
+        else:
+            _paste_tile_simple(preview, img_small, px, py)
+
+    return np.ascontiguousarray(preview)
+
+
+def _make_preview_from_memmap(canvas: np.memmap, max_side: int = 4096) -> np.ndarray:
+    h, w = canvas.shape[:2]
+    step = max(1, int(np.ceil(max(h, w) / max_side)))
+    preview = canvas[::step, ::step].copy()
+    if preview.ndim == 2:
+        preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+    return np.ascontiguousarray(preview)
+
+
+@dataclass
+class PreparedMosaic:
+    """Resultado de registro + colocación, compartido por HDF5 y memmap."""
+
+    background_bgr: Tuple[int, int, int]
+    placements: List[TilePlacement]
+    offset_x: int
+    offset_y: int
+    canvas_w: int
+    canvas_h: int
+    registration_metrics: Dict[str, float]
+
+
+def prepare_mosaic_build(
     inventory: CanvasInventory,
-    output_dir: str,
+    opts: MosaicBuildOptions,
     background_bgr: Optional[Tuple[int, int, int]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    options: Optional[MosaicBuildOptions] = None,
-) -> MosaicBuildResult:
-    """
-    Construye canvas completo con colocación por posición real y registro visual opcional.
-
-    Solo un tile en RAM a la vez durante lectura; composición con blending acumulado.
-    """
-    opts = options or MosaicBuildOptions()
-    if inventory.tile_width <= 0 or inventory.tile_height <= 0:
-        raise ValueError("Inventario sin dimensiones de tile — escanee una carpeta con PNG válidos")
-
-    os.makedirs(output_dir, exist_ok=True)
+) -> PreparedMosaic:
+    """Registro visual y bounding box — sin materializar canvas."""
     grid = inventory.grid
     tw, th = inventory.tile_width, inventory.tile_height
     tiles = inventory.tiles
@@ -221,25 +324,19 @@ def build_mosaic_to_memmap(
         background_bgr, _ = estimate_background_bgr(paths)
 
     registration_metrics: Dict[str, float] = {}
-    images_for_reg: List[np.ndarray] = []
     placements: List[TilePlacement] = []
+
+    def _tile_loader(idx: int) -> np.ndarray:
+        return _load_tile_image(tiles[idx], tw, th, background_bgr)
 
     if opts.visual_registration and tiles:
         if progress_callback:
-            progress_callback(0, len(tiles) + 2, "Cargando tiles para registro visual...")
-        for tile in tiles:
-            img = cv2.imread(tile.filepath, cv2.IMREAD_COLOR)
-            if img is None:
-                img = np.full((th, tw, 3), background_bgr, dtype=np.uint8)
-            elif img.shape[0] != th or img.shape[1] != tw:
-                img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
-            images_for_reg.append(img)
-
+            progress_callback(0, len(tiles) + 2, "Registro visual (tiles bajo demanda)...")
         _, _, _, _, placements = _compute_canvas_bounds(
-            tiles, grid, tw, th, opts.canvas_padding_px
+            tiles, grid, tw, th, opts.canvas_padding_px, swap_axes=opts.swap_stage_axes
         )
         placements, registration_metrics = refine_placements(
-            images_for_reg,
+            _tile_loader,
             placements,
             tw,
             th,
@@ -251,97 +348,33 @@ def build_mosaic_to_memmap(
             tile.reg_offset_px_y = placement.reg_dy
 
     offset_x, offset_y, canvas_w, canvas_h, placements = _compute_canvas_bounds(
-        tiles, grid, tw, th, opts.canvas_padding_px
+        tiles, grid, tw, th, opts.canvas_padding_px, swap_axes=opts.swap_stage_axes
+    )
+    return PreparedMosaic(
+        background_bgr=background_bgr,
+        placements=placements,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        registration_metrics=registration_metrics,
     )
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    class_part = inventory.class_name or "canvas"
-    canvas_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}.dat")
-    preview_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}_preview.png")
-    metadata_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}_meta.json")
 
-    t0 = time.perf_counter()
-    canvas = np.memmap(
-        canvas_path,
-        dtype=np.uint8,
-        mode="w+",
-        shape=(canvas_h, canvas_w, 3),
-    )
-
-    total_steps = len(tiles) + 2
-    step_i = 0
-
-    if progress_callback:
-        progress_callback(step_i, total_steps, "Rellenando fondo por bandas...")
-    _fill_memmap_background(canvas, background_bgr)
-    step_i += 1
-
-    if opts.overlap_blend:
-        acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
-        weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
-
-    tiles_placed = 0
-    for idx, tile in enumerate(tiles):
-        if images_for_reg and idx < len(images_for_reg):
-            img = images_for_reg[idx]
-        else:
-            img = cv2.imread(tile.filepath, cv2.IMREAD_COLOR)
-            if img is None:
-                if progress_callback:
-                    progress_callback(
-                        step_i,
-                        total_steps,
-                        f"⚠ No se pudo leer {os.path.basename(tile.filepath)}",
-                    )
-                continue
-            if img.shape[0] != th or img.shape[1] != tw:
-                img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
-
-        if placements:
-            px = int(round(placements[idx].final_px))
-            py = int(round(placements[idx].final_py))
-        else:
-            px, py = _nominal_pixel_origin(tile, grid, grid.n_rows, tw, th)
-            px, py = int(round(px)), int(round(py))
-
-        tile_weight = float(tile.score) if tile.score is not None and tile.score > 0 else 1.0
-
-        if opts.overlap_blend:
-            _paste_tile_weighted(acc, weight, img, px, py, tile_weight)
-        else:
-            _paste_tile_simple(canvas, img, px, py)
-
-        tiles_placed += 1
-        step_i += 1
-
-        if progress_callback:
-            progress_callback(
-                step_i,
-                total_steps,
-                f"Tile {tiles_placed}/{len(tiles)} → ({px},{py}) px "
-                f"[err {tile.error_x_um:+.1f},{tile.error_y_um:+.1f} µm]",
-            )
-
-    if opts.overlap_blend:
-        if progress_callback:
-            progress_callback(total_steps - 1, total_steps, "Fusionando solapamientos...")
-        composed = _finalize_weighted_canvas(acc, weight, background_bgr)
-        canvas[:] = composed
-
-    canvas.flush()
-
-    if progress_callback:
-        progress_callback(total_steps - 1, total_steps, "Generando preview...")
-    preview = _make_preview(canvas, opts.preview_max_side)
-    cv2.imwrite(preview_path, preview, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-
-    png_path = canvas_path.replace(".dat", ".png")
-    exported_full = _export_memmap_png_banded(canvas, png_path, preview_path)
-
-    build_time = time.perf_counter() - t0
+def _build_metadata_dict(
+    inventory: CanvasInventory,
+    opts: MosaicBuildOptions,
+    prepared: PreparedMosaic,
+    tiles_placed: int,
+    build_time: float,
+    stamp: str,
+    output_files: Dict[str, Optional[str]],
+) -> dict:
+    grid = inventory.grid
+    tw, th = inventory.tile_width, inventory.tile_height
+    tiles = inventory.tiles
     pos_metrics = inventory.position_metrics.to_dict() if inventory.position_metrics else {}
-
-    meta = {
+    return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "class_name": inventory.class_name,
         "folder": inventory.folder,
@@ -351,6 +384,9 @@ def build_mosaic_to_memmap(
             "apply_backlash": opts.apply_backlash,
             "visual_registration": opts.visual_registration,
             "overlap_blend": opts.overlap_blend,
+            "overlap_blend_mode": "local_feather",
+            "output_mode": opts.output_mode,
+            "swap_stage_axes": opts.swap_stage_axes,
             "canvas_padding_px": opts.canvas_padding_px,
         },
         "grid": {
@@ -363,22 +399,18 @@ def build_mosaic_to_memmap(
             "n_cols": grid.n_cols,
             "n_rows": grid.n_rows,
         },
-        "canvas_offset_px": [offset_x, offset_y],
+        "canvas_offset_px": [prepared.offset_x, prepared.offset_y],
         "tile_size_px": [tw, th],
-        "canvas_size_px": [canvas_w, canvas_h],
-        "background_bgr": list(background_bgr),
+        "canvas_size_px": [prepared.canvas_w, prepared.canvas_h],
+        "background_bgr": list(prepared.background_bgr),
         "tiles_placed": tiles_placed,
         "captured_cells": inventory.captured_cells,
         "total_cells": inventory.total_cells,
         "coverage_percent": round(inventory.coverage_percent, 2),
         "build_time_s": round(build_time, 2),
         "position_metrics": pos_metrics,
-        "registration_metrics": registration_metrics,
-        "files": {
-            "memmap": canvas_path,
-            "preview_png": preview_path,
-            "full_png": png_path if exported_full else None,
-        },
+        "registration_metrics": prepared.registration_metrics,
+        "files": output_files,
         "tiles": [
             {
                 "seq": t.seq,
@@ -401,10 +433,161 @@ def build_mosaic_to_memmap(
             for t in tiles
         ],
     }
+
+
+def build_mosaic(
+    inventory: CanvasInventory,
+    output_dir: str,
+    background_bgr: Optional[Tuple[int, int, int]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    options: Optional[MosaicBuildOptions] = None,
+) -> MosaicBuildResult:
+    """Punto de entrada: HDF5 (por defecto) o memmap según ``output_mode``."""
+    opts = options or MosaicBuildOptions()
+    if opts.output_mode == "memmap":
+        return build_mosaic_to_memmap(
+            inventory, output_dir, background_bgr, progress_callback, opts
+        )
+    from core.canvas.hdf5_mosaic_store import build_mosaic_to_hdf5
+
+    return build_mosaic_to_hdf5(
+        inventory, output_dir, background_bgr, progress_callback, opts
+    )
+
+
+def build_mosaic_to_memmap(
+    inventory: CanvasInventory,
+    output_dir: str,
+    background_bgr: Optional[Tuple[int, int, int]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    options: Optional[MosaicBuildOptions] = None,
+) -> MosaicBuildResult:
+    """
+    Construye canvas denso en memmap (modo legacy — usa mucho disco).
+
+    Preferir ``build_mosaic`` con ``output_mode='hdf5'`` para evitar canvas denso.
+    """
+    opts = options or MosaicBuildOptions()
+    if inventory.tile_width <= 0 or inventory.tile_height <= 0:
+        raise ValueError("Inventario sin dimensiones de tile — escanee una carpeta con PNG válidos")
+
+    os.makedirs(output_dir, exist_ok=True)
+    removed = cleanup_orphan_canvas_temp_files(output_dir)
+    if removed and progress_callback:
+        progress_callback(0, len(inventory.tiles) + 2, f"Temporales eliminados: {', '.join(removed)}")
+
+    prepared = prepare_mosaic_build(inventory, opts, background_bgr, progress_callback)
+    background_bgr = prepared.background_bgr
+    placements = prepared.placements
+    offset_x, offset_y = prepared.offset_x, prepared.offset_y
+    canvas_w, canvas_h = prepared.canvas_w, prepared.canvas_h
+    grid = inventory.grid
+    tw, th = inventory.tile_width, inventory.tile_height
+    tiles = inventory.tiles
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    class_part = inventory.class_name or "canvas"
+    canvas_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}.dat")
+    preview_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}_preview.png")
+    metadata_path = os.path.join(output_dir, f"{class_part}_mosaic_{stamp}_meta.json")
+
+    t0 = time.perf_counter()
+    canvas = np.memmap(
+        canvas_path,
+        dtype=np.uint8,
+        mode="w+",
+        shape=(canvas_h, canvas_w, 3),
+    )
+
+    total_steps = len(tiles) + 2
+    step_i = 0
+
+    if progress_callback:
+        progress_callback(
+            step_i,
+            total_steps,
+            f"Rellenando fondo ({canvas_w}×{canvas_h} px, por bandas)...",
+        )
+    _fill_memmap_background(canvas, background_bgr)
+    step_i += 1
+
+    tiles_placed = 0
+    for idx, tile in enumerate(tiles):
+        img = _load_tile_image(tile, tw, th, background_bgr)
+
+        if placements:
+            px = int(round(placements[idx].final_px))
+            py = int(round(placements[idx].final_py))
+        else:
+            px, py = _physical_pixel_origin(tile, grid, tw, th, swap_axes=opts.swap_stage_axes)
+            px, py = int(round(px)), int(round(py))
+
+        if opts.overlap_blend:
+            _paste_tile_feather_blend(
+                canvas, img, px, py, background_bgr, feather_px=opts.feather_px
+            )
+        else:
+            _paste_tile_simple(canvas, img, px, py)
+
+        tiles_placed += 1
+        step_i += 1
+        del img
+
+        if progress_callback:
+            progress_callback(
+                step_i,
+                total_steps,
+                f"Tile {tiles_placed}/{len(tiles)} → ({px},{py}) px "
+                f"[err {tile.error_x_um:+.1f},{tile.error_y_um:+.1f} µm]",
+            )
+
+    canvas.flush()
+
+    if progress_callback:
+        progress_callback(total_steps - 1, total_steps, "Generando preview...")
+    if canvas_w * canvas_h > opts.preview_from_tiles_threshold_px:
+        preview = _make_preview_from_tiles(
+            tiles,
+            placements,
+            tw,
+            th,
+            canvas_w,
+            canvas_h,
+            background_bgr,
+            opts.preview_max_side,
+            opts.overlap_blend,
+            opts.feather_px,
+        )
+    else:
+        preview = _make_preview_from_memmap(canvas, opts.preview_max_side)
+    cv2.imwrite(preview_path, preview, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    del preview
+
+    png_path = canvas_path.replace(".dat", ".png")
+    exported_full = _export_memmap_png_banded(canvas, png_path, preview_path)
+    build_time = time.perf_counter() - t0
+
+    meta = _build_metadata_dict(
+        inventory,
+        opts,
+        prepared,
+        tiles_placed,
+        build_time,
+        stamp,
+        {
+            "memmap": canvas_path,
+            "preview_png": preview_path,
+            "full_png": png_path if exported_full else None,
+            "hdf5": None,
+        },
+    )
     with open(metadata_path, "w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2, ensure_ascii=False)
 
-    del canvas
+    _close_memmap(canvas)
+
+    if progress_callback:
+        progress_callback(total_steps, total_steps, "✅ Completado — canvas memmap")
 
     return MosaicBuildResult(
         canvas_path=png_path if exported_full else preview_path,
@@ -416,7 +599,7 @@ def build_mosaic_to_memmap(
         build_time_s=build_time,
         tiles_placed=tiles_placed,
         coverage_percent=inventory.coverage_percent,
-        registration_metrics=registration_metrics,
+        registration_metrics=prepared.registration_metrics,
         canvas_offset_px=(offset_x, offset_y),
     )
 
@@ -426,13 +609,19 @@ def _export_memmap_png_banded(
     png_path: str,
     preview_path: str,
     max_pixels: int = 120_000_000,
+    band_rows: int = 512,
 ) -> bool:
-    """Exporta PNG completo solo si cabe en RAM; si no, deja memmap + preview."""
+    """Exporta PNG por bandas si cabe en disco; evita cargar canvas completo en RAM."""
     h, w = canvas.shape[:2]
     if h * w > max_pixels:
         return False
     try:
-        cv2.imwrite(png_path, np.asarray(canvas), [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        out = np.empty((h, w, 3), dtype=np.uint8)
+        for y in range(0, h, band_rows):
+            y_end = min(y + band_rows, h)
+            out[y:y_end] = canvas[y:y_end]
+        cv2.imwrite(png_path, out, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        del out
         return os.path.isfile(png_path)
     except (MemoryError, cv2.error):
         return False

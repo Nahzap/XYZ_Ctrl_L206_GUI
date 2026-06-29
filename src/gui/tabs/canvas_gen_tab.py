@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
 
 from config.constants import DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
 from core.canvas.grid_config import GridConfig
-from core.canvas.mosaic_builder import MosaicBuildOptions
+from core.canvas.mosaic_builder import MosaicBuildOptions, estimate_canvas_size_px
 from core.services.canvas_build_worker import CanvasBuildWorker
 from gui.tabs.base_tab import BaseTab
 from gui.tabs.img_analysis_tab import ZoomableImageView
@@ -47,7 +47,7 @@ class CanvasGenTab(BaseTab):
     def setup_ui(self):
         self.layout.setContentsMargins(8, 8, 8, 8)
 
-        title = QLabel("CanvasGen — Mosaico por tiles (memoria optimizada)")
+        title = QLabel("CanvasGen — Mosaico HDF5 (sin canvas denso en RAM)")
         title.setStyleSheet("font-size: 14px; font-weight: bold; color: #5DADE2;")
         self.layout.addWidget(title)
 
@@ -144,6 +144,14 @@ class CanvasGenTab(BaseTab):
         self.cb_overlap_blend = QCheckBox("Blend solapamiento")
         self.cb_overlap_blend.setChecked(True)
         row.addWidget(self.cb_overlap_blend)
+
+        self.cb_swap_axes = QCheckBox("Intercambiar ejes X/Y canvas")
+        self.cb_swap_axes.setChecked(False)
+        self.cb_swap_axes.setToolTip(
+            "Actívelo si la cámara está rotada 90° respecto al stage "
+            "(filas zig-zag aparecen como columnas verticales)."
+        )
+        row.addWidget(self.cb_swap_axes)
 
         return group
 
@@ -265,7 +273,7 @@ class CanvasGenTab(BaseTab):
         folder = self.folder_input.text().strip()
         output_dir = os.path.join(folder, "_canvas_output")
         self._set_busy(True)
-        self._log("Montando canvas por tiles (memmap)…")
+        self._log("Empaquetando tiles en HDF5 (sin canvas denso)…")
         self._worker = CanvasBuildWorker(self)
         self._worker.progress_changed.connect(self._on_progress)
         self._worker.build_finished.connect(self._on_build_finished)
@@ -289,6 +297,7 @@ class CanvasGenTab(BaseTab):
             apply_backlash=self.cb_backlash.isChecked(),
             visual_registration=self.cb_visual_reg.isChecked(),
             overlap_blend=self.cb_overlap_blend.isChecked(),
+            swap_stage_axes=self.cb_swap_axes.isChecked(),
         )
 
     def _on_inventory_ready(self, inventory):
@@ -312,10 +321,24 @@ class CanvasGenTab(BaseTab):
             f"{metrics_text}"
         )
         self.coverage_label.setText(f"Cobertura: {inventory.coverage_percent:.1f} %")
+        est_w, est_h = estimate_canvas_size_px(inventory)
         self._log(
             f"Inventario listo — {inventory.captured_cells} celdas con datos "
             f"({inventory.coverage_percent:.1f} %)"
         )
+        self._log(f"Canvas estimado: {est_w}×{est_h} px (virtual, solo metadatos)")
+        est_tiles_mb = len(inventory.tiles) * inventory.tile_width * inventory.tile_height * 3 / (1024 * 1024)
+        self._log(f"HDF5 estimado: ~{est_tiles_mb:.0f} MiB ({len(inventory.tiles)} tiles) — sin canvas denso")
+        if est_w * est_h > 25_000_000:
+            self._log(
+                "Canvas virtual grande — se guarda HDF5 tile-first; "
+                "preview compuesto sin cargar canvas completo en RAM"
+            )
+        if inventory.coverage_percent < 15 and est_w * est_h > 10_000_000:
+            self._log(
+                "⚠ Cobertura baja con canvas extenso: los tiles están muy dispersos en la rejilla. "
+                "Reduzca X/Y min-max al área realmente capturada para un canvas más compacto."
+            )
         if inventory.position_metrics is not None:
             pm = inventory.position_metrics.to_dict()
             self._log(
@@ -327,6 +350,7 @@ class CanvasGenTab(BaseTab):
     def _on_build_finished(self, result, preview: np.ndarray):
         self._last_result = result
         self.export_btn.setEnabled(True)
+        self.progress_bar.setValue(100)
         self.image_view.set_image(preview)
         self.image_view.reset_view()
         self.metrics_label.setText(
@@ -342,10 +366,14 @@ class CanvasGenTab(BaseTab):
                 f"{rm.get('neighbor_pairs', 0)} pares, "
                 f"resp media={rm.get('mean_response', 0):.3f}"
             )
-        self._log(f"Canvas generado: {result.preview_path}")
+        self._log(f"Preview: {result.preview_path}")
         self._log(f"Metadatos: {result.metadata_path}")
-        if result.canvas_path != result.preview_path:
+        if result.hdf5_path:
+            h5_mb = os.path.getsize(result.hdf5_path) / (1024 * 1024)
+            self._log(f"HDF5: {result.hdf5_path} ({h5_mb:.1f} MiB)")
+        elif result.canvas_path != result.preview_path:
             self._log(f"PNG completo: {result.canvas_path}")
+        self._log(f"✅ Montaje completado en {result.build_time_s:.1f}s")
 
     def _on_failed(self, message: str):
         self._set_busy(False)

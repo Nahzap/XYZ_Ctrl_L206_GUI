@@ -7,7 +7,14 @@ from .capture_position import CapturePositionMetadata, save_position_sidecar, lo
 from .backlash_model import BacklashCorrection, BacklashEstimator
 from .position_metrics import PositionQualityMetrics, compute_position_metrics
 from .tile_registration import RegistrationOffset, refine_placements, phase_correlate_pair
-from .mosaic_builder import MosaicBuildOptions, MosaicBuildResult, build_mosaic_to_memmap
+from .mosaic_builder import (
+    MosaicBuildOptions,
+    MosaicBuildResult,
+    build_mosaic,
+    build_mosaic_to_memmap,
+    estimate_canvas_size_px,
+)
+from .hdf5_mosaic_store import build_mosaic_to_hdf5, read_preview_from_hdf5
 
 __all__ = [
     "GridConfig",
@@ -27,5 +34,9 @@ __all__ = [
     "phase_correlate_pair",
     "MosaicBuildOptions",
     "MosaicBuildResult",
+    "build_mosaic",
     "build_mosaic_to_memmap",
+    "build_mosaic_to_hdf5",
+    "read_preview_from_hdf5",
+    "estimate_canvas_size_px",
 ]

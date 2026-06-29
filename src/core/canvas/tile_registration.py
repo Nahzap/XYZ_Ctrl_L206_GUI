@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -157,7 +157,7 @@ def find_spatial_neighbors(
 
 
 def refine_placements(
-    images: Sequence[np.ndarray],
+    images: Union[Sequence[np.ndarray], Callable[[int], np.ndarray]],
     placements: List[TilePlacement],
     tile_w: int,
     tile_h: int,
@@ -169,16 +169,24 @@ def refine_placements(
     Refina offsets de colocación usando pares de tiles vecinos.
 
     Aplica correcciones acumuladas sobre el tile "b" de cada par con buena correlación.
+    ``images`` puede ser una secuencia en RAM o un loader ``(idx) -> ndarray`` bajo demanda.
     """
     if max_gap_px is None:
         max_gap_px = max(tile_w, tile_h) * 0.45
+
+    def _load(idx: int) -> np.ndarray:
+        if callable(images):
+            return images(idx)
+        return images[idx]
 
     neighbors = find_spatial_neighbors(placements, tile_w, tile_h, max_gap_px)
     responses: List[float] = []
     applied = 0
 
     for idx_a, idx_b, direction in neighbors:
-        reg = phase_correlate_pair(images[idx_a], images[idx_b], direction, max_shift_px=max_shift_px)
+        reg = phase_correlate_pair(
+            _load(idx_a), _load(idx_b), direction, max_shift_px=max_shift_px
+        )
         if reg.response < min_response:
             continue
         responses.append(reg.response)

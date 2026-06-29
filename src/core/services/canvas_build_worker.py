@@ -10,7 +10,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.canvas.canvas_inventory import CanvasInventory, scan_capture_folder
 from core.canvas.grid_config import GridConfig
-from core.canvas.mosaic_builder import MosaicBuildOptions, MosaicBuildResult, build_mosaic_to_memmap
+from core.canvas.mosaic_builder import MosaicBuildOptions, MosaicBuildResult, build_mosaic
 
 logger = logging.getLogger("MotorControl_L206")
 
@@ -89,7 +89,7 @@ class CanvasBuildWorker(QThread):
         def on_progress(current: int, total: int, msg: str):
             self.progress_changed.emit(current, total, msg)
 
-        result = build_mosaic_to_memmap(
+        result = build_mosaic(
             inv,
             self._output_dir,
             progress_callback=on_progress,

@@ -625,7 +625,14 @@ def start_hinf_control(tab):
     tab.control_timer.start(10)
 
     tab.results_text.append(f"\n🎮 Control H∞ ACTIVO")
-    tab.results_text.append(f"   Motor: {tab.control_motor}, Kp={tab.Kp_control:.4f}, Ki={tab.Ki_control:.4f}")
+    tab.results_text.append(
+        f"   Motor: {tab.control_motor}, Kp={tab.Kp_control:.4f}, Ki={tab.Ki_control:.4f} "
+        f"(escala={scale_factor:.2f}, U_max={int(tab.Umax_designed)})"
+    )
+    if scale_factor >= 0.99 and Ki > 500:
+        tab.results_text.append(
+            "⚠️ Escala=1 con Ki alto → PWM saturará. Use escala 0.1 o re-sintetice con ωb menor."
+        )
 
 
 def execute_hinf_control(tab):
@@ -651,31 +658,30 @@ def execute_hinf_control(tab):
         from config.constants import adc_to_um
         position_um = adc_to_um(sensor_adc, axis=axis)
         
-        # Error en µm (espacio homogéneo)
+        # Error en µm — entrada directa al PI (Ki = ωb/K_planta usa error posicional)
         error_um = tab.reference_um - position_um
-        
-        # Escalar error a "unidades de control" para mantener ganancias diseñadas
-        # Las ganancias Kp, Ki fueron diseñadas para ADC, así que escalamos
-        error = error_um / abs(tab.K_value) if hasattr(tab, 'K_value') and tab.K_value != 0 else error_um
+        error = error_um
 
         # Inicializar contador de log si no existe
         if not hasattr(tab, '_log_counter'):
             tab._log_counter = 0
 
-        # Zona muerta en µm (no en ADC) para homogeneidad
-        DEADZONE_UM = 0.5  # 0.5 µm de zona muerta
+        # Zona muerta en µm
+        DEADZONE_UM = 0.5
         if abs(error_um) <= DEADZONE_UM:
             tab.send_command_callback('A,0,0')
             tab.control_integral = 0
             tab._log_counter += 1
             if tab._log_counter % 50 == 0:
-                tab.results_text.append(f"⚪ ZONA MUERTA | Ref={tab.reference_um:.1f}µm | Pos={position_um:.1f}µm | Err={error_um:.2f}µm")
+                tab.results_text.append(
+                    f"⚪ ZONA MUERTA | Ref={tab.reference_um:.1f}µm | Pos={position_um:.1f}µm | Err={error_um:.2f}µm"
+                )
             return
 
-        # Actualizar integral
+        # Actualizar integral (error en µm)
         tab.control_integral += error * Ts
 
-        # Calcular PWM (PI controller)
+        # PI: u = Kp·e + Ki·∫e  — única saturación en Umax_designed (W2)
         pwm_base = tab.Kp_control * error + tab.Ki_control * tab.control_integral
 
         # Invertir si necesario
@@ -703,7 +709,9 @@ def execute_hinf_control(tab):
         if tab._log_counter % 10 == 0:
             icon = "🔴" if saturated else "🟢"
             tab.results_text.append(
-                f"{icon} Ref={tab.reference_um:.1f}µm | Pos={position_um:.1f}µm | Err={error_um:.2f}µm | Int={tab.control_integral:.1f} | PWM={pwm} {saturated}"
+                f"{icon} Ref={tab.reference_um:.1f}µm | Pos={position_um:.1f}µm | "
+                f"Err={error_um:.2f}µm | Int={tab.control_integral:.1f} | "
+                f"u_raw={pwm_base:.0f} | PWM={pwm} {saturated}"
             )
 
         # Enviar comando

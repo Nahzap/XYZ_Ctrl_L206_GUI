@@ -28,7 +28,9 @@ from config.constants import (
     POSITION_TOLERANCE_UM, SETTLING_CYCLES,
     DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
 )
-from core.services.test_service import TestService, ControllerConfig
+from core.control.step_config import load_step_control_config
+from core.control.controller_config import ControllerConfig
+from core.services.test_service import TestService
 from gui.utils.trajectory_preview import show_trajectory_preview
 from gui.utils.csv_utils import export_trajectory_csv, import_trajectory_csv
 from gui.utils.test_tab_ui_builder import (
@@ -269,6 +271,7 @@ class TestTab(QWidget):
         self.trajectory_status = self._widgets.get('trajectory_status')
         self.tolerance_input = self._widgets.get('tolerance_input')
         self.pause_input = self._widgets.get('pause_input')
+        self.homogeneous_steps_cb = self._widgets.get('homogeneous_steps_cb')
         self.trajectory_progress_label = self._widgets.get('trajectory_progress_label')
         self.current_point_label = self._widgets.get('current_point_label')
         self.error_x_label = self._widgets.get('error_x_label')
@@ -303,6 +306,9 @@ class TestTab(QWidget):
                 self.y_end_input.setText(str(defaults.get('y_range', {}).get('max', 19500.0)))
             if self.delay_input:
                 self.delay_input.setText(str(defaults.get('delay_between_points', 0.5)))
+            if self.homogeneous_steps_cb:
+                step_cfg = load_step_control_config()
+                self.homogeneous_steps_cb.setChecked(step_cfg.enabled)
             
             logger.info("✅ Parámetros de trayectoria cargados desde configuración")
         except Exception as e:
@@ -552,7 +558,8 @@ class TestTab(QWidget):
                 Ki=controller_data['Ki'],
                 U_max=controller_data.get('U_max', 150),
                 invert=self.motor_a_invert.isChecked(),
-                sensor_key=sensor_key
+                sensor_key=sensor_key,
+                K_plant=float(controller_data.get('K', 1.0)),
             )
             self.test_service.set_controller_a(config)
             logger.info(f"Controlador A guardado en TestTab y TestService")
@@ -569,7 +576,8 @@ class TestTab(QWidget):
                 Ki=controller_data['Ki'],
                 U_max=controller_data.get('U_max', 150),
                 invert=self.motor_b_invert.isChecked(),
-                sensor_key=sensor_key
+                sensor_key=sensor_key,
+                K_plant=float(controller_data.get('K', 1.0)),
             )
             self.test_service.set_controller_b(config)
             logger.info(f"Controlador B guardado en TestTab y TestService")
@@ -757,6 +765,8 @@ class TestTab(QWidget):
         trajectory_list = [(p[0], p[1]) for p in self.current_trajectory]
         
         # Delegar al servicio con auto_advance=True para TestTab standalone
+        if self.homogeneous_steps_cb is not None:
+            self.test_service.set_step_control_enabled(self.homogeneous_steps_cb.isChecked())
         self.test_service.start_trajectory(trajectory_list, tolerance, pause, auto_advance=True)
     
     def _update_trajectory_feedback(self, target_x: float, target_y: float, error_x: float, error_y: float, 

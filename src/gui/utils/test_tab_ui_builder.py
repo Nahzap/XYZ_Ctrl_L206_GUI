@@ -415,6 +415,13 @@ def create_zigzag_section(widgets: dict, start_callback, stop_callback) -> QGrou
     widgets['pause_input'] = QLineEdit("2.0")
     widgets['pause_input'].setStyleSheet("background: white; color: black;")
     exec_layout.addWidget(widgets['pause_input'], 0, 3)
+
+    widgets['homogeneous_steps_cb'] = QCheckBox("Pasos homogéneos (step control)")
+    widgets['homogeneous_steps_cb'].setChecked(True)
+    widgets['homogeneous_steps_cb'].setToolTip(
+        "Descompone cada transición FOV en micro-pasos mono-eje Y→X con verify + dwell"
+    )
+    exec_layout.addWidget(widgets['homogeneous_steps_cb'], 1, 0, 1, 4)
     
     layout.addLayout(exec_layout)
     

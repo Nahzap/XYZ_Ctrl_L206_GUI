@@ -66,6 +66,7 @@ from gui.styles.dark_theme import DARK_STYLESHEET
 # Fase 3: Comunicación Serial
 from core.communication.serial_handler import SerialHandler
 from core.communication.protocol import MotorProtocol
+from core.control import SensorBuffer
 
 # Fase 4: Ventanas Auxiliares
 from gui.windows import MatplotlibWindow, SignalWindow, CameraViewWindow
@@ -180,6 +181,7 @@ class ArduinoGUI(QMainWindow):
         # Detectar puerto automáticamente o usar el configurado
         initial_port = self._detect_arduino_port() or SERIAL_PORT
         self.serial_thread = SerialHandler(initial_port, BAUD_RATE)
+        self.sensor_buffer = SensorBuffer()
         
         # Widget central con pestañas
         central_widget = QWidget()
@@ -246,9 +248,10 @@ class ArduinoGUI(QMainWindow):
         # Configurar callbacks de hardware para control en tiempo real
         self.test_tab.set_hardware_callbacks(
             send_command=self.send_command,
-            get_sensor_value=lambda key: int(self.control_tab.value_labels[key].text()) if key in self.control_tab.value_labels else None,
+            get_sensor_value=self._get_sensor_adc,
             get_mode_label=lambda: self.control_tab.value_labels.get('mode', None)
         )
+        self.test_tab.test_service.set_sensor_buffer(self.sensor_buffer)
         # TestTab maneja sus operaciones internamente
         self.test_tab.controller_clear_requested.connect(lambda motor: self.test_tab.clear_controller(motor))
         
@@ -258,7 +261,7 @@ class ArduinoGUI(QMainWindow):
         # Configurar callbacks de hardware para control en tiempo real
         self.hinf_tab.set_hardware_callbacks(
             send_command=self.send_command,
-            get_sensor_value=lambda key: int(self.control_tab.value_labels[key].text()) if key in self.control_tab.value_labels else None,
+            get_sensor_value=self._get_sensor_adc,
             get_mode_label=lambda: self.control_tab.value_labels.get('mode', None)
         )
         # Configurar referencia a TestTab para transferencias
@@ -515,6 +518,19 @@ class ArduinoGUI(QMainWindow):
             self.control_tab.set_connection_status(False)
             logger.info("Estado conexión actualizado: Desconectado")
     
+    def _get_sensor_adc(self, key: str):
+        """Lee ADC de sensor desde labels UI con parseo seguro."""
+        labels = getattr(self.control_tab, 'value_labels', {})
+        if key not in labels:
+            return None
+        text = str(labels[key].text()).strip()
+        if not text or text == '---':
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
     def update_data(self, line):
         """
         PROCESAMIENTO de datos del Arduino con VALIDACIÓN.
@@ -546,6 +562,15 @@ class ArduinoGUI(QMainWindow):
                     
                     # Actualizar estado del Arduino en ControlTab
                     self.control_tab.update_arduino_status(parsed_data['state'], parsed_data['settled'])
+
+                    self.sensor_buffer.update(
+                        sens_1,
+                        sens_2,
+                        pot_a=pot_a,
+                        pot_b=pot_b,
+                        settled=bool(parsed_data.get('settled', False)),
+                        state=str(parsed_data.get('state', '')),
+                    )
                     
                     # Actualizar SignalWindow (si está visible)
                     if self.signal_window and self.signal_window.isVisible():
@@ -571,6 +596,15 @@ class ArduinoGUI(QMainWindow):
                 
                 # Mostrar estado LEGACY para indicar firmware viejo
                 self.control_tab.update_arduino_status("LEGACY", False)
+
+                self.sensor_buffer.update(
+                    sens_1,
+                    sens_2,
+                    pot_a=pot_a,
+                    pot_b=pot_b,
+                    settled=False,
+                    state="LEGACY",
+                )
                 
                 # Actualizar SignalWindow (si está visible)
                 if self.signal_window and self.signal_window.isVisible():

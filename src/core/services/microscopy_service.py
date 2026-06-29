@@ -36,6 +36,7 @@ from core.canvas.capture_position import (
     merge_position_into_focus_dict,
     save_position_sidecar,
 )
+from core.control.step_config import load_step_control_config
 from utils.microscopy_filename import (
     build_multifocal_filename,
     build_point_basename,
@@ -207,6 +208,9 @@ class MicroscopyService(QObject):
         # Delays
         self._delay_before_ms = int(config.get('delay_before', 2.0) * 1000)
         self._delay_after_ms = int(config.get('delay_after', 0.2) * 1000)
+        step_cfg = load_step_control_config()
+        if step_cfg.enabled:
+            self._delay_before_ms = max(self._delay_before_ms, int(step_cfg.t_capture_settle_ms))
 
         # Modo de aprendizaje
         learning_mode = bool(config.get('learning_mode', True))
@@ -938,6 +942,23 @@ class MicroscopyService(QObject):
             return 0.0, 0.0
         return pt
 
+    def _apply_step_metadata(
+        self,
+        position: CapturePositionMetadata,
+        snapshot,
+    ) -> CapturePositionMetadata:
+        if snapshot is None:
+            return position
+        if snapshot.n_steps or snapshot.point_steps:
+            position.n_steps = snapshot.n_steps
+            position.t_move_ms = snapshot.t_move_ms
+            position.point_steps = list(snapshot.point_steps)
+            position.step_metrics = snapshot.step_metrics
+        position.fov_verify_passed = bool(getattr(snapshot, "fov_verify_passed", False))
+        position.t_fov_verify_ms = float(getattr(snapshot, "t_fov_verify_ms", 0.0))
+        position.fov_verify_ticks = int(getattr(snapshot, "fov_verify_ticks", 0))
+        return position
+
     def _build_capture_position(self, image_index: int) -> CapturePositionMetadata:
         """Construye metadatos de posición real en el instante de captura."""
         x_nom, y_nom = self._get_point_xy_um(image_index)
@@ -950,7 +971,7 @@ class MicroscopyService(QObject):
         if self._test_service is not None:
             x_act, y_act, err_x, err_y = self._test_service.read_current_position_um(x_nom, y_nom)
             if x_act is not None and y_act is not None:
-                return CapturePositionMetadata.from_acceptance(
+                pos = CapturePositionMetadata.from_acceptance(
                     x_nom,
                     y_nom,
                     float(x_act),
@@ -960,9 +981,10 @@ class MicroscopyService(QObject):
                     status=snapshot.status if snapshot else "",
                     source="sensor_capture",
                 )
+                return self._apply_step_metadata(pos, snapshot)
 
         if snapshot is not None:
-            return CapturePositionMetadata.from_acceptance(
+            pos = CapturePositionMetadata.from_acceptance(
                 snapshot.x_nominal_um,
                 snapshot.y_nominal_um,
                 snapshot.x_actual_um,
@@ -972,6 +994,7 @@ class MicroscopyService(QObject):
                 status=snapshot.status,
                 source="sensor_accept",
             )
+            return self._apply_step_metadata(pos, snapshot)
 
         return CapturePositionMetadata.from_nominal_only(x_nom, y_nom)
 

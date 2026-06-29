@@ -22,8 +22,8 @@ Señales emitidas:
 
 import logging
 import time
-from typing import Callable, Optional, Dict, List, Tuple
-from dataclasses import dataclass
+from typing import Callable, Optional, Dict, List, Tuple, Any
+from dataclasses import dataclass, field
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
@@ -33,21 +33,16 @@ from config.constants import (
     MAX_ATTEMPTS_PER_POINT, FALLBACK_TOLERANCE_MULTIPLIER,
     um_to_adc, adc_to_um
 )
+from core.control.sensor_buffer import SensorBuffer
+from core.control.step_config import StepControlConfig, load_step_control_config
+from core.control.step_controller import StepController
+from core.control.step_metrics import aggregate_point_metrics
+from core.control.step_types import PointTransitionResult, StepControllerPhase
 
 logger = logging.getLogger('MotorControl_L206')
 
 
-@dataclass
-class ControllerConfig:
-    """Configuración de un controlador PI."""
-    Kp: float
-    Ki: float
-    U_max: float = 150.0
-    invert: bool = False
-    sensor_key: str = 'sensor_1'
-
-
-@dataclass
+from core.control.controller_config import ControllerConfig
 class TrajectoryConfig:
     """Configuración para ejecución de trayectoria."""
     tolerance_um: float = 25.0
@@ -68,6 +63,13 @@ class AcceptedPointSnapshot:
     move_dir_x: int = 0
     move_dir_y: int = 0
     status: str = ""
+    n_steps: int = 0
+    t_move_ms: float = 0.0
+    point_steps: List[Dict[str, Any]] = field(default_factory=list)
+    step_metrics: Optional[Dict[str, float]] = None
+    fov_verify_passed: bool = False
+    t_fov_verify_ms: float = 0.0
+    fov_verify_ticks: int = 0
 
 class TestService(QObject):
     """
@@ -130,6 +132,12 @@ class TestService(QObject):
         self._traj_settling_counter = 0
         self._traj_near_attempts = 0
         self._last_accepted_snapshot: Optional[AcceptedPointSnapshot] = None
+
+        # Control de pasos homogéneos
+        self._sensor_buffer: Optional[SensorBuffer] = None
+        self._step_config: StepControlConfig = load_step_control_config()
+        self._step_controller: Optional[StepController] = None
+        self._step_long_approach_active = False
         
         logger.info("TestService inicializado")
     
@@ -147,7 +155,58 @@ class TestService(QObject):
         """
         self._send_command = send_command
         self._get_sensor_value = get_sensor_value
+        self._ensure_step_controller()
         logger.debug("TestService: Callbacks de hardware configurados")
+
+    def set_sensor_buffer(self, sensor_buffer: SensorBuffer) -> None:
+        """Inyecta buffer de sensores con timestamp (alimentado desde main.update_data)."""
+        self._sensor_buffer = sensor_buffer
+        self._ensure_step_controller()
+
+    def set_step_control_enabled(self, enabled: bool) -> None:
+        """Activa/desactiva modo pasos homogéneos en runtime."""
+        self._step_config.enabled = bool(enabled)
+
+    def reload_step_control_config(self) -> None:
+        """Recarga parámetros step_control desde calibration.json."""
+        self._step_config = load_step_control_config()
+        if self._step_controller is not None:
+            self._step_controller.config = self._step_config
+
+    @property
+    def step_control_enabled(self) -> bool:
+        return bool(
+            self._step_config.enabled
+            and self._step_controller is not None
+            and self._sensor_buffer is not None
+        )
+
+    def get_last_point_transition(self) -> Optional[PointTransitionResult]:
+        if self._step_controller is None:
+            return None
+        return self._step_controller.last_point_result
+
+    def _ensure_step_controller(self) -> None:
+        if self._step_controller is not None:
+            return
+        if self._sensor_buffer is None or self._send_command is None:
+            return
+        self._step_controller = StepController(
+            self._step_config,
+            self._sensor_buffer,
+            lambda: self._controller_a,
+            lambda: self._controller_b,
+            self._send_command,
+        )
+
+    def _read_sensor_adc(self, sensor_key: str) -> Optional[int]:
+        if self._sensor_buffer is not None:
+            adc = self._sensor_buffer.get_adc(sensor_key)
+            if adc is not None:
+                return adc
+        if self._get_sensor_value is None:
+            return None
+        return self._get_sensor_value(sensor_key)
     
     def set_controller_a(self, config: Optional[ControllerConfig]):
         """Configura controlador para Motor A (eje X)."""
@@ -183,16 +242,16 @@ class TestService(QObject):
         x_actual = y_actual = None
         error_x = error_y = 0.0
 
-        if self._controller_a and self._get_sensor_value:
-            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
+        if self._controller_a:
+            sensor_adc = self._read_sensor_adc(self._controller_a.sensor_key)
             if sensor_adc is not None:
                 x_actual = adc_to_um(sensor_adc, axis='x')
                 if target_x is not None:
                     ref_adc = um_to_adc(target_x, axis='x')
                     error_x = (ref_adc - sensor_adc) * CALIBRATION_X['slope']
 
-        if self._controller_b and self._get_sensor_value:
-            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
+        if self._controller_b:
+            sensor_adc = self._read_sensor_adc(self._controller_b.sensor_key)
             if sensor_adc is not None:
                 y_actual = adc_to_um(sensor_adc, axis='y')
                 if target_y is not None:
@@ -202,11 +261,18 @@ class TestService(QObject):
         return x_actual, y_actual, error_x, error_y
 
     def _movement_direction(self, index: int) -> Tuple[int, int]:
-        """Dirección de movimiento respecto al punto anterior (-1, 0, +1)."""
-        if not self._trajectory or index <= 0 or index >= len(self._trajectory):
+        """Dirección de avance nominal (-1, 0, +1) hacia el punto FOV index."""
+        if not self._trajectory or index >= len(self._trajectory):
             return 0, 0
-        prev = self._trajectory[index - 1]
         curr = self._trajectory[index]
+        if index > 0:
+            prev = self._trajectory[index - 1]
+        elif self._step_controller is not None:
+            prev = self._step_controller.read_current_xy_um(
+                self._controller_a, self._controller_b
+            )
+        else:
+            prev = curr
         dir_x = 0 if abs(curr[0] - prev[0]) < 1.0 else (1 if curr[0] > prev[0] else -1)
         dir_y = 0 if abs(curr[1] - prev[1]) < 1.0 else (1 if curr[1] > prev[1] else -1)
         return dir_x, dir_y
@@ -243,6 +309,98 @@ class TestService(QObject):
             move_dir_y=move_dir_y,
             status=status,
         )
+
+    @staticmethod
+    def _serialize_point_steps(result: Optional[PointTransitionResult]) -> List[Dict[str, Any]]:
+        if result is None:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for sr in result.steps:
+            rows.append(
+                {
+                    "axis": sr.step.axis,
+                    "delta_um": round(sr.step.delta_um, 3),
+                    "target_x_um": round(sr.step.target_x_um, 3),
+                    "target_y_um": round(sr.step.target_y_um, 3),
+                    "duration_ms": round(sr.duration_ms, 1),
+                    "error_um": round(sr.error_um, 3),
+                    "status": sr.status,
+                    "retries": sr.retries,
+                    "pwm_max": sr.pwm_max,
+                }
+            )
+        return rows
+
+    def _prepare_step_transition(self) -> None:
+        """Descompone transición al punto FOV actual en cola de micro-pasos."""
+        if not self.step_control_enabled or not self._trajectory or self._step_controller is None:
+            return
+        idx = self._trajectory_index
+        if idx >= len(self._trajectory):
+            return
+        target = self._trajectory[idx]
+        prev_actual = self._step_controller.read_current_xy_um(
+            self._controller_a, self._controller_b
+        )
+        nominal_prev = (
+            self._trajectory[idx - 1] if idx > 0 else prev_actual
+        )
+        dx_actual = target[0] - prev_actual[0]
+        dy_actual = target[1] - prev_actual[1]
+        dx_nominal = target[0] - nominal_prev[0]
+        dy_nominal = target[1] - nominal_prev[1]
+
+        if idx == 0 and max(abs(dx_actual), abs(dy_actual)) > self._step_config.long_approach_threshold_um:
+            self._step_long_approach_active = True
+            logger.info(
+                "[TestService] Aproximación legacy al punto 1 (ΔX=%.0fµm ΔY=%.0fµm > %.0fµm)",
+                abs(dx_actual),
+                abs(dy_actual),
+                self._step_config.long_approach_threshold_um,
+            )
+            self.log_message.emit(
+                f"   Aproximación legacy al punto 1 (Δ={max(abs(dx_actual), abs(dy_actual)):.0f}µm)…"
+            )
+            return
+
+        self._step_long_approach_active = False
+        move_dir_x, move_dir_y = self._movement_direction(idx)
+        backlash_dx, backlash_dy = 0.0, 0.0
+        backlash = getattr(self, "_backlash_correction", None)
+        if backlash is not None:
+            backlash_dx, backlash_dy = backlash.delta_for_direction(move_dir_x, move_dir_y)
+        self._step_controller.prepare_transition(
+            prev_actual,
+            target,
+            idx,
+            nominal_prev_xy=nominal_prev,
+            backlash_dx_um=backlash_dx,
+            backlash_dy_um=backlash_dy,
+            move_dir_x=move_dir_x,
+            move_dir_y=move_dir_y,
+        )
+        logger.info(
+            "[TestService] Transición (%d) actual (%.1f,%.1f)→(%.1f,%.1f) "
+            "Δactual=(%.1f,%.1f)µm Δnominal FOV=(%.1f,%.1f)µm",
+            idx + 1,
+            prev_actual[0],
+            prev_actual[1],
+            target[0],
+            target[1],
+            dx_actual,
+            dy_actual,
+            dx_nominal,
+            dy_nominal,
+        )
+        if idx > 0 and (
+            abs(abs(dx_actual) - abs(dx_nominal)) > 20.0
+            or abs(abs(dy_actual) - abs(dy_nominal)) > 20.0
+        ):
+            logger.warning(
+                "[TestService] Desfase posición real vs FOV nominal en punto %d — "
+                "usando Δactual para micro-pasos",
+                idx + 1,
+            )
     
     def update_controller_a_sensor(self, sensor_key: str, invert: bool):
         """Actualiza configuración de sensor e inversión para controlador A."""
@@ -492,7 +650,7 @@ class TestService(QObject):
             self.error_occurred.emit("Trayectoria vacía")
             return False
         
-        if not self._send_command or not self._get_sensor_value:
+        if not self._send_command:
             self.error_occurred.emit("Callbacks de hardware no configurados")
             return False
         
@@ -550,6 +708,15 @@ class TestService(QObject):
         self._trajectory_timer.timeout.connect(self._execute_trajectory_step)
         self._trajectory_timer.start(10)  # 100Hz
         
+        if self.step_control_enabled:
+            self._step_controller.reset_session()
+            self._step_long_approach_active = False
+            self._prepare_step_transition()
+            self.log_message.emit(
+                f"   Modo pasos homogéneos: step={self._step_config.step_um}µm, "
+                f"tol={self._step_config.tol_step_um}µm"
+            )
+        
         self.trajectory_started.emit(len(trajectory))
         self.log_message.emit(f"🚀 Ejecutando trayectoria: {len(trajectory)} puntos")
         self.log_message.emit(f"   Tolerancia: {tolerance_um}µm, Pausa: {pause_s}s")
@@ -561,6 +728,10 @@ class TestService(QObject):
         logger.info("=== TestService: DETENIENDO TRAYECTORIA ===")
         
         self._trajectory_active = False
+        
+        if self._step_controller is not None:
+            self._step_controller.reset_session()
+        self._step_long_approach_active = False
         
         # Detener timer
         if self._trajectory_timer:
@@ -669,6 +840,8 @@ class TestService(QObject):
                 # Resetear integrales al reanudar para evitar wind-up
                 self._dual_integral_a = 0.0
                 self._dual_integral_b = 0.0
+                if self.step_control_enabled:
+                    self._prepare_step_transition()
             else:
                 # Pausa manual: NO avanzar, solo reanudar en punto actual
                 # NO resetear _point_accepted porque el punto ya fue alcanzado
@@ -709,6 +882,124 @@ class TestService(QObject):
         # Resetear integrales
         self._dual_integral_a = 0.0
         self._dual_integral_b = 0.0
+        if self.step_control_enabled:
+            self._prepare_step_transition()
+    
+    def _tick_step_long_approach(self) -> bool:
+        """PI legacy hacia punto 1 hasta distancia manejable por micro-pasos."""
+        if not self._trajectory:
+            return False
+
+        target_x, target_y = self._trajectory[self._trajectory_index]
+        Ts = max(1e-4, time.time() - self._dual_last_time)
+        self._dual_last_time = time.time()
+
+        ref_adc_x = um_to_adc(target_x, axis="x")
+        ref_adc_y = um_to_adc(target_y, axis="y")
+        pwm_a = pwm_b = 0
+        error_x_um = error_y_um = 0.0
+
+        if self._controller_a:
+            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
+            if sensor_adc is not None:
+                error_adc = ref_adc_x - sensor_adc
+                error_x_um = error_adc * CALIBRATION_X["slope"]
+                if abs(error_adc) > DEADZONE_ADC:
+                    self._dual_integral_a += error_adc * Ts
+                    pwm_base = (
+                        self._controller_a.Kp * error_adc
+                        + self._controller_a.Ki * self._dual_integral_a
+                    )
+                    pwm_a = -int(pwm_base) if self._controller_a.invert else int(pwm_base)
+                    umax = int(self._get_adaptive_pwm_limit("x", error_x_um))
+                    if abs(pwm_a) > umax:
+                        self._dual_integral_a -= error_adc * Ts
+                        pwm_a = max(-umax, min(umax, pwm_a))
+
+        if self._controller_b:
+            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
+            if sensor_adc is not None:
+                error_adc = ref_adc_y - sensor_adc
+                error_y_um = error_adc * CALIBRATION_Y["slope"]
+                if abs(error_adc) > DEADZONE_ADC:
+                    self._dual_integral_b += error_adc * Ts
+                    pwm_base = (
+                        self._controller_b.Kp * error_adc
+                        + self._controller_b.Ki * self._dual_integral_b
+                    )
+                    pwm_b = -int(pwm_base) if self._controller_b.invert else int(pwm_base)
+                    umax = int(self._get_adaptive_pwm_limit("y", error_y_um))
+                    if abs(pwm_b) > umax:
+                        self._dual_integral_b -= error_adc * Ts
+                        pwm_b = max(-umax, min(umax, pwm_b))
+
+        self._send_command(f"A,{pwm_a},{pwm_b}")
+        self.trajectory_feedback.emit(
+            target_x, target_y, error_x_um, error_y_um, False, False, 0
+        )
+
+        done = self._step_config.long_approach_done_um
+        if abs(error_x_um) < done and abs(error_y_um) < done:
+            self._step_long_approach_active = False
+            self._dual_integral_a = 0.0
+            self._dual_integral_b = 0.0
+            self._send_command("B")
+            self._send_command("A,0,0")
+            time.sleep(0.15)
+            logger.info(
+                "[TestService] Aproximación legacy completa (err X=%.1f Y=%.1f µm)",
+                error_x_um,
+                error_y_um,
+            )
+            self.log_message.emit("   ✓ Aproximación legacy OK — pasos homogéneos")
+            return True
+        return False
+
+    def _execute_trajectory_step_step_mode(self) -> None:
+        """Un tick del controlador de pasos homogéneos."""
+        if self._step_controller is None or not self._trajectory:
+            return
+
+        if self._step_long_approach_active:
+            if self._tick_step_long_approach():
+                self._prepare_step_transition()
+            return
+
+        out = self._step_controller.tick()
+        self.trajectory_feedback.emit(
+            out.feedback_target_x,
+            out.feedback_target_y,
+            out.error_x_um,
+            out.error_y_um,
+            out.lock_x,
+            out.lock_y,
+            out.settling,
+        )
+
+        if out.point_failed:
+            idx = self._trajectory_index + 1
+            self.error_occurred.emit(f"Punto {idx}: fallo en paso homogéneo")
+            self.log_message.emit(f"❌ Punto {idx}: fallo en control de pasos homogéneos")
+            self.stop_trajectory()
+            return
+
+        if out.point_complete:
+            if self._point_accepted:
+                return
+            target = self._trajectory[self._trajectory_index]
+            result = self._step_controller.last_point_result
+            n_steps = result.n_steps if result else 0
+            t_move = result.t_move_ms if result else 0.0
+            status = f"✅ Homogéneo ({n_steps} pasos, {t_move:.0f}ms)"
+            _, _, err_x, err_y = self.read_current_position_um(target[0], target[1])
+            self._accept_trajectory_point(
+                target[0],
+                target[1],
+                err_x,
+                err_y,
+                status,
+                point_result=result,
+            )
     
     def _get_adaptive_pwm_limit(self, axis: str, error_um: float) -> float:
         """Calcula PWM adaptativo según error, manteniendo mínimo de 80.
@@ -769,6 +1060,10 @@ class TestService(QObject):
             #   - send_command('A,0,0')  ← PWM a 0
             # NO se envían comandos de corrección durante pausa
             if self._trajectory_paused:
+                return
+
+            if self.step_control_enabled:
+                self._execute_trajectory_step_step_mode()
                 return
             
             # Calcular Ts
@@ -926,7 +1221,8 @@ class TestService(QObject):
             logger.error(f"TestService: Error en trayectoria: {e}")
     
     def _accept_trajectory_point(self, target_x: float, target_y: float, 
-                                  error_x: float, error_y: float, status: str):
+                                  error_x: float, error_y: float, status: str,
+                                  point_result: Optional[PointTransitionResult] = None):
         """Acepta el punto actual y PAUSA o AVANZA según modo.
         
         Si auto_advance=True (TestTab): Pausa temporal y avanza automáticamente.
@@ -961,6 +1257,19 @@ class TestService(QObject):
             error_y,
             status,
         )
+        if point_result is not None:
+            self._last_accepted_snapshot.n_steps = point_result.n_steps
+            self._last_accepted_snapshot.t_move_ms = point_result.t_move_ms
+            self._last_accepted_snapshot.point_steps = self._serialize_point_steps(point_result)
+            self._last_accepted_snapshot.step_metrics = aggregate_point_metrics(point_result.steps)
+            self._last_accepted_snapshot.fov_verify_passed = point_result.fov_verify_passed
+            self._last_accepted_snapshot.t_fov_verify_ms = point_result.t_fov_verify_ms
+            self._last_accepted_snapshot.fov_verify_ticks = point_result.fov_verify_ticks
+            if point_result.fov_verify_passed:
+                self._last_accepted_snapshot.x_actual_um = point_result.x_actual_um
+                self._last_accepted_snapshot.y_actual_um = point_result.y_actual_um
+                self._last_accepted_snapshot.error_x_um = point_result.residual_x_um
+                self._last_accepted_snapshot.error_y_um = point_result.residual_y_um
         
         # Emitir señales
         total = len(self._trajectory) if self._trajectory else 0

@@ -377,8 +377,22 @@ class HInfController:
         elif config.Ms < 1.1:
             warnings.append(f"Ms={config.Ms:.2f} muy restrictivo, puede causar problemas")
         
-        # Validar ωb
-        if config.wb > 100:
+        # Validar ωb respecto al polo de la planta G(s)=K/(τs+1)
+        if config.tau > 0:
+            pole_rad = 1.0 / config.tau
+            wb_max_rec = pole_rad / 5.0
+            if config.wb > pole_rad:
+                errors.append(
+                    f"ωb={config.wb:.1f} rad/s supera el polo de la planta "
+                    f"({pole_rad:.1f} rad/s = 1/τ). "
+                    f"Con τ={config.tau:.4f}s use ωb ≈ {wb_max_rec:.1f}–{pole_rad/2:.1f} rad/s."
+                )
+            elif config.wb > pole_rad / 2.0:
+                warnings.append(
+                    f"ωb={config.wb:.1f} rad/s cerca del polo ({pole_rad:.1f} rad/s); "
+                    f"Ki=ωb/K será muy alto → saturación PWM."
+                )
+        elif config.wb > 100:
             warnings.append(f"ωb={config.wb:.1f} rad/s muy alto, puede requerir control excesivo")
         elif config.wb < 0.1:
             warnings.append(f"ωb={config.wb:.1f} rad/s muy bajo, respuesta lenta")

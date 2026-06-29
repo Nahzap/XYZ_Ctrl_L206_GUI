@@ -39,14 +39,26 @@ class GridConfig:
     def xy_at_cell(self, col: int, row: int) -> tuple[float, float]:
         return self.x_min + col * self.fov_x, self.y_min + row * self.fov_y
 
-    def um_to_pixel(self, x_um: float, y_um: float, tile_w: int, tile_h: int) -> tuple[float, float]:
+    def um_to_pixel(
+        self,
+        x_um: float,
+        y_um: float,
+        tile_w: int,
+        tile_h: int,
+        swap_axes: bool = False,
+    ) -> tuple[float, float]:
         """
         Convierte coordenadas físicas (µm) a posición en canvas (px).
 
-        Convención: y_min queda abajo (fila 0 del grid = parte inferior del canvas).
+        Convención normal: X stage → px (horizontal), Y stage → py (vertical, y_min abajo).
+        Con ``swap_axes=True``: Y stage → px, X stage → py (cámara rotada 90°).
         """
-        px = (x_um - self.x_min) / self.fov_x * tile_w
-        py = (self.y_max - y_um) / self.fov_y * tile_h
+        if swap_axes:
+            px = (y_um - self.y_min) / self.fov_y * tile_w
+            py = (self.x_max - x_um) / self.fov_x * tile_h
+        else:
+            px = (x_um - self.x_min) / self.fov_x * tile_w
+            py = (self.y_max - y_um) / self.fov_y * tile_h
         return px, py
 
     def pixel_offset_from_nominal(
