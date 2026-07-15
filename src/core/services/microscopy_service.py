@@ -52,7 +52,7 @@ class MicroscopyService(QObject):
     Coordina trayectoria, control de posición (vía TestTab o callbacks),
     captura de imágenes (vía CameraTab/CameraService) y autofoco (vía AutofocusService).
 
-    Este servicio reemplaza la lógica de microscopia que antes vivía en ArduinoGUI.
+    Este servicio reemplaza la lógica de microscopía que antes vivía en CTRL_GUI.
     """
 
     status_changed = pyqtSignal(str)              # Mensajes de log para la UI

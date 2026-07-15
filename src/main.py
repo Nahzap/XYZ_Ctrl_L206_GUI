@@ -130,10 +130,12 @@ from config.hardware_availability import THORLABS_AVAILABLE
 # =========================================================================
 # --- Interfaz Principal con Pestañas ---
 # =========================================================================
-class ArduinoGUI(QMainWindow):
+class CTRL_GUI(QMainWindow):
+    """Ventana principal del sistema de control (STM32F767ZI + host Python)."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Sistema de Control y Análisis - Motores L206')
+        self.setWindowTitle('CTRL_GUI — MycoViT XY / STM32F767ZI')
         self.setGeometry(100, 100, 800, 700)
         self.setStyleSheet(DARK_STYLESHEET)
 
@@ -182,6 +184,11 @@ class ArduinoGUI(QMainWindow):
         initial_port = self._detect_arduino_port() or SERIAL_PORT
         self.serial_thread = SerialHandler(initial_port, BAUD_RATE)
         self.sensor_buffer = SensorBuffer()
+        # Plano MÁQUINA: el hilo RX llena el buffer a tasa completa (Fase 1),
+        # así el control lee medida fresca sin depender del repintado de la UI.
+        self.serial_thread.set_sensor_buffer(self.sensor_buffer)
+        # Compuerta de refresco de UI (~30 Hz) — no afecta medida ni control.
+        self._last_ui_update_mono = 0.0
         
         # Widget central con pestañas
         central_widget = QWidget()
@@ -446,10 +453,10 @@ class ArduinoGUI(QMainWindow):
     
     def _detect_arduino_port(self):
         """
-        Detecta automáticamente el puerto del Arduino.
+        Detecta automáticamente el puerto del controlador XY (STM32 ST-Link VCP u otros).
         
         Returns:
-            str: Puerto detectado (ej: 'COM3') o None si no se encuentra
+            str: Puerto detectado (ej: 'COM5') o None si no se encuentra
         """
         import serial.tools.list_ports
         
@@ -458,16 +465,20 @@ class ArduinoGUI(QMainWindow):
             logger.warning("No se encontraron puertos seriales disponibles")
             return None
         
-        # Buscar Arduino por descripción
+        keywords = (
+            'stlink', 'st-link', 'stm', 'stmicroelectronics', 'virtual com',
+            'arduino', 'ch340', 'ch341', 'ftdi', 'usb serial',
+        )
         for port in ports:
             desc_lower = port.description.lower()
-            if any(x in desc_lower for x in ['arduino', 'ch340', 'ch341', 'ftdi', 'usb serial']):
-                logger.info(f"Arduino detectado automáticamente en: {port.device} ({port.description})")
+            mfg = (port.manufacturer or '').lower()
+            haystack = f"{desc_lower} {mfg}"
+            if any(x in haystack for x in keywords):
+                logger.info(f"Controlador XY detectado en: {port.device} ({port.description})")
                 return port.device
         
-        # Si no se encuentra Arduino, usar el primer puerto disponible
         first_port = ports[0].device
-        logger.warning(f"Arduino no detectado. Usando primer puerto disponible: {first_port}")
+        logger.warning(f"Controlador XY no detectado por descripción. Usando: {first_port}")
         return first_port
 
     # NOTA: create_control_group(), create_motors_group(), create_sensors_group() 
@@ -519,7 +530,17 @@ class ArduinoGUI(QMainWindow):
             logger.info("Estado conexión actualizado: Desconectado")
     
     def _get_sensor_adc(self, key: str):
-        """Lee ADC de sensor desde labels UI con parseo seguro."""
+        """ADC de sensor para el CONTROL (plano máquina).
+
+        Fuente primaria: SensorBuffer (llenado en el hilo RX a tasa completa,
+        independiente del refresco de UI). Fallback: label (compatibilidad).
+        """
+        buf = getattr(self, 'sensor_buffer', None)
+        if buf is not None:
+            adc = buf.get_adc(key)
+            if adc is not None:
+                return int(adc)
+        # Fallback legacy: texto del label (solo si el buffer aún no tiene dato)
         labels = getattr(self.control_tab, 'value_labels', {})
         if key not in labels:
             return None
@@ -531,95 +552,94 @@ class ArduinoGUI(QMainWindow):
         except ValueError:
             return None
 
+    def _ui_refresh_due(self) -> bool:
+        """True si toca refrescar la UI (~UI_REFRESH_HZ).
+
+        Desacopla el repintado de la tasa de telemetría: la medida (SensorBuffer)
+        y la grabación van a tasa completa; los widgets/plots a ~30 Hz.
+        """
+        from config.constants import UI_REFRESH_HZ
+        now = time.perf_counter()
+        if (now - self._last_ui_update_mono) >= (1.0 / float(UI_REFRESH_HZ)):
+            self._last_ui_update_mono = now
+            return True
+        return False
+
     def update_data(self, line):
         """
-        PROCESAMIENTO de datos del Arduino con VALIDACIÓN.
-        Formato viejo: pot_a,pot_b,sens_1,sens_2 (4 enteros CSV)
-        Formato nuevo: pot_a,pot_b,sens_1,sens_2,estado,settled (6 campos)
-        Filtra datos inválidos y actualiza estado de ControlTab.
+        PROCESAMIENTO de telemetría STM32/Arduino con VALIDACIÓN.
+        Formato LEGACY: pot_a,pot_b,sens_1,sens_2 (4 enteros CSV)
+        Formato STM32: pot_a,pot_b,sens_1,sens_2,estado,settled (6 campos)
+        Descarta líneas corruptas; sensores 12-bit en ruta de 6 campos.
+
+        Nota (Fase 1): el SensorBuffer ya se llena en el hilo RX
+        (SerialHandler) a tasa completa. Aquí solo se hace grabación
+        (tasa completa) y refresco de UI (~30 Hz vía _ui_refresh_due()).
         """
-        # Mensajes de sistema o cabecera
+        from config.constants import ADC_MAX
+
         if line.startswith(("ERROR:", "INFO:", "Potencia")):
             logger.info(line)
             return
 
         try:
-            # Parseo con validación - manejar ambos formatos
             parts = line.split(',')
-            
-            if len(parts) == 6:
-                # Formato nuevo con estado y settled
+            adc_hi = int(ADC_MAX)
+
+            if len(parts) >= 6:
                 parsed_data = MotorProtocol.parse_sensor_data_with_status(line)
-                if parsed_data:
-                    pot_a = parsed_data['pot_a']
-                    pot_b = parsed_data['pot_b']
-                    sens_1 = parsed_data['sens_1']
-                    sens_2 = parsed_data['sens_2']
-                    
-                    # Actualizar valores en ControlTab
-                    self.control_tab.update_motor_values(pot_a, pot_b)
-                    self.control_tab.update_sensor_values(sens_1, sens_2)
-                    
-                    # Actualizar estado del Arduino en ControlTab
-                    self.control_tab.update_arduino_status(parsed_data['state'], parsed_data['settled'])
-
-                    self.sensor_buffer.update(
-                        sens_1,
-                        sens_2,
-                        pot_a=pot_a,
-                        pot_b=pot_b,
-                        settled=bool(parsed_data.get('settled', False)),
-                        state=str(parsed_data.get('state', '')),
-                    )
-                    
-                    # Actualizar SignalWindow (si está visible)
-                    if self.signal_window and self.signal_window.isVisible():
-                        self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
-                    
-                    # Grabar datos (si está grabando)
-                    if self.data_recorder.is_recording:
-                        self.data_recorder.write_data_point(pot_a, pot_b, sens_1, sens_2)
-                    
-            elif len(parts) == 4:
-                # Formato viejo - firmware sin Position Hold
-                pot_a, pot_b, sens_1, sens_2 = map(int, parts)
-                
-                # Validar rangos
-                if not (-255 <= pot_a <= 255 and -255 <= pot_b <= 255 and 
-                       0 <= sens_1 <= 1023 and 0 <= sens_2 <= 1023):
-                    logger.warning(f"Datos fuera de rango: {line}")
+                if not parsed_data:
+                    logger.debug(f"Línea telemetría no parseable: {line}")
                     return
-                
-                # Actualizar valores en ControlTab
-                self.control_tab.update_motor_values(pot_a, pot_b)
-                self.control_tab.update_sensor_values(sens_1, sens_2)
-                
-                # Mostrar estado LEGACY para indicar firmware viejo
-                self.control_tab.update_arduino_status("LEGACY", False)
 
-                self.sensor_buffer.update(
-                    sens_1,
-                    sens_2,
-                    pot_a=pot_a,
-                    pot_b=pot_b,
-                    settled=False,
-                    state="LEGACY",
-                )
-                
-                # Actualizar SignalWindow (si está visible)
-                if self.signal_window and self.signal_window.isVisible():
-                    self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
-                
-                # Grabar datos (si está grabando)
+                pot_a = parsed_data['pot_a']
+                pot_b = parsed_data['pot_b']
+                sens_1 = parsed_data['sens_1']
+                sens_2 = parsed_data['sens_2']
+
+                if not (-255 <= pot_a <= 255 and -255 <= pot_b <= 255 and
+                        0 <= sens_1 <= adc_hi and 0 <= sens_2 <= adc_hi):
+                    logger.debug(f"Datos fuera de rango (descartados): {line}")
+                    return
+
+                # Grabación: tasa COMPLETA (dato crudo, no UI)
                 if self.data_recorder.is_recording:
                     self.data_recorder.write_data_point(pot_a, pot_b, sens_1, sens_2)
-                    
+
+                # UI ~30 Hz: labels + plots (no interfiere en medida/control)
+                if self._ui_refresh_due():
+                    self.control_tab.update_motor_values(pot_a, pot_b)
+                    self.control_tab.update_sensor_values(sens_1, sens_2)
+                    self.control_tab.update_arduino_status(parsed_data['state'], parsed_data['settled'])
+                    if self.signal_window and self.signal_window.isVisible():
+                        self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
+
+            elif len(parts) == 4:
+                pot_a, pot_b, sens_1, sens_2 = map(int, parts)
+
+                if not (-255 <= pot_a <= 255 and -255 <= pot_b <= 255 and
+                       0 <= sens_1 <= adc_hi and 0 <= sens_2 <= adc_hi):
+                    logger.debug(f"Datos LEGACY fuera de rango: {line}")
+                    return
+
+                # Grabación: tasa COMPLETA (dato crudo, no UI)
+                if self.data_recorder.is_recording:
+                    self.data_recorder.write_data_point(pot_a, pot_b, sens_1, sens_2)
+
+                # UI ~30 Hz: labels + plots (no interfiere en medida/control)
+                if self._ui_refresh_due():
+                    self.control_tab.update_motor_values(pot_a, pot_b)
+                    self.control_tab.update_sensor_values(sens_1, sens_2)
+                    self.control_tab.update_arduino_status("LEGACY", False)
+                    if self.signal_window and self.signal_window.isVisible():
+                        self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
+
             else:
-                logger.warning(f"Formato de datos inválido ({len(parts)} campos): {line}")
+                logger.debug(f"Formato inválido ({len(parts)} campos), descartado: {line}")
                 return
-                
+
         except (ValueError, IndexError) as e:
-            logger.warning(f"Error parseando datos: '{line}' - {e}")
+            logger.debug(f"Error parseando datos (descartado): '{line}' - {e}")
             return
     
     # --- Lógica de Control y Comandos ---
@@ -745,6 +765,35 @@ class ArduinoGUI(QMainWindow):
             test_data.get("invert_map", {}),
         )
         controllers = test_data.get("controllers", {})
+        hinf_slots = hinf_data.get("slots", {}) if isinstance(hinf_data, dict) else {}
+
+        # Si A y B quedaron idénticos por el bug de transferencia "ambos"/default-B,
+        # recuperar desde slots H∞ distintos (A_* / B_*).
+        ctrl_a = controllers.get("A") if isinstance(controllers.get("A"), dict) else None
+        ctrl_b = controllers.get("B") if isinstance(controllers.get("B"), dict) else None
+        same_ab = (
+            isinstance(ctrl_a, dict)
+            and isinstance(ctrl_b, dict)
+            and abs(float(ctrl_a.get("Kp", 0)) - float(ctrl_b.get("Kp", 0))) < 1e-9
+            and abs(float(ctrl_a.get("Ki", 0)) - float(ctrl_b.get("Ki", 0))) < 1e-9
+        )
+        if same_ab and isinstance(hinf_slots, dict) and hinf_slots:
+            slot_a = next((k for k in sorted(hinf_slots) if str(k).upper().startswith("A")), None)
+            slot_b = next((k for k in sorted(hinf_slots) if str(k).upper().startswith("B")), None)
+            if slot_a and slot_b:
+                data_a = self.hinf_tab._controller_data_from_hinf_snapshot(hinf_slots[slot_a])
+                data_b = self.hinf_tab._controller_data_from_hinf_snapshot(hinf_slots[slot_b])
+                if abs(data_a["Kp"] - data_b["Kp"]) > 1e-9 or abs(data_a["Ki"] - data_b["Ki"]) > 1e-9:
+                    logger.warning(
+                        "Test controllers A/B idénticos en sesión; "
+                        f"restaurando desde slots {slot_a} / {slot_b}"
+                    )
+                    self.hinf_tab._push_controller_to_test("A", data_a)
+                    self.hinf_tab._push_controller_to_test("B", data_b)
+                    self._persist_test_state()
+                    self.session_store.save()
+                    controllers = {}  # ya aplicados
+
         if isinstance(controllers.get("A"), dict):
             self.test_tab.set_controller("A", controllers["A"])
         if isinstance(controllers.get("B"), dict):
@@ -770,24 +819,24 @@ class ArduinoGUI(QMainWindow):
     
     # HInfTab ahora llama directamente a su método synthesize_hinf_controller()
     def send_command(self, command):
-        """Envía comando al Arduino vía serial."""
+        """Envía comando al Arduino vía serial (TX con lock, thread-safe)."""
         logger.debug(f"Enviando comando: '{command}'")
-        
-        if self.serial_thread.ser and self.serial_thread.ser.is_open:
-            full_command = command + '\n' 
-            self.serial_thread.ser.write(full_command.encode('utf-8'))
+
+        # Ruta única de TX protegida por lock en SerialHandler: permite que el
+        # lazo de control y la GUI escriban sin corromper el flujo (Fase 1).
+        if self.serial_thread.send_command(command):
             logger.info(f"Comando enviado exitosamente: {command}")
         else:
             logger.error("Error: Puerto serial no está abierto. Comando no enviado.")
-            print("Error: El puerto serie no está abierto.")
 
     # --- NUEVOS HANDLERS PARA POSITION HOLD ---
     
     def _on_position_hold(self, sensor1_target: int, sensor2_target: int):
-        """Maneja solicitud de position hold desde ControlTab."""
-        logger.info(f"=== POSITION HOLD SOLICITADO: S1={sensor1_target}, S2={sensor2_target} ===")
-        command = MotorProtocol.format_position_hold(sensor1_target, sensor2_target)
-        self.send_command(command)
+        """Position Hold no está implementado en firmware STM32 (H,s1,s2)."""
+        logger.warning(
+            "Position Hold ignorado: firmware STM32 no soporta H,<s1>,<s2> "
+            f"(pedido S1={sensor1_target}, S2={sensor2_target}). Usar control PC vía A,<pwm>."
+        )
     
     def _on_brake(self):
         """Maneja solicitud de freno activo desde ControlTab."""
@@ -796,10 +845,11 @@ class ArduinoGUI(QMainWindow):
         self.send_command(command)
     
     def _on_settling_config(self, threshold: int):
-        """Maneja configuración de umbral de asentamiento desde ControlTab."""
-        logger.info(f"=== CONFIGURANDO UMBRAL DE ASENTAMIENTO: {threshold} ===")
-        command = MotorProtocol.format_settling_config(threshold)
-        self.send_command(command)
+        """Settling config no está implementado en firmware STM32 (S,threshold)."""
+        logger.warning(
+            f"Configuración S,{threshold} ignorada: firmware STM32 no soporta comando S. "
+            "Settling se gestiona en PC (use_arduino_settled=false)."
+        )
 
     # NOTA: set_manual_mode(), set_auto_mode(), send_power_command() 
     # ELIMINADOS - Ahora están en ControlTab
@@ -1076,16 +1126,16 @@ class ArduinoGUI(QMainWindow):
 def main():
     """Función principal de la aplicación."""
     logger.info("="*70)
-    logger.info("INICIANDO SISTEMA DE CONTROL Y ANÁLISIS - MOTORES L206")
-    logger.info(f"Versión: 2.5 | Puerto: {SERIAL_PORT} | Baudrate: {BAUD_RATE}")
+    logger.info("INICIANDO CTRL_GUI — MycoViT XY (STM32F767ZI)")
+    logger.info(f"Versión: 2.3 | Puerto: {SERIAL_PORT} | Baudrate: {BAUD_RATE}")
     logger.info("="*70)
     
     try:
         app = QApplication(sys.argv)
         logger.info("QApplication creada exitosamente")
         
-        window = ArduinoGUI()
-        logger.info("Ventana principal creada")
+        window = CTRL_GUI()
+        logger.info("Ventana principal CTRL_GUI creada")
         
         window.show()
         logger.info("Interfaz gráfica mostrada - Sistema listo")

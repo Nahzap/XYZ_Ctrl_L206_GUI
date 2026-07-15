@@ -1,36 +1,68 @@
-# Dependencias principales del proyecto XYZ_Ctrl_L206_GUI
+# =============================================================================
+# XYZ_Ctrl_L206_GUI — dependencias (CTRL_ENV, Python 3.11)
+# Actualizado: 2026-07-14
+#
+# Entorno de referencia: ./CTRL_ENV (prefijo conda-style; python.exe en la raíz).
+# Aislamiento: CTRL_ENV/Lib/site-packages/sitecustomize.py desactiva el user-site
+# (AppData\Roaming\Python\...) para que TODO se resuelva dentro de CTRL_ENV.
+#
+# Instalación típica (Windows, PowerShell):
+#   $env:PYTHONNOUSERSITE=1
+#   .\CTRL_ENV\python.exe -m pip install -r requirements.txt
+#   # PyTorch CUDA (índice aparte; ver abajo):
+#   .\CTRL_ENV\python.exe -m pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+#
+# Arranque:
+#   .\CTRL_ENV\python.exe src\main.py
+# =============================================================================
 
-# Interface gráfica
+# --- GUI ---
 PyQt5==5.15.11
 pyqtgraph>=0.13.7
 
-# Visualización y análisis
-matplotlib>=3.10.0
-numpy>=2.2.0
+# --- Análisis / control ---
+numpy>=2.2.0,<2.3
 pandas>=2.3.0
 scipy>=1.16.0
-
-# Control de sistemas
+matplotlib>=3.10.0
 control>=0.10.0
 slycot>=0.6.0
+scikit-learn>=1.4.0
 
-# Comunicación serial
+# --- Serial / instrumentación ---
 pyserial>=3.5
-
-# Procesamiento de imágenes
-opencv-python>=4.12.0
-
-# Cámaras científicas e industriales
-pylablib>=1.4.4  # Thorlabs camera SDK
-pypylon>=3.0.1   # Basler camera SDK (opcional)
 pyusb>=1.3.0
 PyVISA>=1.15.0
+pywin32>=306
 
-# Computación numérica
+# --- Imagen / mosaico ---
+opencv-python>=4.12.0
+Pillow>=10.0.0
+scikit-image>=0.26.0
+h5py>=3.10.0
+imageio>=2.34.0
+tifffile>=2024.0.0
+
+# --- Cámaras ---
+# Thorlabs (requiere ThorCam / SDK instalado en el SO)
+pylablib>=1.4.4
+# Basler (requiere Pylon Runtime instalado en el SO)
+pypylon>=26.6
+
+# --- Deep learning (U2-Net) — instalar torch/vision DESDE el índice PyTorch ---
+# No van en este archivo: el wheel +cu121 no está en PyPI.
+#   pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+# Versión verificada en CTRL_ENV: torch 2.5.1+cu121, torchvision 0.20.1+cu121 (CUDA 12.1)
+gdown>=5.2.0
+
+# --- Computación numérica ---
 numba>=0.62.0
 llvmlite>=0.45.0
 
-# Utilidades
+# --- Utilidades ---
 toml>=0.10.0
 python-dateutil>=2.9.0
 pytz>=2025.0
+tqdm>=4.66.0
+requests[socks]>=2.32.0
+typing_extensions>=4.12.0

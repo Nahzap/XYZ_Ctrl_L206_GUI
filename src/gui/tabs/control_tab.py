@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox)
 from PyQt5.QtCore import pyqtSignal
 
-from config.constants import BAUD_RATE
+from config.constants import BAUD_RATE, FACTORY_UI
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -41,7 +41,7 @@ class ControlTab(QWidget):
         
         Args:
             serial_handler: Instancia de SerialHandler para comunicación
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
         self.parent_gui = parent
@@ -84,7 +84,7 @@ class ControlTab(QWidget):
         # Puerto COM con detección automática
         layout.addWidget(QLabel("Puerto:"), 0, 0)
         self.port_combo = QComboBox()
-        self.port_combo.setToolTip("Selecciona el puerto serial del Arduino")
+        self.port_combo.setToolTip("Selecciona el puerto serial del controlador XY (STM32 ST-Link VCP)")
         layout.addWidget(self.port_combo, 0, 1)
         
         # Botón escanear puertos
@@ -97,14 +97,21 @@ class ControlTab(QWidget):
         # Escanear puertos al inicializar
         self._scan_ports()
         
-        # Baudrate (sincronizado con constants.py)
-        layout.addWidget(QLabel("Baudrate:"), 1, 0)
+        # Baudrate: fábrica fija 1 Mbps (Fase 5.3); lab puede cambiar.
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '1000000'])
-        self.baudrate_combo.setCurrentText(str(BAUD_RATE))  # Sincronizado con constants.py
+        self.baudrate_combo.setCurrentText(str(BAUD_RATE))
         self.baudrate_combo.setToolTip("Velocidad de comunicación serial")
-        layout.addWidget(self.baudrate_combo, 1, 1, 1, 2)
-        
+        if FACTORY_UI:
+            self.baudrate_combo.setVisible(False)
+            self.baudrate_combo.setCurrentText(str(BAUD_RATE))
+            baud_lbl = QLabel(f"Enlace: {BAUD_RATE // 1000} kbps (fijo)")
+            baud_lbl.setStyleSheet("color: #7F8C8D;")
+            layout.addWidget(baud_lbl, 1, 0, 1, 3)
+        else:
+            layout.addWidget(QLabel("Baudrate:"), 1, 0)
+            layout.addWidget(self.baudrate_combo, 1, 1, 1, 2)
+
         # Estado de conexión
         layout.addWidget(QLabel("Estado:"), 2, 0)
         self.connection_status = QLabel("❌ Desconectado")
@@ -196,12 +203,12 @@ class ControlTab(QWidget):
         layout = QGridLayout()
         value_style = "font-size: 18px; color: #58D68D;"
         
-        layout.addWidget(QLabel("Valor Sensor 1 (A2):"), 0, 0)
+        layout.addWidget(QLabel("Valor Sensor 1 (Y / PC3):"), 0, 0)
         self.value_labels['sensor_1'] = QLabel("---")
         self.value_labels['sensor_1'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_1'], 0, 1)
         
-        layout.addWidget(QLabel("Valor Sensor 2 (A3):"), 1, 0)
+        layout.addWidget(QLabel("Valor Sensor 2 (X / PA3):"), 1, 0)
         self.value_labels['sensor_2'] = QLabel("---")
         self.value_labels['sensor_2'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_2'], 1, 1)
@@ -219,21 +226,25 @@ class ControlTab(QWidget):
             logger.warning("No se encontraron puertos seriales disponibles")
             return
         
-        arduino_index = -1
+        ctrl_index = -1
+        keywords = (
+            'stlink', 'st-link', 'stm', 'stmicroelectronics', 'virtual com',
+            'arduino', 'ch340', 'ch341', 'ftdi', 'usb serial',
+        )
         for i, port in enumerate(ports):
             # Mostrar puerto con descripción
             display = f"{port.device} - {port.description[:30]}"
             self.port_combo.addItem(display, port.device)
             
-            # Detectar Arduino automáticamente
             desc_lower = port.description.lower()
-            if any(x in desc_lower for x in ['arduino', 'ch340', 'ch341', 'ftdi', 'usb serial']):
-                arduino_index = i
+            mfg = (port.manufacturer or '').lower()
+            haystack = f"{desc_lower} {mfg}"
+            if any(x in haystack for x in keywords):
+                ctrl_index = i
         
-        # Seleccionar Arduino si se encontró
-        if arduino_index >= 0:
-            self.port_combo.setCurrentIndex(arduino_index)
-            logger.info(f"Arduino detectado en: {ports[arduino_index].device}")
+        if ctrl_index >= 0:
+            self.port_combo.setCurrentIndex(ctrl_index)
+            logger.info(f"Controlador XY detectado en: {ports[ctrl_index].device}")
         
         logger.info(f"Puertos escaneados: {[p.device for p in ports]}")
     
@@ -381,31 +392,31 @@ class ControlTab(QWidget):
         self.update_motor_values(power_a, power_b)
     
     def _create_position_hold_group(self):
-        """Crea el panel de Position Hold para testing de nuevas funcionalidades."""
-        group_box = QGroupBox("🎯 Position Hold - Testing Arduino v0.2")
+        """Panel de estado MCU + freno. Hold/S deshabilitados (STM32 no implementa H/S)."""
+        group_box = QGroupBox("Estado MCU STM32 / Freno")
         layout = QGridLayout()
         
-        # Target de sensores (ADC values)
         layout.addWidget(QLabel("Target Sensor 1 (ADC):"), 0, 0)
-        self.sensor1_target_input = QLineEdit("500")
-        self.sensor1_target_input.setToolTip("Valor ADC target para sensor 1")
+        self.sensor1_target_input = QLineEdit("2048")
+        self.sensor1_target_input.setEnabled(False)
+        self.sensor1_target_input.setToolTip("Hold no disponible en firmware STM32")
         layout.addWidget(self.sensor1_target_input, 0, 1)
         
         layout.addWidget(QLabel("Target Sensor 2 (ADC):"), 0, 2)
-        self.sensor2_target_input = QLineEdit("500")
-        self.sensor2_target_input.setToolTip("Valor ADC target para sensor 2")
+        self.sensor2_target_input = QLineEdit("2048")
+        self.sensor2_target_input.setEnabled(False)
+        self.sensor2_target_input.setToolTip("Hold no disponible en firmware STM32")
         layout.addWidget(self.sensor2_target_input, 0, 3)
         
-        # Botones de control
-        hold_btn = QPushButton("📍 Position Hold")
+        hold_btn = QPushButton("Position Hold (N/A)")
+        hold_btn.setEnabled(False)
+        hold_btn.setToolTip("Firmware STM32 no soporta H,<s1>,<s2>. Usar control PC vía A,<pwm>.")
         hold_btn.setStyleSheet("""
-            QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #27AE60; }
-            QPushButton:hover { background-color: #2ECC71; }
+            QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #555555; color: #AAAAAA; }
         """)
-        hold_btn.clicked.connect(self._request_position_hold)
         layout.addWidget(hold_btn, 1, 0)
         
-        brake_btn = QPushButton("🛑 Freno Activo")
+        brake_btn = QPushButton("Freno Activo")
         brake_btn.setStyleSheet("""
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #E74C3C; }
             QPushButton:hover { background-color: #C0392B; }
@@ -413,38 +424,35 @@ class ControlTab(QWidget):
         brake_btn.clicked.connect(self._request_brake)
         layout.addWidget(brake_btn, 1, 1)
         
-        # Configuración de asentamiento
         layout.addWidget(QLabel("Umbral Asentamiento:"), 1, 2)
-        self.settling_threshold_input = QLineEdit("8")
-        self.settling_threshold_input.setToolTip("Umbral ADC para detección de asentamiento")
+        self.settling_threshold_input = QLineEdit("32")
+        self.settling_threshold_input.setEnabled(False)
+        self.settling_threshold_input.setToolTip("Comando S no soportado; settling en PC")
         layout.addWidget(self.settling_threshold_input, 1, 3)
         
-        config_btn = QPushButton("⚙️ Configurar")
+        config_btn = QPushButton("Configurar (N/A)")
+        config_btn.setEnabled(False)
+        config_btn.setToolTip("Firmware STM32 no soporta S,<threshold>")
         config_btn.setStyleSheet("""
-            QPushButton { font-size: 11px; padding: 6px; background-color: #F39C12; }
-            QPushButton:hover { background-color: #F1C40F; }
+            QPushButton { font-size: 11px; padding: 6px; background-color: #555555; color: #AAAAAA; }
         """)
-        config_btn.clicked.connect(self._request_settling_config)
         layout.addWidget(config_btn, 1, 4)
         
-        # Estado del Arduino
-        layout.addWidget(QLabel("Estado Arduino:"), 2, 0)
+        layout.addWidget(QLabel("Estado MCU:"), 2, 0)
         self.arduino_state_label = QLabel("DESCONOCIDO")
         self.arduino_state_label.setStyleSheet("font-weight: bold; color: #95A5A6;")
         layout.addWidget(self.arduino_state_label, 2, 1)
         
-        layout.addWidget(QLabel("Posición Asentada:"), 2, 2)
-        self.settled_status_label = QLabel("❌ NO")
+        layout.addWidget(QLabel("Settled (info):"), 2, 2)
+        self.settled_status_label = QLabel("NO")
         self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
         layout.addWidget(self.settled_status_label, 2, 3)
         
-        # Información
-        info_label = QLabel("💡 Position Hold mantiene posición con PWM mínimo adaptativo")
+        info_label = QLabel("Comandos MCU: M | A,<pwm_a>,<pwm_b> | B. Hold/S deshabilitados.")
         info_label.setStyleSheet("color: #7F8C8D; font-size: 10px;")
         layout.addWidget(info_label, 3, 0, 1, 5)
         
-        # Indicador de firmware
-        self.firmware_status_label = QLabel("⚠️ Firmware: Esperando conexión...")
+        self.firmware_status_label = QLabel("Firmware: Esperando telemetría STM32...")
         self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")
         layout.addWidget(self.firmware_status_label, 4, 0, 1, 5)
         
@@ -452,14 +460,8 @@ class ControlTab(QWidget):
         return group_box
     
     def _request_position_hold(self):
-        """Solicita position hold con los valores configurados."""
-        try:
-            sensor1 = int(self.sensor1_target_input.text())
-            sensor2 = int(self.sensor2_target_input.text())
-            logger.info(f"ControlTab: Solicitar Position Hold - S1={sensor1}, S2={sensor2}")
-            self.position_hold_requested.emit(sensor1, sensor2)
-        except ValueError:
-            logger.error("Valores de sensor inválidos para Position Hold")
+        """No-op: Hold no soportado en STM32."""
+        logger.warning("Position Hold solicitado pero deshabilitado (STM32 sin comando H)")
     
     def _request_brake(self):
         """Solicita freno activo."""
@@ -467,25 +469,17 @@ class ControlTab(QWidget):
         self.brake_requested.emit()
     
     def _request_settling_config(self):
-        """Solicita configuración de umbral de asentamiento."""
-        try:
-            threshold = int(self.settling_threshold_input.text())
-            logger.info(f"ControlTab: Configurar Umbral Asentamiento - {threshold}")
-            self.settling_config_requested.emit(threshold)
-        except ValueError:
-            logger.error("Umbral de asentamiento inválido")
+        """No-op: S no soportado en STM32."""
+        logger.warning("Settling config solicitado pero deshabilitado (STM32 sin comando S)")
     
     def update_arduino_status(self, state: str, settled: bool):
-        """Actualiza el estado del Arduino y estado de asentamiento."""
-        # Solo actualizar si hay cambio real (evitar logging excesivo)
+        """Actualiza el estado del MCU y flag settled (informativo)."""
         current_state = self.arduino_state_label.text()
         if current_state == state.upper():
-            return  # Sin cambio, no actualizar
+            return
         
-        # Actualizar estado
         self.arduino_state_label.setText(state.upper())
         
-        # Colorear según estado
         state_colors = {
             'MANUAL': '#3498DB',
             'AUTO': '#9B59B6', 
@@ -493,29 +487,27 @@ class ControlTab(QWidget):
             'BRAKE': '#E74C3C',
             'SETTLING': '#F39C12',
             'UNKNOWN': '#95A5A6',
-            'LEGACY': '#F39C12'  # Firmware viejo
+            'LEGACY': '#F39C12'
         }
         color = state_colors.get(state.upper(), '#95A5A6')
         self.arduino_state_label.setStyleSheet(f"font-weight: bold; color: {color};")
         
-        # Actualizar estado de asentamiento
         if settled:
-            self.settled_status_label.setText("✅ SÍ")
+            self.settled_status_label.setText("SI")
             self.settled_status_label.setStyleSheet("font-weight: bold; color: #27AE60;")
         else:
-            self.settled_status_label.setText("❌ NO")
+            self.settled_status_label.setText("NO")
             self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
         
-        logger.info(f"ControlTab: Estado Arduino cambiado a {state}, Settled={settled}")
+        logger.info(f"ControlTab: Estado MCU cambiado a {state}, Settled={settled}")
         
-        # Actualizar indicador de firmware
         if hasattr(self, 'firmware_status_label'):
             if state.upper() == 'LEGACY':
-                self.firmware_status_label.setText("⚠️ Firmware v0.1 (viejo) - Sube XYZ_Control_Lab206.ino para Position Hold")
+                self.firmware_status_label.setText("Firmware LEGACY 4 campos - preferir STM32 6 campos")
                 self.firmware_status_label.setStyleSheet("color: #E74C3C; font-size: 10px; font-weight: bold;")
-            elif state.upper() in ['HOLD', 'BRAKE', 'SETTLING', 'MANUAL', 'AUTO']:
-                self.firmware_status_label.setText("✅ Firmware v0.2 - Position Hold disponible")
+            elif state.upper() in ['MANUAL', 'AUTO', 'BRAKE']:
+                self.firmware_status_label.setText("STM32F767ZI - M/A/B OK (Hold/S N/A)")
                 self.firmware_status_label.setStyleSheet("color: #27AE60; font-size: 10px; font-weight: bold;")
             else:
-                self.firmware_status_label.setText("⚠️ Firmware: Estado desconocido")
+                self.firmware_status_label.setText(f"Firmware: estado {state}")
                 self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")

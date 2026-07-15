@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "F:/BaslerCAM"
+		},
+		{
+			"path": "../../Documents/Arduino/XYZ_Control_Lab206/MycoViT_XY_Controller"
 		}
 	],
 	"settings": {}

@@ -34,6 +34,7 @@ from config.constants import (
     um_to_adc, adc_to_um
 )
 from core.control.sensor_buffer import SensorBuffer
+from core.control.control_worker import ControlWorker
 from core.control.step_config import StepControlConfig, load_step_control_config
 from core.control.step_controller import StepController
 from core.control.step_metrics import aggregate_point_metrics
@@ -111,7 +112,8 @@ class TestService(QObject):
         # Estado de control dual
         self._dual_active = False
         self._dual_paused = False  # NUEVO: Para pausar control XY durante captura
-        self._dual_timer: Optional[QTimer] = None
+        # Reloj de control en QThread propio (Fase 1: fuera del hilo GUI).
+        self._dual_worker: Optional[ControlWorker] = None
         self._dual_ref_a_um = 0.0
         self._dual_ref_b_um = 0.0
         self._dual_integral_a = 0.0
@@ -461,12 +463,19 @@ class TestService(QObject):
         
         # Activar control
         self._dual_active = True
-        
-        # Crear timer
-        self._dual_timer = QTimer()
-        self._dual_timer.timeout.connect(self._execute_dual_control_step)
-        self._dual_timer.start(10)  # 100Hz
-        
+
+        # Reloj de control en QThread propio (Fase 1: reemplaza QTimer(10)).
+        # Corre fuera del hilo GUI → sin jitter por repintado y a > 100 Hz.
+        from config.constants import CONTROL_RATE_HZ
+        if self._dual_worker is not None:
+            self._dual_worker.stop()
+        self._dual_worker = ControlWorker(
+            tick=self._execute_dual_control_step,
+            rate_hz=CONTROL_RATE_HZ,
+            name="DualControlWorker",
+        )
+        self._dual_worker.start()
+
         self.dual_control_started.emit()
         self.log_message.emit("🎮 Control Dual ACTIVO")
         logger.info("TestService: Control dual iniciado")
@@ -477,10 +486,10 @@ class TestService(QObject):
         """Detiene el control dual con freno activo."""
         logger.info("=== TestService: DETENIENDO CONTROL DUAL ===")
         
-        # Detener timer
-        if self._dual_timer:
-            self._dual_timer.stop()
-            self._dual_timer = None
+        # Detener reloj de control (QThread)
+        if self._dual_worker:
+            self._dual_worker.stop()
+            self._dual_worker = None
         
         # Freno activo
         if self._send_command:
@@ -688,11 +697,6 @@ class TestService(QObject):
         self._trajectory_waiting = False
         self._point_accepted = False  # NUEVO: Flag para evitar múltiples aceptaciones del mismo punto
         
-        # Estado de corrección de eje bloqueado
-        self._correcting_locked_axis = False
-        self._correction_axis = None  # 'x' o 'y'
-        self._correction_target_um = 0.0
-        
         # Resetear integrales y contadores
         self._dual_integral_a = 0.0
         self._dual_integral_b = 0.0
@@ -709,12 +713,19 @@ class TestService(QObject):
         self._trajectory_timer.start(10)  # 100Hz
         
         if self.step_control_enabled:
+            # La tolerancia del UI debe mandar en FOV/step (antes solo se logueaba tol_step fijo).
+            tol = float(tolerance_um)
+            self._step_config.tol_fov_um = tol
+            self._step_config.tol_step_um = min(self._step_config.tol_step_um, tol)
+            # Aproximación legacy: terminar más cerca del FOV (no a 80–200 µm).
+            self._step_config.long_approach_done_um = max(tol * 2.0, self._step_config.step_um * 2.0)
             self._step_controller.reset_session()
             self._step_long_approach_active = False
             self._prepare_step_transition()
             self.log_message.emit(
                 f"   Modo pasos homogéneos: step={self._step_config.step_um}µm, "
-                f"tol={self._step_config.tol_step_um}µm"
+                f"tol_step={self._step_config.tol_step_um}µm, tol_fov={self._step_config.tol_fov_um}µm, "
+                f"long_done={self._step_config.long_approach_done_um:.0f}µm"
             )
         
         self.trajectory_started.emit(len(trajectory))
@@ -776,10 +787,13 @@ class TestService(QObject):
             logger.warning("[TestService] ⚠️  Control dual YA está pausado")
             return
         
-        # CRÍTICO: DETENER el timer para que NO se ejecuten comandos XY
-        if self._dual_timer:
-            self._dual_timer.stop()
-            logger.info("[TestService] 🛑 Timer del control dual XY DETENIDO")
+        # CRÍTICO: PAUSAR el worker para que NO se ejecuten comandos XY.
+        # Se marca la bandera ANTES del BRAKE para que un tick en vuelo no
+        # vuelva a enviar A,pwm después del freno.
+        self._dual_paused = True
+        if self._dual_worker:
+            self._dual_worker.pause(True)
+            logger.info("[TestService] 🛑 Worker del control dual XY PAUSADO")
         
         # Activar BRAKE para mantener posición
         if self._send_command:
@@ -787,8 +801,6 @@ class TestService(QObject):
             time.sleep(0.02)
             self._send_command('A,0,0')  # PWM a 0
             logger.info("[TestService] 🔒 BRAKE activado - motores XY bloqueados")
-        
-        self._dual_paused = True
         logger.info("[TestService] ⏸️  Control dual XY PAUSADO COMPLETAMENTE (timer detenido + BRAKE activo)")
     
     def resume_dual_control(self):
@@ -797,6 +809,8 @@ class TestService(QObject):
         """
         if self._dual_active and self._dual_paused:
             self._dual_paused = False
+            if self._dual_worker:
+                self._dual_worker.pause(False)
             logger.info("[TestService] ▶️  Control dual XY REANUDADO")
     
     def resume_trajectory(self, advance_to_next: bool = True):
@@ -1301,157 +1315,6 @@ class TestService(QObject):
                 f"- PAUSADO (esperando comando)"
             )
             logger.info(f"{status} Punto {self._trajectory_index + 1} - PAUSADO esperando resume_trajectory()")
-    
-    def _accept_corrected_point(self):
-        """Acepta el punto actual después de corregir el eje bloqueado."""
-        if not self._trajectory or self._trajectory_index >= len(self._trajectory):
-            return
-        
-        target = self._trajectory[self._trajectory_index]
-        target_x, target_y = target[0], target[1]
-        
-        # Leer errores actuales después de corrección
-        error_x_um = 0.0
-        error_y_um = 0.0
-        
-        if self._controller_a:
-            sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
-            if sensor_adc is not None:
-                ref_adc_x = um_to_adc(target_x, axis='x')
-                error_x_um = (ref_adc_x - sensor_adc) * CALIBRATION_X['slope']
-        
-        if self._controller_b:
-            sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
-            if sensor_adc is not None:
-                ref_adc_y = um_to_adc(target_y, axis='y')
-                error_y_um = (ref_adc_y - sensor_adc) * CALIBRATION_Y['slope']
-        
-        # Aceptar punto con status de corrección
-        self._accept_trajectory_point(target_x, target_y, error_x_um, error_y_um, "✅ Estable (corregido)")
-    
-    def _start_locked_axis_correction(self, axis: str, target_um: float, current_error_um: float):
-        """
-        Inicia la corrección de un eje bloqueado que ha acumulado error > 100µm.
-        
-        Args:
-            axis: 'x' o 'y'
-            target_um: Posición objetivo en µm
-            current_error_um: Error actual en µm
-        """
-        self._correcting_locked_axis = True
-        self._correction_axis = axis
-        self._correction_target_um = target_um
-        
-        # Resetear integral del eje a corregir
-        if axis == 'x':
-            self._dual_integral_a = 0.0
-        else:
-            self._dual_integral_b = 0.0
-        
-        self.log_message.emit(
-            f"🔧 Corrigiendo eje {axis.upper()} bloqueado: error={current_error_um:.1f}µm → 0µm"
-        )
-        logger.info(f"Iniciando corrección de eje {axis.upper()} bloqueado: {current_error_um:.1f}µm")
-    
-    def _execute_locked_axis_correction(self):
-        """
-        Ejecuta un paso de corrección del eje bloqueado.
-        Solo mueve el motor del eje bloqueado hasta que el error sea < 25µm.
-        """
-        try:
-            current_time = time.time()
-            Ts = current_time - self._dual_last_time
-            self._dual_last_time = current_time
-            
-            axis = self._correction_axis
-            target_um = self._correction_target_um
-            tolerance = self._trajectory_config.tolerance_um
-            
-            if axis == 'x' and self._controller_a:
-                # Corregir eje X (Motor A)
-                ref_adc = um_to_adc(target_um, axis='x')
-                sensor_adc = self._get_sensor_value(self._controller_a.sensor_key)
-                
-                if sensor_adc is not None:
-                    error_adc = ref_adc - sensor_adc
-                    error_um = error_adc * CALIBRATION_X['slope']
-                    
-                    # Verificar si ya corregimos
-                    if abs(error_um) < tolerance:
-                        self._correcting_locked_axis = False
-                        self._correction_axis = None
-                        self._send_command('B')  # Freno
-                        time.sleep(0.02)
-                        self._send_command('A,0,0')
-                        self.log_message.emit(f"✅ Eje X corregido: error={error_um:.1f}µm")
-                        logger.info(f"Eje X corregido: {error_um:.1f}µm")
-                        # Aceptar punto inmediatamente después de corrección
-                        self._accept_corrected_point()
-                        return
-                    
-                    # Control PI solo para Motor A
-                    if abs(error_adc) > DEADZONE_ADC:
-                        self._dual_integral_a += error_adc * Ts
-                        pwm_base = (self._controller_a.Kp * error_adc + 
-                                   self._controller_a.Ki * self._dual_integral_a)
-                        
-                        if self._controller_a.invert:
-                            pwm_a = -int(pwm_base)
-                        else:
-                            pwm_a = int(pwm_base)
-                        
-                        U_max = int(self._controller_a.U_max)
-                        if abs(pwm_a) > U_max:
-                            self._dual_integral_a -= error_adc * Ts
-                            pwm_a = max(-U_max, min(U_max, pwm_a))
-                        
-                        # Solo mover Motor A, Motor B = 0
-                        self._send_command(f"A,{pwm_a},0")
-                        
-            elif axis == 'y' and self._controller_b:
-                # Corregir eje Y (Motor B)
-                ref_adc = um_to_adc(target_um, axis='y')
-                sensor_adc = self._get_sensor_value(self._controller_b.sensor_key)
-                
-                if sensor_adc is not None:
-                    error_adc = ref_adc - sensor_adc
-                    error_um = error_adc * CALIBRATION_Y['slope']
-                    
-                    # Verificar si ya corregimos
-                    if abs(error_um) < tolerance:
-                        self._correcting_locked_axis = False
-                        self._correction_axis = None
-                        self._send_command('B')  # Freno
-                        time.sleep(0.02)
-                        self._send_command('A,0,0')
-                        self.log_message.emit(f"✅ Eje Y corregido: error={error_um:.1f}µm")
-                        logger.info(f"Eje Y corregido: {error_um:.1f}µm")
-                        # Aceptar punto inmediatamente después de corrección
-                        self._accept_corrected_point()
-                        return
-                    
-                    # Control PI solo para Motor B
-                    if abs(error_adc) > DEADZONE_ADC:
-                        self._dual_integral_b += error_adc * Ts
-                        pwm_base = (self._controller_b.Kp * error_adc + 
-                                   self._controller_b.Ki * self._dual_integral_b)
-                        
-                        if self._controller_b.invert:
-                            pwm_b = -int(pwm_base)
-                        else:
-                            pwm_b = int(pwm_base)
-                        
-                        U_max = int(self._controller_b.U_max)
-                        if abs(pwm_b) > U_max:
-                            self._dual_integral_b -= error_adc * Ts
-                            pwm_b = max(-U_max, min(U_max, pwm_b))
-                        
-                        # Solo mover Motor B, Motor A = 0
-                        self._send_command(f"A,0,{pwm_b}")
-                        
-        except Exception as e:
-            logger.error(f"TestService: Error en corrección de eje bloqueado: {e}")
-            self._correcting_locked_axis = False
     
     @property
     def is_trajectory_active(self) -> bool:

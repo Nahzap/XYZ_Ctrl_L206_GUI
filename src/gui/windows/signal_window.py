@@ -6,14 +6,18 @@ utilizando PyQtGraph para un rendimiento óptimo.
 """
 
 import logging
+import time
 import numpy as np
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox
 from PyQt5.QtCore import Qt
 import pyqtgraph as pg
-from config.constants import PLOT_LENGTH
+from config.constants import PLOT_LENGTH, ADC_MAX
 from gui.styles.dark_theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
+
+# Decimación de plot ~100 Hz (telemetría STM32 puede ser kHz)
+_PLOT_MIN_INTERVAL_S = 0.01
 
 
 class SignalWindow(QWidget):
@@ -30,6 +34,7 @@ class SignalWindow(QWidget):
         self.setWindowTitle('Señales de Control - Tiempo Real')
         self.setGeometry(150, 150, 900, 600)
         self.setStyleSheet(DARK_STYLESHEET)
+        self._last_plot_ts = 0.0
         
         layout = QVBoxLayout(self)
         
@@ -55,7 +60,7 @@ class SignalWindow(QWidget):
         legend = self.plot_widget.addLegend()
         legend.setLabelTextColor('#F0F0F0')
         
-        self.plot_widget.setYRange(0, 1023, padding=0)
+        self.plot_widget.setYRange(0, float(ADC_MAX), padding=0)
         
         layout.addWidget(self.plot_widget)
         
@@ -111,21 +116,20 @@ class SignalWindow(QWidget):
     
     def update_data(self, pot_a, pot_b, sens_1, sens_2):
         """
-        ACTUALIZACIÓN INSTANTÁNEA - SIN DELAYS, SOLO ESCRITURA DIRECTA.
-        Esta función se llama a MÁXIMA VELOCIDAD del puerto serial.
+        Ingiere telemetría en buffer circular; refresca el plot a ~100 Hz.
         """
-        # Escribir directamente en buffer circular
         idx = self.index
         self.data['power_a'][idx] = abs(pot_a)
         self.data['power_b'][idx] = abs(pot_b)
         self.data['sensor_1'][idx] = sens_1
         self.data['sensor_2'][idx] = sens_2
-        
-        # Avanzar índice circular
         self.index = (self.index + 1) % self.buffer_size
-        
-        # ACTUALIZAR GRÁFICOS INMEDIATAMENTE - sin validaciones
-        # setData() es llamada TAN RÁPIDO como llegan los datos
+
+        now = time.perf_counter()
+        if (now - self._last_plot_ts) < _PLOT_MIN_INTERVAL_S:
+            return
+        self._last_plot_ts = now
+
         self.plot_lines['power_a'].setData(self.data['power_a'])
         self.plot_lines['power_b'].setData(self.data['power_b'])
         self.plot_lines['sensor_1'].setData(self.data['sensor_1'])

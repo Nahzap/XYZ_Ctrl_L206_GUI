@@ -1,7 +1,7 @@
 # XYZ_Ctrl_L206_GUI: Automated Microscopy System for Pollen Analysis
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
-[![PyQt5](https://img.shields.io/badge/PyQt5-5.15+-green.svg)](https://www.riverbankcomputing.com/software/pyqt/)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
+[![PyQt5](https://img.shields.io/badge/PyQt5-5.15.11-green.svg)](https://www.riverbankcomputing.com/software/pyqt/)
 [![License](https://img.shields.io/badge/License-Open_Source-orange.svg)](LICENSE)
 
 ## 📋 Overview
@@ -12,7 +12,7 @@
 - **Piezoelectric Z-axis control** (C-Focus, Mad City Labs) for sub-micron autofocus
 - **Deep learning-based detection** using U2-Net for salient object detection
 - **Automated microscopy workflows** for multi-object capture and analysis
-- **Real-time control and data acquisition** via Arduino microcontroller
+- **Real-time control and data acquisition** via STM32F767ZI microcontroller
 
 ### Key Features
 
@@ -42,11 +42,11 @@ This system is specifically designed for **melissopalynology** - the microscopic
 
 | Component | Model/Type | Function |
 |-----------|------------|----------|
-| **XY Stage** | L206 DC Motors + Arduino | Precision positioning (25mm range) |
+| **XY Stage** | L206/L298N + STM32F767ZI | Posicionamiento calibrado (span según banco: p. ej. 3–25 mm) |
 | **Z-Axis** | C-Focus Piezo (Mad City Labs) | Sub-micron autofocus (68µm range) |
-| **Camera** | Thorlabs Scientific Camera | High-resolution microscopy imaging |
-| **Controller** | Arduino Mega 2560 | Real-time motor control and sensing |
-| **PC Interface** | USB Serial (115200 baud) | Command/telemetry communication |
+| **Camera** | Thorlabs / Basler Scientific Camera | High-resolution microscopy imaging |
+| **Controller** | NUCLEO-STM32F767ZI (MycoViT_XY_Controller) | Real-time motor control and 12-bit sensing |
+| **PC Interface** | USB Serial ST-Link VCP (**1 000 000 baud**) | Command/telemetry communication |
 
 ### Software Architecture
 
@@ -87,58 +87,52 @@ This system is specifically designed for **melissopalynology** - the microscopic
 
 ### Prerequisites
 
-- **Python 3.9+**
-- **Windows 10/11** (for Thorlabs camera drivers)
-- **CUDA-capable GPU** (optional, for faster U2-Net inference)
-- **Arduino IDE** (for firmware upload)
+- **Python 3.11** (entorno de referencia: `CTRL_ENV`, conda-forge)
+- **Windows 10/11**
+- **CUDA 12.1** (recomendado para U2-Net; CPU también funciona)
+- **Pylon Runtime** (Basler) y/o **ThorCam** (Thorlabs), según cámara
+- **Firmware MCU:** `MycoViT_XY_Controller` (NUCLEO-F767ZI)
 
-### Step 1: Clone Repository
+### Entorno CTRL_ENV (canónico)
 
-```bash
-git clone https://github.com/yourusername/XYZ_Ctrl_L206_GUI.git
-cd XYZ_Ctrl_L206_GUI
+El proyecto usa el prefijo `./CTRL_ENV` (Python en la raíz del prefijo, no un `venv` clásico con `Scripts\python.exe`).  
+`CTRL_ENV\Lib\site-packages\sitecustomize.py` **desactiva el user-site** (`AppData\Roaming\Python\...`) para que todos los paquetes salgan de CTRL_ENV.
+
+```powershell
+# Desde la raíz del repo
+$env:PYTHONNOUSERSITE = "1"
+
+# Dependencias PyPI
+.\CTRL_ENV\python.exe -m pip install -r requirements.txt
+
+# PyTorch CUDA 12.1 (índice aparte; no está en PyPI)
+.\CTRL_ENV\python.exe -m pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### Step 2: Create Virtual Environment
+Verificación rápida:
 
-```bash
-python -m venv CTRL_ENV
-CTRL_ENV\Scripts\activate  # Windows
+```powershell
+.\CTRL_ENV\python.exe -c "import site,torch,pypylon,h5py; print('user_site', site.ENABLE_USER_SITE); print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('pypylon OK')"
 ```
 
-### Step 3: Install Dependencies
+### Cámaras (SO + Python)
 
-```bash
-pip install -r requirements.txt
-```
+| Cámara | Runtime SO | Paquete Python |
+|--------|------------|----------------|
+| **Basler** | [Pylon](https://www.baslerweb.com/en/downloads/software-downloads/) | `pypylon` (≥26.6) |
+| **Thorlabs** | [ThorCam](https://www.thorlabs.com/software_pages/ViewSoftwarePage.cfm?Code=ThorCam) | `pylablib` (≥1.4.4) |
 
-### Step 4: Install Thorlabs Camera Drivers
+### Hardware / configuración
 
-1. Download **ThorCam** from [Thorlabs website](https://www.thorlabs.com/software_pages/ViewSoftwarePage.cfm?Code=ThorCam)
-2. Install to default location: `C:\Program Files\Thorlabs\ThorImageCAM\`
-3. Verify `pylablib` can detect camera
-
-### Step 5: Configure Hardware
-
-1. **Upload Arduino firmware** (see `arduino/` folder)
-2. **Connect hardware**:
-   - Arduino via USB (check COM port in Device Manager)
-   - Thorlabs camera via USB 3.0
-   - C-Focus controller via USB
-3. **Update configuration** in `src/config/constants.py`:
+1. Flashear `MycoViT_XY_Controller` en NUCLEO-F767ZI  
+2. Conectar ST-Link VCP (p. ej. COM5 @ **1 000 000** baud)  
+3. Ajustar `src/config/constants.py` y `src/config/calibration.json`:
    ```python
-   SERIAL_PORT = 'COM3'  # Your Arduino port
-   CFOCUS_SERIAL_PORT = 'COM4'  # Your C-Focus port
+   SERIAL_PORT = 'COM5'
+   BAUD_RATE = 1000000
+   # ADC 12-bit: system.adc_max = 4095
    ```
-
-### Step 6: Download U2-Net Model Weights
-
-```bash
-# Download u2netp.pth (4.7 MB)
-# Place in: models/u2net/u2netp.pth
-```
-
-Download from: [U2-Net GitHub](https://github.com/xuebinqin/U-2-Net)
+4. Pesos U2-Net: `models/u2net/u2netp.pth` ([U-2-Net](https://github.com/xuebinqin/U-2-Net))
 
 ---
 
@@ -146,16 +140,15 @@ Download from: [U2-Net GitHub](https://github.com/xuebinqin/U-2-Net)
 
 ### Quick Start
 
-```bash
-cd src
-python main.py
+```powershell
+.\CTRL_ENV\python.exe src\main.py
 ```
 
 ### Basic Workflow
 
 #### 1. **Connect Hardware**
 - Click **"Conectar"** in Control tab
-- Verify Arduino connection (green status)
+- Verify STM32 connection (green status; COM ST-Link @ 1 Mbps)
 - Connect camera in Camera tab
 - Connect C-Focus in Camera tab
 
@@ -168,7 +161,7 @@ python main.py
 - Go to **H∞ tab**
 - Load plant model from calibration
 - Synthesize robust controller
-- Export to Arduino
+- Apply on PC (AUTO via `A,<pwm_a>,<pwm_b>`); MCU hold on-chip is roadmap
 
 #### 4. **Automated Microscopy**
 - Go to **Camera tab**
@@ -291,9 +284,9 @@ captures/
 Edit `src/config/constants.py`:
 
 ```python
-# Serial Communication
-SERIAL_PORT = 'COM3'
-BAUD_RATE = 115200
+# Serial Communication (STM32F767ZI ST-Link VCP)
+SERIAL_PORT = 'COM5'
+BAUD_RATE = 1000000  # 1 Mbps; telemetry CSV 6 fields, ADC 12-bit (0-4095)
 
 # Autofocus Parameters
 Z_SCAN_RANGE = 68.0        # µm
@@ -341,21 +334,28 @@ python tests/benchmark_autofocus.py
 
 ### Camera Not Detected
 
-1. Verify ThorCam installation
-2. Check USB 3.0 connection
-3. Run: `python -c "import pylablib as pll; print(pll.list_cameras())"`
+**Basler:** Pylon Runtime instalado; USB;  
+`.\CTRL_ENV\python.exe -c "from pypylon import pylon; print(len(pylon.TlFactory.GetInstance().EnumerateDevices()))"`
 
-### Arduino Connection Failed
+**Thorlabs:** ThorCam instalado; USB 3.0;  
+`.\CTRL_ENV\python.exe -c "import pylablib as pll; print(pll.list_cameras())"`
 
-1. Check COM port in Device Manager
-2. Verify baud rate (115200)
-3. Re-upload firmware if needed
+### STM32 / Serial Connection Failed
+
+1. Check COM port in Device Manager (ST-Link Virtual COM Port)
+2. Verify baud rate (**1000000**)
+3. Close other apps using the port; re-flash `MycoViT_XY_Controller` if needed
+4. Confirm telemetry format: `potA,potB,s1,s2,STATE,settled` with sensors 0-4095
+
+### Imports from AppData / wrong packages
+
+Si aparecen rutas `AppData\Roaming\Python\...`, el user-site está filtrándose. Con CTRL_ENV + `sitecustomize.py` debe ser `ENABLE_USER_SITE False`. Reinstalar con `$env:PYTHONNOUSERSITE=1`.
 
 ### U2-Net Model Not Loading
 
 1. Verify `models/u2net/u2netp.pth` exists
-2. Check PyTorch installation: `python -c "import torch; print(torch.__version__)"`
-3. For GPU: Verify CUDA installation
+2. Check PyTorch: `.\CTRL_ENV\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"`
+3. Si falta CUDA build: reinstalar `torch==2.5.1+cu121` desde el índice PyTorch (ver Installation)
 
 ### Autofocus Not Working
 
@@ -371,7 +371,7 @@ python tests/benchmark_autofocus.py
 |--------|-------|
 | Detection Speed | 50-80ms/frame (GPU) |
 | Autofocus Time | 2-3s/object |
-| Positioning Accuracy | ±2µm (XY), ±0.1µm (Z) |
+| Positioning Accuracy (product goal) | ±8 µm XY estable ≥300 ms; Z piezo ~0.1 µm |
 | Throughput | ~20-30 objects/minute |
 | Classification Accuracy | 93% (7 taxa, phase contrast) |
 
@@ -439,14 +439,27 @@ If you use this system in your research, please cite:
 
 ## 🗺️ Roadmap
 
+### Control micrométrico (en curso — ver Docs)
+
+Plan: `Docs/20260714_0032_Plan_Implementacion_Control_Micrometrico_Rapido.md`  
+(firmware: `MycoViT_XY_Controller/Docs/…`)
+
+| Fase | Estado |
+|------|--------|
+| 0 Baseline telemetría ~3.4 kHz | ✅ |
+| 1 ControlWorker + UI ~30 Hz | ✅ |
+| 2 Pulsos FOV wall-clock (ms) + permanencia 300 ms | ✅ |
+| 3 Mini-pulso MCU + `P,axis,sign,idx` | ⏸️ Pausada (banco) |
+| 4 LUT micrométrica STM32 | ⏸️ Pausada |
+| 5 Validación ±8 µm microscopía | ⏸️ Pausada |
+
+### Producto
+
 - [ ] Multi-species classification model
-- [ ] Cloud-based image storage
-- [ ] Mobile app for remote monitoring
-- [ ] Integration with spectroscopy data
 - [ ] Automated report generation
-- [ ] Support for other microscopy techniques
+- [ ] Framing binario / C(z) en hook 1 MHz (stretch)
 
 ---
 
-**Last Updated**: January 14, 2026  
-**Version**: 2.2.0
+**Last Updated**: 2026-07-14  
+**Version**: 2.3.0 (CTRL_ENV aislado; control host Fases 0–2)

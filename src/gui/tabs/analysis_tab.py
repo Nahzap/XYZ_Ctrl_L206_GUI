@@ -36,7 +36,7 @@ class AnalysisTab(QWidget):
         
         Args:
             tf_analyzer: Instancia de TransferFunctionAnalyzer
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
         self.tf_analyzer = tf_analyzer

@@ -22,7 +22,7 @@ class RecordingTab(QWidget):
         recording_stopped: Emitido cuando se detiene grabación
     """
     
-    # Señales para comunicación con ArduinoGUI
+    # Señales para comunicación con CTRL_GUI
     recording_started = pyqtSignal(str)  # filename
     recording_stopped = pyqtSignal()
     
@@ -32,7 +32,7 @@ class RecordingTab(QWidget):
         
         Args:
             data_recorder: Instancia de DataRecorder para manejar archivos
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
         self.data_recorder = data_recorder

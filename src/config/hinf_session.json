@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "saved_at": "2026-06-27T12:12:29",
+  "saved_at": "2026-07-14T19:39:15",
   "analysis": {
     "slots": {
       "A_1": {
@@ -18,40 +18,40 @@
         "motor": "A",
         "sensor": "2",
         "slot_key": "A_2",
-        "csv_path": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/motorY_A_S2_3mm.csv",
+        "csv_path": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/MotorA_Sensor2.csv",
         "csv_exists": true,
         "t_start_s": 0.0,
-        "t_end_s": 15.0,
-        "distance_min_mm": 12.0,
-        "distance_max_mm": 15.0,
+        "t_end_s": 28.0,
+        "distance_min_mm": 10.0,
+        "distance_max_mm": 20.0,
         "last_identification": {
-          "K": 1.3440357461267467,
-          "tau": 0.145,
+          "K": 0.3384319454132914,
+          "tau": 0.0,
           "tau_slow": 1000.0,
-          "timestamp": "2026-06-26T15:05:35",
-          "v_ss": 138.16546959811427,
-          "U": 102.7989545637314,
-          "calibration_msg": "✅ Interpolado: 12.0→15.0 mm (INVERSA)"
+          "timestamp": "2026-07-14T19:07:38",
+          "v_ss": 77.15322276667973,
+          "U": 227.972636189709,
+          "calibration_msg": "✅ Interpolado: 10.0→20.0 mm (INVERSA)"
         }
       },
       "B_1": {
         "motor": "B",
         "sensor": "1",
         "slot_key": "B_1",
-        "csv_path": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/motorX_B_S1_3mm.csv",
+        "csv_path": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/MotorB_Sensor1.csv",
         "csv_exists": true,
         "t_start_s": 0.0,
-        "t_end_s": 13.0,
-        "distance_min_mm": 12.0,
-        "distance_max_mm": 15.0,
+        "t_end_s": 30.0,
+        "distance_min_mm": 10.0,
+        "distance_max_mm": 20.0,
         "last_identification": {
-          "K": 2.0031686296423796,
+          "K": 0.5564872168670668,
           "tau": 0.0,
           "tau_slow": 1000.0,
-          "timestamp": "2026-06-26T15:04:05",
-          "v_ss": 190.62570082978266,
-          "U": 95.16208371524596,
-          "calibration_msg": "✅ Interpolado: 12.0→15.0 mm (INVERSA)"
+          "timestamp": "2026-07-14T19:31:04",
+          "v_ss": 119.77682513419259,
+          "U": 215.2373343066473,
+          "calibration_msg": "✅ Interpolado: 10.0→20.0 mm (INVERSA)"
         }
       }
     },
@@ -59,22 +59,22 @@
       {
         "motor": "A",
         "sensor": "2",
-        "K": 1.3440357461267467,
-        "tau": 0.145,
+        "K": 0.3384319454132914,
+        "tau": 0.0,
         "tau_slow": 1000.0,
-        "timestamp": "2026-06-26 15:05:35",
-        "filename": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/motorY_A_S2_3mm.csv",
-        "calibration": "✅ Interpolado: 12.0→15.0 mm (INVERSA)"
+        "timestamp": "2026-07-14 19:07:38",
+        "filename": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/MotorA_Sensor2.csv",
+        "calibration": "✅ Interpolado: 10.0→20.0 mm (INVERSA)"
       },
       {
         "motor": "B",
         "sensor": "1",
-        "K": 2.0031686296423796,
+        "K": 0.5564872168670668,
         "tau": 0.0,
         "tau_slow": 1000.0,
-        "timestamp": "2026-06-26 15:04:05",
-        "filename": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/motorX_B_S1_3mm.csv",
-        "calibration": "✅ Interpolado: 12.0→15.0 mm (INVERSA)"
+        "timestamp": "2026-07-14 19:31:04",
+        "filename": "C:/Users/askna/PycharmProjects/XYZ_Ctrl_L206_GUI/MotorB_Sensor1.csv",
+        "calibration": "✅ Interpolado: 10.0→20.0 mm (INVERSA)"
       }
     ]
   },
@@ -83,10 +83,51 @@
       "A_2": {
         "slot_key": "A_2",
         "plant": {
-          "K": 1.2896,
+          "K": 0.3384,
+          "tau": 0.008,
+          "num": [
+            0.3384
+          ],
+          "den": [
+            0.008,
+            1.0
+          ]
+        },
+        "weights": {
+          "method": "H∞ (mixsyn)",
+          "Ms": 1.0,
+          "wb": 1.0,
+          "eps": 0.1,
+          "U_max": 255.0,
+          "w_unc": 1.0,
+          "eps_T": 0.001,
+          "invert_pwm": false
+        },
+        "result": {
+          "gamma": 1.0000000073348327,
+          "Kp": 2.6586152030047563,
+          "Ki": 2.955082742316785,
+          "K_value": 0.3384,
+          "tau_value": 0.008,
+          "Umax_designed": 255.0,
+          "controller_num": [
+            6181482.066719446,
+            772685260.103358
+          ],
+          "controller_den": [
+            1.0,
+            289201375.5588735,
+            28920135.378822327
+          ]
+        }
+      },
+      "B_1": {
+        "slot_key": "B_1",
+        "plant": {
+          "K": 0.5565,
           "tau": 0.001,
           "num": [
-            1.2896
+            0.5565
           ],
           "den": [
             0.001,
@@ -95,70 +136,29 @@
         },
         "weights": {
           "method": "H∞ (mixsyn)",
-          "Ms": 1.5,
-          "wb": 5.0,
-          "eps": 0.001,
-          "U_max": 150.0,
-          "w_unc": 50.0,
-          "eps_T": 0.1,
-          "invert_pwm": true
-        },
-        "result": {
-          "gamma": 0.6677391721583363,
-          "Kp": 5.77974011820485,
-          "Ki": 3.877171215880893,
-          "K_value": 1.2896,
-          "tau_value": 0.001,
-          "Umax_designed": 150.0,
-          "controller_num": [
-            4849606512.514382,
-            4849607193.77279
-          ],
-          "controller_den": [
-            1.0,
-            854619253.6570437,
-            213654775.1564982
-          ]
-        }
-      },
-      "B_1": {
-        "slot_key": "B_1",
-        "plant": {
-          "K": 2.0032,
-          "tau": 0.007,
-          "num": [
-            2.0032
-          ],
-          "den": [
-            0.007,
-            1.0
-          ]
-        },
-        "weights": {
-          "method": "H∞ (mixsyn)",
-          "Ms": 1.1,
-          "wb": 15.0,
+          "Ms": 1.0,
+          "wb": 1.0,
           "eps": 0.1,
-          "U_max": 200.0,
-          "w_unc": 10.0,
-          "eps_T": 0.75,
+          "U_max": 255.0,
+          "w_unc": 0.1,
+          "eps_T": 0.0001,
           "invert_pwm": false
         },
         "result": {
-          "gamma": 0.9090910148532769,
-          "Kp": 0.8243076220484016,
-          "Ki": 7.488019169329073,
-          "K_value": 2.0032,
-          "tau_value": 0.007,
-          "Umax_designed": 200.0,
+          "gamma": 1.0000203007714301,
+          "Kp": 2.286099783886193,
+          "Ki": 1.7969451931716083,
+          "K_value": 0.5565,
+          "tau_value": 0.001,
+          "Umax_designed": 255.0,
           "controller_num": [
-            685103933.6834155,
-            97871992557.51437
+            215931863.0576375,
+            215931858.94296306
           ],
           "controller_den": [
             1.0,
-            7919506437.284562,
-            11879258942.775229
+            132915569.40694982,
+            13291557.77002588
           ]
         }
       }
@@ -168,26 +168,26 @@
   "test": {
     "controllers": {
       "A": {
-        "Kp": 0.8243076220484016,
-        "Ki": 7.488019169329073,
-        "K": 2.0032,
-        "tau": 0.007,
-        "U_max": 200.0,
-        "gamma": 0.9090910148532769,
+        "Kp": 2.6586152030047563,
+        "Ki": 2.955082742316785,
+        "K": 0.3384,
+        "tau": 0.008,
+        "U_max": 255.0,
+        "gamma": 1.0000000073348327,
         "K_sign": 1.0,
-        "Ms": 1.1,
-        "wb": 15.0
+        "Ms": 1.0,
+        "wb": 1.0
       },
       "B": {
-        "Kp": 0.8243076220484016,
-        "Ki": 7.488019169329073,
-        "K": 2.0032,
-        "tau": 0.007,
-        "U_max": 200.0,
-        "gamma": 0.9090910148532769,
+        "Kp": 2.286099783886193,
+        "Ki": 1.7969451931716083,
+        "K": 0.5565,
+        "tau": 0.001,
+        "U_max": 255.0,
+        "gamma": 1.0000203007714301,
         "K_sign": 1.0,
-        "Ms": 1.1,
-        "wb": 15.0
+        "Ms": 1.0,
+        "wb": 1.0
       }
     },
     "sensor_map": {

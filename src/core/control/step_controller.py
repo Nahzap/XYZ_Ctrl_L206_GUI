@@ -1,9 +1,15 @@
-"""Orquestador de pasos homogéneos mono-eje (máquina de estados)."""
+"""Orquestador de pasos homogéneos mono-eje (máquina de estados).
+
+Fine FOV (un solo camino activo):
+  use_mcu_cz_loop=True  → MCU C(z): I+F → observa → N (canónico)
+  use_mcu_atom_pulse    → host P (solo si cz=False)
+  ambos False           → host A,pwm timed (legacy)
+Coarse: H∞ MOVING → A,pwm. Parking: B + A,0,0 vía _park_motors.
+"""
 
 from __future__ import annotations
 
 import logging
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
@@ -11,9 +17,9 @@ from typing import Callable, List, Optional, Tuple
 from config.constants import CALIBRATION_X, CALIBRATION_Y, SETTLING_CYCLES, adc_to_um, um_to_adc
 from core.control.controller_config import ControllerConfig
 from core.control.pwm_crit_estimator import PwmCritEstimator
-from core.control.discrete_hinf_kz import CONTROL_TS_S, DiscreteKzState, step_pi_kz
 from core.control.hinf_actuator import HinfActuator, HinfActuatorConfig, HinfAxisState
 from core.control.sensor_buffer import SensorBuffer
+from core.communication.protocol import MotorProtocol
 from core.control.step_config import StepControlConfig
 from core.control.step_decomposer import decompose_transition
 from core.control.step_metrics import StepSessionMetrics
@@ -92,23 +98,35 @@ class StepController:
 
         self._hinf_state_a = HinfAxisState()
         self._hinf_state_b = HinfAxisState()
-        self._fov_settling_counter = 0
         self._fov_verify_started_mono = 0.0
-        self._fov_verify_log_counter = 0
         self._fov_verify_ticks = 0
+        self._fov_in_band_since_mono = 0.0
+        self._fov_retries = 0
         self._fov_active_axis: Optional[str] = None
         self._fov_advance_axes: List[str] = []
-        self._fov_advance_axis_idx = 0
-        self._fov_priority_settling = 0
-        self._fov_locked_axes: set[str] = set()
         self._move_dir_x = 0
         self._move_dir_y = 0
         self._backlash_dx_um = 0.0
         self._backlash_dy_um = 0.0
-        self._kz_state_a = DiscreteKzState()
-        self._kz_state_b = DiscreteKzState()
-        self._fov_creep_cd_x = 0
-        self._fov_creep_cd_y = 0
+        self._fov_pulse = self._new_fov_pulse_state()
+        self._fov_brake_pending = False
+        self._fov_best_max_um: Optional[float] = None
+        self._fov_frozen: bool = False  # latch: best≤tol → no más átomos en este punto
+        self._fov_freeze_since_mono: float = 0.0
+        self._fov_pulse_count = 0
+        self._fov_pulses_since_improve = 0
+        self._fov_locked = {"x": False, "y": False}
+        self._fov_hard_lock = {"x": False, "y": False}
+        self._fov_axis_in_band_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_out_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_observe_since = 0.0
+        self._fov_cz_last_arm_mono = 0.0
+        self._fov_cz_armed = False
+        self._fov_cz_ref_key: Optional[Tuple[int, int]] = None
+        self._fov_atom_um = {
+            "x": float(config.fov_atom_um_per_idx0),
+            "y": float(config.fov_atom_um_per_idx0),
+        }
         self._pwm_crit = PwmCritEstimator(pwm_cap=config.step_hinf_pwm_min)
         self._last_control_telemetry_epoch = 0
         self._actuator = HinfActuator(
@@ -147,40 +165,71 @@ class StepController:
         self._last_err_adc_y = 0.0
         self._hinf_state_a = HinfAxisState()
         self._hinf_state_b = HinfAxisState()
-        self._fov_settling_counter = 0
         self._fov_verify_started_mono = 0.0
-        self._fov_verify_log_counter = 0
         self._fov_verify_ticks = 0
+        self._fov_in_band_since_mono = 0.0
+        self._fov_retries = 0
         self._fov_active_axis = None
         self._fov_advance_axes = []
-        self._fov_advance_axis_idx = 0
-        self._fov_priority_settling = 0
-        self._fov_locked_axes = set()
         self._move_dir_x = 0
         self._move_dir_y = 0
         self._backlash_dx_um = 0.0
         self._backlash_dy_um = 0.0
-        self._kz_state_a = DiscreteKzState()
-        self._kz_state_b = DiscreteKzState()
-        self._fov_creep_cd_x = 0
-        self._fov_creep_cd_y = 0
+        self._fov_pulse = self._new_fov_pulse_state()
+        self._fov_brake_pending = False
+        self._fov_best_max_um = None
+        self._fov_frozen = False
+        self._fov_freeze_since_mono = 0.0
+        self._fov_pulse_count = 0
+        self._fov_pulses_since_improve = 0
+        self._fov_locked = {"x": False, "y": False}
+        self._fov_hard_lock = {"x": False, "y": False}
+        self._fov_axis_in_band_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_out_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_observe_since = 0.0
+        self._fov_cz_last_arm_mono = 0.0
+        self._fov_cz_armed = False
+        self._fov_cz_ref_key = None
+        self._fov_atom_um = {
+            "x": float(self.config.fov_atom_um_per_idx0),
+            "y": float(self.config.fov_atom_um_per_idx0),
+        }
         self._pwm_crit.reset()
         self._last_control_telemetry_epoch = 0
 
-    def _decay_fov_creep_cooldown(self) -> None:
-        if self._fov_creep_cd_x > 0:
-            self._fov_creep_cd_x -= 1
-        if self._fov_creep_cd_y > 0:
-            self._fov_creep_cd_y -= 1
+    def _new_fov_pulse_state(self) -> dict:
+        """Estado por eje: magnitud, signo aprendido, ganancia y reposo."""
+        return {
+            "x": self._fresh_fov_axis_pulse(),
+            "y": self._fresh_fov_axis_pulse(),
+        }
 
-    def _fov_creep_cooldown(self, axis: str) -> int:
-        return self._fov_creep_cd_x if axis == "x" else self._fov_creep_cd_y
+    def _fresh_fov_axis_pulse(self) -> dict:
+        # Timing del pulso en TIEMPO DE PARED (Fase 2.1): pstate ∈ idle|on|rest.
+        return {
+            "pstate": "idle",
+            "pulse_on_until": 0.0,
+            "rest_until": 0.0,
+            "pwm": self.config.fov_pwm_min,
+            "atom_idx": int(self.config.fov_atom_idx_min),
+            "pre_adc": None,
+            "pre_err": 0.0,
+            "pre_pwm": 0,
+            "sign": 0,
+            "gain": 0.0,
+            "overshoot_at_min": 0,
+            "hold_gate": False,
+        }
 
-    def _set_fov_creep_cooldown(self, axis: str, ticks: int) -> None:
-        if axis == "x":
-            self._fov_creep_cd_x = ticks
-        else:
-            self._fov_creep_cd_y = ticks
+    def _reset_fov_pulse_axis(self, axis: str) -> None:
+        # Conserva ganancia/hold/atom_idx; reinicia el ciclo de pulso (pstate→idle).
+        prev = self._fov_pulse.get(axis, {})
+        st = self._fresh_fov_axis_pulse()
+        st["gain"] = float(prev.get("gain", 0.0) or 0.0)
+        st["hold_gate"] = bool(prev.get("hold_gate"))
+        st["pwm"] = max(self.config.fov_pwm_min, int(prev.get("pwm", self.config.fov_pwm_min)))
+        st["atom_idx"] = int(prev.get("atom_idx", self.config.fov_atom_idx_min))
+        self._fov_pulse[axis] = st
 
     def _reset_control_telemetry_epoch(self) -> None:
         self._last_control_telemetry_epoch = 0
@@ -192,18 +241,6 @@ class StepController:
     def _fov_tol_um_axis(self, axis: str) -> float:
         """Tolerancia de cierre por eje — respeta ``tol_fov_um`` de configuración."""
         return max(self.config.tol_fov_um, self._sensor_lsb_um(axis))
-
-    def _fov_adc_tol_axis(self, axis: str) -> int:
-        """Cuentas ADC equivalentes a ``tol_fov_um`` (mínimo 1 LSB)."""
-        lsb = self._sensor_lsb_um(axis)
-        return max(1, int(math.ceil(self._fov_tol_um_axis(axis) / lsb)))
-
-    def _fov_adc_tol(self) -> int:
-        return max(self._fov_adc_tol_axis("x"), self._fov_adc_tol_axis("y"))
-
-    def _fov_actuator_deadzone_um(self) -> float:
-        """Deadzone actuador FOV = resolución cuantizada del peor eje."""
-        return max(self._sensor_lsb_um("x"), self._sensor_lsb_um("y"))
 
     def _consume_fresh_telemetry(self) -> bool:
         """
@@ -275,27 +312,32 @@ class StepController:
             axes = ["y", "x"] if self.config.axis_order.startswith("y") else ["x", "y"]
         return axes
 
-    def _fov_secondary_axis(self) -> str:
-        """Eje de ajuste fino tras completar avance (no alternar con eje principal)."""
-        order = self._fov_advance_axes
-        if len(order) == 1:
-            return "y" if order[0] == "x" else "x"
-        x0, y0 = self._nominal_prev_xy
-        dx = abs(self._nominal_xy[0] - x0)
-        dy = abs(self._nominal_xy[1] - y0)
-        dominant = "x" if dx >= dy else "y"
-        return "y" if dominant == "x" else "x"
-
     def _init_fov_advance_plan(self) -> None:
-        self._fov_advance_axes = self._compute_advance_axis_order()
-        self._fov_advance_axis_idx = 0
-        self._fov_priority_settling = 0
-        self._fov_locked_axes = set()
+        # Ambos ejes siempre disponibles: el residual de acoplamiento no respeta Δ nominal.
+        prefer = self._compute_advance_axis_order()
+        both = ["x", "y"]
+        ordered = [a for a in prefer if a in both]
+        for a in both:
+            if a not in ordered:
+                ordered.append(a)
+        self._fov_advance_axes = ordered
         self._fov_active_axis = None
-        self._kz_state_a = DiscreteKzState()
-        self._kz_state_b = DiscreteKzState()
-        self._fov_creep_cd_x = 0
-        self._fov_creep_cd_y = 0
+        self._fov_pulse = self._new_fov_pulse_state()
+        self._fov_brake_pending = False
+        self._fov_best_max_um = None
+        self._fov_frozen = False
+        self._fov_freeze_since_mono = 0.0
+        self._fov_pulse_count = 0
+        self._fov_pulses_since_improve = 0
+        self._fov_locked = {"x": False, "y": False}
+        self._fov_hard_lock = {"x": False, "y": False}
+        self._fov_axis_in_band_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_out_since = {"x": 0.0, "y": 0.0}
+        self._fov_gate_observe_since = 0.0
+        self._fov_atom_um = {
+            "x": float(self.config.fov_atom_um_per_idx0),
+            "y": float(self.config.fov_atom_um_per_idx0),
+        }
         if self._fov_advance_axes:
             self._set_fov_active_axis(self._fov_advance_axes[0])
 
@@ -303,6 +345,38 @@ class StepController:
         """Setpoint FOV con corrección de backlash según dirección nominal."""
         nx, ny = self._nominal_xy
         return nx + self._backlash_dx_um, ny + self._backlash_dy_um
+
+    def _arm_mcu_cz(self, force: bool = False) -> None:
+        """Activa C(z) una vez por punto (no spamear F: congela UI/serial)."""
+        ref_x, ref_y = self._fov_ref_um()
+        ref_adc_x = int(round(um_to_adc(ref_x, axis="x")))
+        ref_adc_y = int(round(um_to_adc(ref_y, axis="y")))
+        key = (ref_adc_x, ref_adc_y)
+        if (
+            not force
+            and self._fov_cz_armed
+            and getattr(self, "_fov_cz_ref_key", None) == key
+        ):
+            return
+        ctrl_a = self._get_controller_a()
+        ctrl_b = self._get_controller_b()
+        inv_x = bool(getattr(ctrl_a, "invert", False)) if ctrl_a else False
+        inv_y = bool(getattr(ctrl_b, "invert", False)) if ctrl_b else False
+        self._send_command(MotorProtocol.format_cz_invert(inv_x, inv_y))
+        self._send_command(MotorProtocol.format_cz_fine(ref_adc_x, ref_adc_y))
+        self._fov_cz_last_arm_mono = time.perf_counter()
+        self._fov_cz_armed = True
+        self._fov_cz_ref_key = key
+        logger.info(
+            "[StepController] Punto %d FOV_CZ_ARM ref_um=(%.1f,%.1f) ref_adc=(%d,%d) inv=(%d,%d)",
+            self._point_index + 1,
+            ref_x,
+            ref_y,
+            ref_adc_x,
+            ref_adc_y,
+            int(inv_x),
+            int(inv_y),
+        )
 
     def _read_fov_error_adc(self) -> Tuple[int, int, float, float, float, float]:
         """
@@ -327,105 +401,90 @@ class StepController:
         err_traj_y = ref_y - actual[1]
         return err_adc_x, err_adc_y, err_ctrl_x, err_ctrl_y, err_traj_x, err_traj_y
 
-    def _fov_move_dir(self, axis: str) -> int:
-        return self._move_dir_x if axis == "x" else self._move_dir_y
-
-    def _fov_approach_allows_pwm(self, axis: str, err_traj_um: float) -> bool:
-        """Solo actuar desde el lado de avance; eje LOCKED nunca PWM."""
-        if axis in self._fov_locked_axes:
-            return False
-        tol = self._fov_tol_um_axis(axis)
-        move_dir = self._fov_move_dir(axis)
-        if move_dir > 0:
-            return err_traj_um > tol
-        if move_dir < 0:
-            return err_traj_um < -tol
-        return abs(err_traj_um) > tol
-
-    def _fov_can_lock_from_approach(self, axis: str, err_adc: int, err_traj_um: float) -> bool:
-        """True si dentro de tol configurada y sin cruce de setpoint."""
-        tol_um = self._fov_tol_um_axis(axis)
-        if abs(err_traj_um) > tol_um:
-            return False
-        if abs(err_adc) > self._fov_adc_tol_axis(axis):
-            return False
-        move_dir = self._fov_move_dir(axis)
-        if move_dir > 0 and err_traj_um < 0:
-            return False
-        if move_dir < 0 and err_traj_um > 0:
-            return False
-        return True
-
-    def _lock_fov_axis(self, axis: str, err_adc: int) -> None:
-        """Marca eje como LOCKED — PWM=0 permanente hasta POINT_COMPLETE."""
-        if axis in self._fov_locked_axes:
-            return
-        self._fov_locked_axes.add(axis)
-        logger.info(
-            "[StepController] LOCK %s adc_err=%+d dir=%+d (sin re-actuación)",
-            axis.upper(),
-            err_adc,
-            self._fov_move_dir(axis),
-        )
-
-    def _current_fov_priority_axis(self) -> Optional[str]:
-        if self._fov_advance_axis_idx >= len(self._fov_advance_axes):
-            return None
-        return self._fov_advance_axes[self._fov_advance_axis_idx]
-
-    def _update_fov_priority_handoff(
-        self,
-        err_adc_x: int,
-        err_adc_y: int,
-        err_traj_x: float,
-        err_traj_y: float,
-    ) -> None:
-        """Avanza al siguiente eje cuando el actual cumple 1 LSB desde lado de avance."""
-        axis = self._current_fov_priority_axis()
-        if axis is None:
-            return
-        err_adc = err_adc_x if axis == "x" else err_adc_y
-        err_traj = err_traj_x if axis == "x" else err_traj_y
-        if self._fov_can_lock_from_approach(axis, err_adc, err_traj):
-            self._fov_priority_settling += 1
-            if self._fov_priority_settling >= SETTLING_CYCLES:
-                self._lock_fov_axis(axis, err_adc)
-                self._fov_advance_axis_idx += 1
-                self._fov_priority_settling = 0
-                nxt = self._current_fov_priority_axis()
-                if nxt is not None:
-                    self._set_fov_active_axis(nxt)
-        else:
-            self._fov_priority_settling = 0
-
     def _active_fov_correction_axis(
         self,
         err_adc_x: int,
         err_adc_y: int,
         err_traj_x: float,
         err_traj_y: float,
-    ) -> str:
+    ) -> Optional[str]:
+        """Un eje activo; el otro queda bloqueado (PWM=0).
+
+        Se mantiene el eje activo hasta encerrarlo en banda (settle) → lock.
+        Si |err| ≤ gate (paso mínimo > residual útil) → hard-lock sin pulsar.
         """
-        Avance nominal → LOCK por eje.
+        now = time.perf_counter()
+        errs = {"x": err_traj_x, "y": err_traj_y}
+        for axis in ("x", "y"):
+            err = errs[axis]
+            gate = self._fov_gate_um(axis)
+            in_tol = abs(err) <= self._fov_tol_um_axis(axis)
+            in_gate = abs(err) <= gate
 
-        Ejes LOCKED nunca vuelven a PWM. Sin recuperación de margen post-lock.
-        """
-        self._update_fov_priority_handoff(
-            err_adc_x, err_adc_y, err_traj_x, err_traj_y
-        )
-        priority = self._current_fov_priority_axis()
-        if priority is not None and priority not in self._fov_locked_axes:
-            err_traj = err_traj_x if priority == "x" else err_traj_y
-            if self._fov_approach_allows_pwm(priority, err_traj):
-                return priority
+            # Bajo el gate: soft-lock. Reapertura con histéresis temporal (acoplamiento).
+            if in_gate:
+                self._fov_gate_out_since[axis] = 0.0
+                if not self._fov_locked[axis]:
+                    self._fov_locked[axis] = True
+                    self._fov_pulse[axis]["hold_gate"] = True
+                    logger.info(
+                        "[StepController] FOV_GATE_LOCK punto %d eje %s err=%.1fµm gate=%.1fµm",
+                        self._point_index + 1,
+                        axis.upper(),
+                        err,
+                        gate,
+                    )
+            elif self._fov_locked[axis] and not self._fov_hard_lock[axis]:
+                if self._fov_gate_out_since[axis] <= 0.0:
+                    self._fov_gate_out_since[axis] = now
+                out_ms = (now - self._fov_gate_out_since[axis]) * 1000.0
+                if out_ms >= self.config.fov_gate_unlock_hold_ms:
+                    self._fov_locked[axis] = False
+                    self._fov_pulse[axis]["hold_gate"] = False
+                    self._fov_gate_out_since[axis] = 0.0
+                    logger.info(
+                        "[StepController] FOV_GATE_UNLOCK punto %d eje %s err=%.1fµm "
+                        "gate=%.1fµm held_out=%.0fms",
+                        self._point_index + 1,
+                        axis.upper(),
+                        err,
+                        gate,
+                        out_ms,
+                    )
 
-        secondary = self._fov_secondary_axis()
-        if secondary not in self._fov_locked_axes:
-            err_traj = err_traj_x if secondary == "x" else err_traj_y
-            if self._fov_approach_allows_pwm(secondary, err_traj):
-                return secondary
+            if in_tol:
+                if self._fov_axis_in_band_since[axis] <= 0.0:
+                    self._fov_axis_in_band_since[axis] = now
+                held_ms = (now - self._fov_axis_in_band_since[axis]) * 1000.0
+                if held_ms >= self.config.fov_axis_settle_ms and not self._fov_locked[axis]:
+                    self._fov_locked[axis] = True
+                    logger.info(
+                        "[StepController] FOV_LOCK punto %d eje %s err=%.1fµm held=%.0fms",
+                        self._point_index + 1,
+                        axis.upper(),
+                        err,
+                        held_ms,
+                    )
+            else:
+                self._fov_axis_in_band_since[axis] = 0.0
+                if self._fov_locked[axis] and not self._fov_hard_lock[axis] and not in_gate:
+                    # Ya manejado por GATE_UNLOCK arriba si salió del gate.
+                    pass
 
-        return secondary
+        cur = self._fov_active_axis
+        if cur is not None and not self._fov_locked.get(cur, False):
+            if abs(errs[cur]) > self._fov_gate_um(cur):
+                return cur
+
+        candidates = [
+            a
+            for a in self._fov_advance_axes
+            if not self._fov_locked[a] and abs(errs[a]) > self._fov_gate_um(a)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda a: abs(errs[a]), reverse=True)
+        return candidates[0]
 
     def prepare_transition(
         self,
@@ -457,6 +516,7 @@ class StepController:
             self._move_dir_y = 0 if abs(dy_nom) < 1.0 else (1 if dy_nom > 0 else -1)
         self._backlash_dx_um = backlash_dx_um
         self._backlash_dy_um = backlash_dy_um
+        self._fov_retries = 0
         self._reset_control_telemetry_epoch()
         self._queue = decompose_transition(prev_xy, next_xy, self.config, backlash_x_um)
         for i, step in enumerate(self._queue):
@@ -596,13 +656,18 @@ class StepController:
             self._band_latched = True
         return self._band_latched
 
+    def _park_motors(self) -> None:
+        """Único parking host: freno + AUTO 0 (también mata C(z) en FW)."""
+        self._cz_soft_off()
+        self._send_command("B")
+        self._send_command("A,0,0")
+
     def _hold_position(self, force: bool = False) -> None:
         now = time.perf_counter()
         if not force and (now - self._last_hold_sent_mono) < (self.config.hold_resend_ms / 1000.0):
             return
         self._last_hold_sent_mono = now
-        self._send_command("B")
-        self._send_command("A,0,0")
+        self._park_motors()
 
     def _pi_gain_scale(self, error_um: float) -> Tuple[float, float]:
         """Escala Kp/Ki solo si step_use_full_hinf_gains=false (tuning legacy)."""
@@ -815,12 +880,9 @@ class StepController:
     def _set_fov_active_axis(self, axis: str) -> None:
         if axis == self._fov_active_axis:
             return
-        if axis == "x":
-            self._kz_state_a = DiscreteKzState()
-            self._fov_creep_cd_x = 0
-        else:
-            self._kz_state_b = DiscreteKzState()
-            self._fov_creep_cd_y = 0
+        self._reset_fov_pulse_axis(axis)
+        self._fov_brake_pending = False
+        self._fov_pulses_since_improve = 0
         self._fov_active_axis = axis
 
     def _dual_axis_mode(self) -> str:
@@ -829,92 +891,200 @@ class StepController:
             return "primary_only"
         return self.config.step_dual_axis_mode
 
-    def _fov_pwm_pulse(
-        self, axis: str, err_ctrl_um: float, ctrl: ControllerConfig
-    ) -> int:
-        """Un pulso creep: signo de K(z), magnitud TF o piso crítico aprendido."""
-        pwm, _, _ = step_pi_kz(
-            err_ctrl_um,
-            DiscreteKzState(),
-            ctrl,
-            deadzone_um=0.0,
-            pwm_min=0,
-            use_integral=False,
+    def _fov_nominal_pwm_sign(self, err_ctrl_um: float, ctrl: ControllerConfig) -> int:
+        """Signo nominal H∞ (respeta ``invert``). Se sobreescribe si la planta aprende lo contrario."""
+        if err_ctrl_um == 0:
+            return 0
+        d = 1 if err_ctrl_um > 0 else -1
+        return -d if ctrl.invert else d
+
+    def _fov_pulse_direction(self, axis: str, err_ctrl_um: float, ctrl: ControllerConfig) -> int:
+        """Solo polaridad H∞ (invert). SIGNFLIP desactivado: el log mostró flips espurios por costa/backlash."""
+        return self._fov_nominal_pwm_sign(err_ctrl_um, ctrl)
+
+    def _fov_gate_um(self, axis: str) -> float:
+        """Umbral bajo el cual un pulso mínimo empeora más de lo que corrige."""
+        return max(self.config.fov_pulse_gate_um, self._fov_tol_um_axis(axis))
+
+    def _measure_and_adapt_pulse(
+        self, axis: str, adc_now: Optional[int], err_traj_now: float
+    ) -> None:
+        """Evalúa el pulso: adapta magnitud/idx; congela eje si ya está dentro del gate."""
+        st = self._fov_pulse[axis]
+        pre_adc = st["pre_adc"]
+        if pre_adc is None or adc_now is None:
+            return
+        moved = int(adc_now) - int(pre_adc)
+        moved_abs = abs(moved)
+        pre_err = float(st["pre_err"])
+        pre_pwm = int(st.get("pre_pwm", 0) or 0)
+        pre_idx = int(st.get("atom_idx", self.config.fov_atom_idx_min))
+        overshoot = (pre_err * err_traj_now < 0) and (
+            abs(err_traj_now) > self._fov_tol_um_axis(axis)
         )
-        return self._pwm_crit.apply_floor(axis, pwm)
+        worsened = abs(err_traj_now) > abs(pre_err) + 0.5 and (pre_err * err_traj_now > 0)
+        improved = abs(err_traj_now) < abs(pre_err) - 0.5
+        gate = self._fov_gate_um(axis)
+        use_atom = bool(self.config.use_mcu_atom_pulse)
+        imin = max(0, int(self.config.fov_atom_idx_min))
+        imax = max(imin, int(self.config.fov_atom_idx_max))
 
-    def _run_kz_closure(
-        self,
-        active_axis: str,
-        Ts: float = CONTROL_TS_S,
-        *,
-        use_integral: bool = False,
-    ) -> Tuple[int, int, float, float]:
-        """Cierre setpoint con K(z) @ 10 ms — magnitud solo TF (+ piso aprendido)."""
-        ctrl_a = self._get_controller_a()
-        ctrl_b = self._get_controller_b()
-        deadzone = self._fov_actuator_deadzone_um()
+        if moved_abs > 0 and abs(pre_pwm) > 0:
+            g = moved_abs / float(abs(pre_pwm))
+            st["gain"] = g if st["gain"] <= 0 else (0.7 * st["gain"] + 0.3 * g)
 
-        err_adc_x, err_adc_y, err_ctrl_x, err_ctrl_y, _, _ = self._read_fov_error_adc()
-        err_adc = err_adc_x if active_axis == "x" else err_adc_y
-        err_ctrl = err_ctrl_x if active_axis == "x" else err_ctrl_y
+        # Aprende µm por átomo idx0 (escala ~1.4^idx) — puente H∞-µm ↔ LUT.
+        if use_atom and moved_abs > 0:
+            slope = self._sensor_lsb_um(axis)
+            scale = 1.4 ** max(0, pre_idx)
+            um_eq = (moved_abs * slope) / scale
+            prev = float(self._fov_atom_um.get(axis, self.config.fov_atom_um_per_idx0))
+            self._fov_atom_um[axis] = 0.7 * prev + 0.3 * max(2.0, min(80.0, um_eq))
 
-        pwm_a, pwm_b = 0, 0
-        creep_adc = self.config.fov_creep_adc
+        target = self.config.fov_target_step_adc
+        max_step = self.config.fov_max_step_adc
+        adapted = False
 
-        if abs(err_adc) <= self._fov_adc_tol():
-            return 0, 0, err_ctrl_x, err_ctrl_y
-
-        if self._fov_creep_cooldown(active_axis) > 0:
-            return 0, 0, err_ctrl_x, err_ctrl_y
-
-        if abs(err_adc) <= creep_adc:
-            ctrl = ctrl_a if active_axis == "x" else ctrl_b
-            if ctrl is None:
-                return 0, 0, err_ctrl_x, err_ctrl_y
-            pulse = self._fov_pwm_pulse(active_axis, err_ctrl, ctrl)
-            if pulse != 0:
-                self._set_fov_creep_cooldown(
-                    active_axis, self.config.fov_creep_cooldown_ticks
-                )
-                if active_axis == "x":
-                    pwm_a = pulse
+        if use_atom:
+            # Adapta índice LUT (no la escalera pwm 22..45 que dejaba idx fijo=2).
+            idx = pre_idx
+            if moved_abs == 0 or (not improved and not overshoot and moved_abs < 2):
+                idx = min(imax, idx + 1)
+                adapted = True
+                st["overshoot_at_min"] = 0
+            elif overshoot or moved_abs > max_step:
+                idx = max(imin, idx - 1)
+                adapted = True
+                if overshoot and idx <= imin:
+                    st["overshoot_at_min"] = int(st.get("overshoot_at_min", 0) or 0) + 1
                 else:
-                    pwm_b = pulse
-            return pwm_a, pwm_b, err_ctrl_x, err_ctrl_y
-
-        if active_axis == "x" and ctrl_a is not None:
-            pwm_a, self._kz_state_a, err_ctrl_x = step_pi_kz(
-                err_ctrl_x,
-                self._kz_state_a,
-                ctrl_a,
-                deadzone_um=deadzone,
-                pwm_min=0,
-                use_integral=use_integral,
-                Ts=Ts,
+                    st["overshoot_at_min"] = 0
+            else:
+                st["overshoot_at_min"] = 0
+            st["atom_idx"] = idx
+        elif moved_abs == 0:
+            st["pwm"] = min(self.config.fov_pwm_cap, st["pwm"] + self.config.fov_pwm_step)
+            adapted = True
+            st["overshoot_at_min"] = 0
+        elif overshoot or moved_abs > max_step:
+            scale = target / max(moved_abs, 1)
+            new_pwm = int(round(st["pwm"] * scale))
+            st["pwm"] = max(self.config.fov_pwm_min, min(self.config.fov_pwm_cap, new_pwm))
+            adapted = True
+            if overshoot and st["pwm"] <= self.config.fov_pwm_min:
+                st["overshoot_at_min"] = int(st.get("overshoot_at_min", 0) or 0) + 1
+            else:
+                st["overshoot_at_min"] = 0
+        elif st["gain"] > 0:
+            desired = max(
+                1,
+                min(max_step, int(round(abs(err_traj_now) / self._sensor_lsb_um(axis)))),
             )
-            pwm_a = self._pwm_crit.apply_floor("x", pwm_a)
-        elif active_axis == "y" and ctrl_b is not None:
-            pwm_b, self._kz_state_b, err_ctrl_y = step_pi_kz(
-                err_ctrl_y,
-                self._kz_state_b,
-                ctrl_b,
-                deadzone_um=deadzone,
-                pwm_min=0,
-                use_integral=use_integral,
-                Ts=Ts,
-            )
-            pwm_b = self._pwm_crit.apply_floor("y", pwm_b)
+            new_pwm = int(round(desired / st["gain"]))
+            st["pwm"] = max(self.config.fov_pwm_min, min(self.config.fov_pwm_cap, new_pwm))
+            adapted = True
+            st["overshoot_at_min"] = 0
+        else:
+            st["overshoot_at_min"] = 0
 
-        return pwm_a, pwm_b, err_ctrl_x, err_ctrl_y
+        # Dentro del gate → no tiene sentido otro pulso (paso mín. >> residual).
+        if abs(err_traj_now) <= gate:
+            st["hold_gate"] = True
+            st["overshoot_at_min"] = 0
 
-    def _run_hinf_to_nominal(self, Ts: float, *, active_axis: str) -> Tuple[int, int, float, float]:
-        """FOV_VERIFY: K(z) + creep; sin Ki."""
-        return self._run_kz_closure(active_axis, Ts=CONTROL_TS_S, use_integral=False)
+        # Spoil tras haber alcanzado tol_fov: congelar eje (log 15:04 best=1–3 µm luego spoil).
+        tol = self._fov_tol_um_axis(axis)
+        if (
+            self._fov_best_max_um is not None
+            and self._fov_best_max_um <= tol
+            and abs(err_traj_now) > tol
+            and (worsened or overshoot)
+        ):
+            st["hold_gate"] = True
+        elif (
+            self._fov_best_max_um is not None
+            and self._fov_best_max_um <= gate
+            and max(abs(err_traj_now), abs(pre_err)) > self._fov_best_max_um * 2.0
+            and worsened
+        ):
+            st["hold_gate"] = True
 
-    def _read_fov_residual_um(self) -> Tuple[float, float]:
-        _, _, _, _, err_traj_x, err_traj_y = self._read_fov_error_adc()
-        return err_traj_x, err_traj_y
+        if improved or adapted:
+            self._fov_pulses_since_improve = 0
+        else:
+            self._fov_pulses_since_improve += 1
+
+        logger.info(
+            "[StepController] FOV_PULSE punto %d eje %s pwm=%+d idx=%d moved_adc=%+d "
+            "err=%.1f→%.1fµm overshoot=%s worsened=%s stall=%d pwm_next=%d idx_next=%d "
+            "gain=%.3f ovr_min=%d hold=%d gate=%.1f",
+            self._point_index + 1,
+            axis.upper(),
+            pre_pwm,
+            pre_idx,
+            moved,
+            pre_err,
+            err_traj_now,
+            overshoot,
+            worsened,
+            self._fov_pulses_since_improve,
+            st["pwm"],
+            int(st.get("atom_idx", pre_idx)),
+            float(st.get("gain", 0.0) or 0.0),
+            int(st.get("overshoot_at_min", 0) or 0),
+            int(bool(st.get("hold_gate"))),
+            gate,
+        )
+        st["pre_adc"] = None
+        st["pre_pwm"] = 0
+
+    def _bump_fov_pulse_pwm(self, axis: str) -> None:
+        st = self._fov_pulse[axis]
+        st["pwm"] = min(self.config.fov_pwm_cap, st["pwm"] + self.config.fov_pwm_step)
+        st["atom_idx"] = min(
+            int(self.config.fov_atom_idx_max),
+            int(st.get("atom_idx", self.config.fov_atom_idx_min)) + 1,
+        )
+
+    def _fov_atom_idx_for_error(self, axis: str, err_um: float) -> int:
+        """Índice LUT desde Δµm deseado (paradigma H∞ en µm → átomo MCU).
+
+        H∞ ya expresa el error en µm; aquí no se re-sintetiza con W1 (Ms/wb),
+        se cuantiza la corrección pedida a 1..N átomos calibrados.
+        """
+        e = abs(float(err_um))
+        imin = max(0, int(self.config.fov_atom_idx_min))
+        imax = max(imin, int(self.config.fov_atom_idx_max))
+        um0 = max(2.0, float(self._fov_atom_um.get(axis, self.config.fov_atom_um_per_idx0)))
+        # nº de átomos idx0 equivalentes; cada +1 idx ≈ ×1.4 energía.
+        n = e / um0
+        if n <= 1.15:
+            sug = imin
+        elif n <= 2.2:
+            sug = imin + 1
+        else:
+            sug = imax
+        return max(imin, min(imax, sug))
+
+    def _fov_atom_idx(self, st: dict, err_um: float = 0.0, axis: str = "x") -> int:
+        """Combina Δµm→idx + bump en stall; respeta freeze-after-best."""
+        imin = max(0, int(self.config.fov_atom_idx_min))
+        imax = max(imin, int(self.config.fov_atom_idx_max))
+        if (
+            self.config.fov_freeze_after_best
+            and self._fov_best_max_um is not None
+            and self._fov_best_max_um <= self.config.tol_fov_um
+        ):
+            return imin
+        sug = self._fov_atom_idx_for_error(axis, err_um)
+        learned = max(imin, min(imax, int(st.get("atom_idx", sug))))
+        if self._fov_pulses_since_improve >= 2:
+            idx = max(sug, learned)
+        elif int(st.get("overshoot_at_min", 0) or 0) > 0:
+            idx = min(sug, learned)
+        else:
+            idx = sug
+        return max(imin, min(imax, idx))
 
     def _in_fov_band(self, err_adc_x: int, err_adc_y: int, err_traj_x: float, err_traj_y: float) -> bool:
         """Dentro de margen FOV — criterio único en µm (``tol_fov_um``)."""
@@ -945,23 +1115,13 @@ class StepController:
         """Tolerancia de handoff (peor eje)."""
         return max(self._fov_tol_um_axis("x"), self._fov_tol_um_axis("y"))
 
-    def _apply_fov_verify_actuator(self) -> None:
-        """Deadzone FOV = 1 LSB; magnitud PWM solo K(z) + piso aprendido."""
-        self._actuator.config = HinfActuatorConfig(
-            deadzone_um=self._fov_actuator_deadzone_um(),
-            pwm_min=0,
-            use_integral=self.config.step_use_integral,
-        )
-
     def _begin_fov_verify(self) -> None:
         self.phase = StepControllerPhase.FOV_VERIFY
-        self._fov_settling_counter = 0
+        self._fov_in_band_since_mono = 0.0
         self._fov_verify_ticks = 0
-        self._fov_verify_log_counter = 0
         self._fov_verify_started_mono = time.perf_counter()
         self._last_time = time.time()
         self._reset_control_telemetry_epoch()
-        self._apply_fov_verify_actuator()
         self._init_fov_advance_plan()
         err_adc_x, err_adc_y, err_ctrl_x, err_ctrl_y, err_traj_x, err_traj_y = (
             self._read_fov_error_adc()
@@ -971,7 +1131,7 @@ class StepController:
         logger.info(
             "[StepController] Punto %d FOV_VERIFY ref=(%.1f, %.1f) backlash=(%.1f, %.1f) "
             "residual_adc=(%+d, %+d) residual_traj=(%.1f, %.1f)µm tol_fov=%.1f avance=%s "
-            "dir=(%+d,%+d) eje=%s",
+            "dir=(%+d,%+d) eje=%s cz=%s",
             self._point_index + 1,
             ref_x,
             ref_y,
@@ -986,84 +1146,465 @@ class StepController:
             self._move_dir_x,
             self._move_dir_y,
             (self._fov_active_axis or "?").upper(),
+            bool(self.config.use_mcu_cz_loop),
         )
+        if self.config.use_mcu_cz_loop:
+            self._fov_cz_armed = False
+            self._fov_cz_ref_key = None
+            self._arm_mcu_cz(force=True)
+
+    def _fov_settle_progress(self, settle_ms: float) -> int:
+        """Progreso de asentamiento 0..SETTLING_CYCLES para feedback de UI."""
+        if self.config.fov_settle_ms <= 0:
+            return SETTLING_CYCLES
+        frac = settle_ms / self.config.fov_settle_ms
+        return int(max(0, min(SETTLING_CYCLES, round(frac * SETTLING_CYCLES))))
+
+    def _accept_fov_best_effort(
+        self, out: StepTickOutput, reason: str, err_traj_x: float, err_traj_y: float
+    ) -> StepTickOutput:
+        """Acepta el residual actual, lo registra y deja avanzar la trayectoria."""
+        logger.warning(
+            "[StepController] Punto %d FOV %s residual=(%.1f,%.1f)µm mejor=%.1fµm "
+            "pulses=%d locks=(X=%s,Y=%s) → acepta y avanza",
+            self._point_index + 1,
+            reason,
+            err_traj_x,
+            err_traj_y,
+            self._fov_best_max_um if self._fov_best_max_um is not None else -1.0,
+            self._fov_pulse_count,
+            self._fov_locked["x"],
+            self._fov_locked["y"],
+        )
+        self._park_motors()
+        self._finish_point()
+        out.phase = StepControllerPhase.POINT_COMPLETE
+        out.point_complete = True
+        return out
+
+    def _handle_fov_timeout(
+        self, err_traj_x: float, err_traj_y: float, out: StepTickOutput
+    ) -> StepTickOutput:
+        """Timeout FOV: un reintento opcional desde posición real; si no, acepta error."""
+        if self._fov_retries < self.config.fov_verify_max_retries:
+            self._fov_retries += 1
+            logger.warning(
+                "[StepController] Punto %d FOV_VERIFY timeout (%.0fms) residual=(%.1f,%.1f)µm "
+                "→ reintento %d/%d",
+                self._point_index + 1,
+                self.config.fov_verify_timeout_ms,
+                err_traj_x,
+                err_traj_y,
+                self._fov_retries,
+                self.config.fov_verify_max_retries,
+            )
+            self._park_motors()
+            self._sync_actuator_config()
+            actual = self.read_current_xy_um(
+                self._get_controller_a(), self._get_controller_b()
+            )
+            self._queue = decompose_transition(actual, self._nominal_xy, self.config, 0.0)
+            for step in self._queue:
+                step.transition_index = self._point_index
+            self._queue_index = 0
+            if self._queue:
+                self._begin_current_step()
+            else:
+                self._begin_fov_verify()
+            out.phase = self.phase
+            return out
+
+        return self._accept_fov_best_effort(
+            out, "timeout/límite", err_traj_x, err_traj_y
+        )
+
+    def _update_fov_best_residual(self, err_traj_x: float, err_traj_y: float) -> None:
+        cur = max(abs(err_traj_x), abs(err_traj_y))
+        if self._fov_best_max_um is None or cur < self._fov_best_max_um:
+            self._fov_best_max_um = cur
+        # FREEZE host-atom only. Con C(z): freeze+MCU activo = LOCK falso + spoil (log 16:17).
+        if self.config.use_mcu_cz_loop:
+            return
+        if (
+            self.config.fov_freeze_after_best
+            and self._fov_best_max_um is not None
+            and self._fov_best_max_um <= self.config.tol_fov_um
+        ):
+            if not self._fov_frozen:
+                self._fov_freeze_since_mono = time.perf_counter()
+                self._fov_gate_observe_since = 0.0
+                logger.info(
+                    "[StepController] Punto %d FOV_FREEZE_LATCH best=%.1fµm",
+                    self._point_index + 1,
+                    self._fov_best_max_um,
+                )
+            self._fov_frozen = True
+
+    def _cz_soft_off(self) -> None:
+        """Apaga C(z) sin freno B (evita jerk/spoil)."""
+        if self._fov_cz_armed:
+            self._send_command(MotorProtocol.format_cz_off())
+            self._fov_cz_armed = False
+
+    def _tick_fov_verify_cz(
+        self,
+        out: StepTickOutput,
+        err_adc_x: int,
+        err_adc_y: int,
+        err_traj_x: float,
+        err_traj_y: float,
+    ) -> StepTickOutput:
+        """FOV + C(z): MCU corrige; host solo settle. Sin LOCK hasta hold real."""
+        now = time.perf_counter()
+        cur = max(abs(err_traj_x), abs(err_traj_y))
+        out.pwm_a, out.pwm_b = 0, 0
+        out.lock_x = False
+        out.lock_y = False
+
+        in_band = self._in_fov_band(err_adc_x, err_adc_y, err_traj_x, err_traj_y)
+        ctrl_a = self._get_controller_a()
+        ctrl_b = self._get_controller_b()
+        max_age = self.config.sensor_control_max_age_ms
+        sensors_ok = bool(
+            ctrl_a
+            and ctrl_b
+            and self.sensor_buffer.is_fresh(ctrl_a.sensor_key, max_age)
+            and self.sensor_buffer.is_fresh(ctrl_b.sensor_key, max_age)
+        )
+
+        if in_band and sensors_ok:
+            # Entró en banda → un solo N, luego observar (LOCK = hold real).
+            if self._fov_cz_armed:
+                self._cz_soft_off()
+                logger.info(
+                    "[StepController] Punto %d FOV_CZ_INBAND residual=(%.1f,%.1f)µm → N/hold",
+                    self._point_index + 1,
+                    err_traj_x,
+                    err_traj_y,
+                )
+            out.lock_x = True
+            out.lock_y = True
+            if self._fov_in_band_since_mono <= 0.0:
+                self._fov_in_band_since_mono = now
+            settle_ms = (now - self._fov_in_band_since_mono) * 1000.0
+            out.settling = self._fov_settle_progress(settle_ms)
+            if settle_ms >= self.config.fov_settle_ms:
+                self._finish_point()
+                out.phase = StepControllerPhase.POINT_COMPLETE
+                out.point_complete = True
+                logger.info(
+                    "[StepController] Punto %d FOV_CZ_OK residual=(%.1f,%.1f)µm best=%.1fµm",
+                    self._point_index + 1,
+                    err_traj_x,
+                    err_traj_y,
+                    self._fov_best_max_um if self._fov_best_max_um is not None else -1.0,
+                )
+            return out
+
+        # Spoil tras hold: rearmar C(z) (máx ~2 Hz; no spam F).
+        if (
+            not self._fov_cz_armed
+            and cur > self.config.tol_fov_um * 1.5
+            and (now - float(self._fov_cz_last_arm_mono or 0.0)) >= 0.5
+        ):
+            self._fov_in_band_since_mono = 0.0
+            self._arm_mcu_cz(force=True)
+            logger.info(
+                "[StepController] Punto %d FOV_CZ_REARM residual=(%.1f,%.1f)µm",
+                self._point_index + 1,
+                err_traj_x,
+                err_traj_y,
+            )
+
+        self._fov_in_band_since_mono = 0.0
+        out.settling = 0
+        elapsed_ms = (now - self._fov_verify_started_mono) * 1000.0
+        if elapsed_ms >= self.config.fov_verify_timeout_ms:
+            self._cz_soft_off()
+            return self._handle_fov_timeout(err_traj_x, err_traj_y, out)
+        return out
 
     def _tick_fov_verify(self) -> StepTickOutput:
         out = StepTickOutput(phase=StepControllerPhase.FOV_VERIFY)
         out.feedback_target_x, out.feedback_target_y = self._fov_ref_um()
         self._fov_verify_ticks += 1
-        self._decay_fov_creep_cooldown()
 
         err_adc_x, err_adc_y, err_ctrl_x, err_ctrl_y, err_traj_x, err_traj_y = (
             self._read_fov_error_adc()
         )
         out.error_x_um, out.error_y_um = err_traj_x, err_traj_y
+        self._update_fov_best_residual(err_traj_x, err_traj_y)
+        now = time.perf_counter()
+        cur = max(abs(err_traj_x), abs(err_traj_y))
 
-        if self._in_fov_band(err_adc_x, err_adc_y, err_traj_x, err_traj_y):
-            if self._fov_sensors_ready():
-                self._fov_settling_counter += 1
-                out.settling = self._fov_settling_counter
-                out.pwm_a, out.pwm_b = 0, 0
-                self._send_command("A,0,0")
-                if self._fov_settling_counter >= SETTLING_CYCLES:
+        # Canónico: C(z) MCU — no entrar al árbol host atom/PWM/freeze/lock.
+        if self.config.use_mcu_cz_loop:
+            return self._tick_fov_verify_cz(
+                out, err_adc_x, err_adc_y, err_traj_x, err_traj_y
+            )
+
+        # --- Fallback host (atom P o A,pwm) — solo si use_mcu_cz_loop=False ---
+        # Latch: best≤tol → solo observar (reloj propio desde FREEZE_LATCH).
+        if self._fov_frozen and not self._in_fov_band(
+            err_adc_x, err_adc_y, err_traj_x, err_traj_y
+        ):
+            out.lock_x = True
+            out.lock_y = True
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            for ax in ("x", "y"):
+                st = self._fov_pulse[ax]
+                if st.get("pstate") != "idle":
+                    st["pstate"] = "idle"
+                    st["pre_adc"] = None
+            if self._fov_freeze_since_mono <= 0.0:
+                self._fov_freeze_since_mono = now
+            observe_ms = (now - self._fov_freeze_since_mono) * 1000.0
+            if self._fov_gate_observe_since <= 0.0:
+                self._fov_gate_observe_since = now
+                logger.info(
+                    "[StepController] Punto %d FOV_FREEZE_BEST best=%.1fµm cur=%.1fµm → observe",
+                    self._point_index + 1,
+                    self._fov_best_max_um if self._fov_best_max_um is not None else -1.0,
+                    cur,
+                )
+            out.settling = self._fov_settle_progress(observe_ms)
+            if observe_ms >= self.config.fov_settle_ms:
+                if cur <= self.config.tol_fov_um:
                     self._finish_point()
                     out.phase = StepControllerPhase.POINT_COMPLETE
                     out.point_complete = True
-            else:
-                out.settling = self._fov_settling_counter
+                    return out
+                return self._accept_fov_best_effort(
+                    out, "freeze_best", err_traj_x, err_traj_y
+                )
             return out
 
-        if not self._consume_fresh_telemetry():
-            out.settling = self._fov_settling_counter
+        # Completado: ambos ejes en banda el tiempo de settle global.
+        if self._in_fov_band(err_adc_x, err_adc_y, err_traj_x, err_traj_y) and (
+            self._fov_sensors_ready()
+        ):
+            if self._fov_in_band_since_mono <= 0.0:
+                self._fov_in_band_since_mono = now
+            settle_ms = (now - self._fov_in_band_since_mono) * 1000.0
+            out.settling = self._fov_settle_progress(settle_ms)
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            if settle_ms >= self.config.fov_settle_ms:
+                self._finish_point()
+                out.phase = StepControllerPhase.POINT_COMPLETE
+                out.point_complete = True
             return out
 
-        self._last_time = time.time()
-
-        self._fov_settling_counter = 0
+        self._fov_in_band_since_mono = 0.0
         out.settling = 0
+
+        elapsed_ms = (now - self._fov_verify_started_mono) * 1000.0
+        if elapsed_ms >= self.config.fov_verify_timeout_ms:
+            return self._handle_fov_timeout(err_traj_x, err_traj_y, out)
+        if self._fov_pulse_count >= self.config.fov_max_pulses_per_point:
+            return self._accept_fov_best_effort(
+                out, "max_pulses", err_traj_x, err_traj_y
+            )
+
         active = self._active_fov_correction_axis(
             err_adc_x, err_adc_y, err_traj_x, err_traj_y
         )
-        self._set_fov_active_axis(active)
-        out.lock_x = active == "y" or "x" in self._fov_locked_axes
-        out.lock_y = active == "x" or "y" in self._fov_locked_axes
-
-        err_traj = err_traj_x if active == "x" else err_traj_y
-        if active in self._fov_locked_axes or not self._fov_approach_allows_pwm(
-            active, err_traj
-        ):
+        if active is None:
+            # Ambos bajo gate o en banda: OBSERVAR (no aceptar al instante).
+            # El log mostró aceptación a 21ms sobre muestras transitorias.
+            out.lock_x = True
+            out.lock_y = True
             out.pwm_a, out.pwm_b = 0, 0
             self._send_command("A,0,0")
-        else:
-            pwm_a, pwm_b, error_x, error_y = self._run_hinf_to_nominal(
-                CONTROL_TS_S, active_axis=active
-            )
-            out.pwm_a, out.pwm_b = pwm_a, pwm_b
-            out.error_x_um, out.error_y_um = error_x, error_y
-            self._send_command(f"A,{pwm_a},{pwm_b}")
-            self._observe_pwm_crit(pwm_a, pwm_b)
+            if self._fov_gate_observe_since <= 0.0:
+                self._fov_gate_observe_since = now
+            observe_ms = (now - self._fov_gate_observe_since) * 1000.0
+            out.settling = self._fov_settle_progress(observe_ms)
+            if observe_ms >= self.config.fov_settle_ms:
+                # Cierre válido solo si ambos ≤ tol_fov (no “aceptar” a 10–20 µm).
+                if self._in_fov_band(err_adc_x, err_adc_y, err_traj_x, err_traj_y):
+                    self._finish_point()
+                    out.phase = StepControllerPhase.POINT_COMPLETE
+                    out.point_complete = True
+                    logger.info(
+                        "[StepController] Punto %d FOV gate_stable OK residual=(%.1f,%.1f)µm",
+                        self._point_index + 1,
+                        err_traj_x,
+                        err_traj_y,
+                    )
+                    return out
+                # Cerca: un eje en tol y el otro ≤ 1.5·tol → aceptar best-effort marcado.
+                tol = self.config.tol_fov_um
+                ax_ok = abs(err_traj_x) <= tol
+                ay_ok = abs(err_traj_y) <= tol
+                near = (
+                    (ax_ok and abs(err_traj_y) <= 1.5 * tol)
+                    or (ay_ok and abs(err_traj_x) <= 1.5 * tol)
+                )
+                if near:
+                    return self._accept_fov_best_effort(
+                        out, "gate_near_tol", err_traj_x, err_traj_y
+                    )
+                # Aún lejos del producto: reabrir soft-locks y seguir con átomos bajos.
+                for ax in ("x", "y"):
+                    if not self._fov_hard_lock[ax]:
+                        self._fov_locked[ax] = False
+                        self._fov_pulse[ax]["hold_gate"] = False
+                        self._fov_pulse[ax]["atom_idx"] = int(self.config.fov_atom_idx_min)
+                self._fov_gate_observe_since = 0.0
+                logger.info(
+                    "[StepController] Punto %d FOV observe sin tol residual=(%.1f,%.1f)µm → reintenta",
+                    self._point_index + 1,
+                    err_traj_x,
+                    err_traj_y,
+                )
+            return out
 
-        self._fov_verify_log_counter += 1
-        if self._fov_verify_log_counter % 200 == 0:
-            elapsed_ms = (time.perf_counter() - self._fov_verify_started_mono) * 1000.0
+        self._fov_gate_observe_since = 0.0
+        self._set_fov_active_axis(active)
+        out.lock_x = active != "x"
+        out.lock_y = active != "y"
+        st = self._fov_pulse[active]
+
+        ctrl_a = self._get_controller_a()
+        ctrl_b = self._get_controller_b()
+        ctrl = ctrl_a if active == "x" else ctrl_b
+        adc_active = (
+            self.sensor_buffer.get_adc(ctrl_a.sensor_key)
+            if active == "x" and ctrl_a
+            else self.sensor_buffer.get_adc(ctrl_b.sensor_key)
+            if ctrl_b
+            else None
+        )
+        err_ctrl_active = err_ctrl_x if active == "x" else err_ctrl_y
+        err_traj_active = err_traj_x if active == "x" else err_traj_y
+
+        # === Submáquina de pulso fine en TIEMPO DE PARED (Fase 2.1 / 3) ===
+        # Host: idle → on (A,pwm) → rest → medir.
+        # MCU atom: idle → rest (P dispara; no B durante ON — abortaría el átomo).
+        pstate = st.get("pstate", "idle")
+        use_atom = bool(self.config.use_mcu_atom_pulse)
+
+        if pstate == "on":
+            if now < st["pulse_on_until"]:
+                return out  # mantener empuje del pulso (solo path host)
+            # Fin de la ventana ON → frenar y entrar en reposo/asentamiento
+            if not use_atom:
+                self._send_command("B")
+            self._send_command("A,0,0")
+            st["rest_until"] = now + self.config.fov_pulse_rest_ms / 1000.0
+            st["pstate"] = "rest"
+            self._fov_brake_pending = False
+            return out
+
+        if pstate == "rest":
+            if now < st["rest_until"]:
+                self._send_command("A,0,0")
+                return out
+            # No medir mientras el MCU siga en PULSE (átomo ON/OFF).
+            if use_atom:
+                fr = self.sensor_buffer.last_frame()
+                if fr is not None and str(fr.state).upper() == "PULSE":
+                    self._send_command("A,0,0")
+                    return out
+            # Reposo cumplido: medir sobre muestra fresca ya asentada.
+            if not self._consume_fresh_telemetry():
+                self._send_command("A,0,0")
+                return out
+            self._last_time = time.time()
+            self._measure_and_adapt_pulse(active, adc_active, err_traj_active)
+            st["pstate"] = "idle"
+            # No disparar en el mismo tick (log 15:04: ráfagas sin cooldown).
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            return out
+
+        # pstate == "idle": decidir bloqueo o disparar el próximo pulso.
+        if bool(st.get("hold_gate")) or abs(err_traj_active) <= self._fov_gate_um(active):
+            self._fov_locked[active] = True
+            # Soft gate — no hard_lock: si el residual reabre, se corrige.
+            st["hold_gate"] = True
             logger.info(
-                "[StepController] FOV_VERIFY punto %d eje %s: err_adc=(%+d,%+d) err_traj=(%.1f,%.1f)µm "
-                "locked=%s crit_pwm=(%d,%d) creep_cd=(%d,%d) settling=%d/%d t=%.0fms",
+                "[StepController] FOV_GATE_LOCK punto %d eje %s err=%.1fµm (post-pulso)",
                 self._point_index + 1,
                 active.upper(),
-                err_adc_x,
-                err_adc_y,
-                err_traj_x,
-                err_traj_y,
-                sorted(self._fov_locked_axes),
-                self._pwm_crit.effective_min("x"),
-                self._pwm_crit.effective_min("y"),
-                self._fov_creep_cd_x,
-                self._fov_creep_cd_y,
-                self._fov_settling_counter,
-                SETTLING_CYCLES,
-                elapsed_ms,
+                err_traj_active,
             )
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            return out
+
+        # PWM mínimo sigue sobrepasando: el actuador no puede resolver este eje.
+        # Bloquéalo con residual registrado y pasa al otro (minimizar pérdida).
+        if int(st.get("overshoot_at_min", 0) or 0) >= self.config.fov_overshoot_lock_count:
+            self._fov_locked[active] = True
+            self._fov_hard_lock[active] = True
+            logger.warning(
+                "[StepController] FOV_AXIS_LIMIT punto %d eje %s residual=%.1fµm "
+                "pwm_min=%d → hard-lock y cambia de eje",
+                self._point_index + 1,
+                active.upper(),
+                err_traj_active,
+                self.config.fov_pwm_min,
+            )
+            st["overshoot_at_min"] = 0
+            self._fov_pulses_since_improve = 0
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            return out
+
+        if self._fov_pulses_since_improve >= self.config.fov_no_improve_pulses:
+            return self._accept_fov_best_effort(
+                out, "sin_mejora", err_traj_x, err_traj_y
+            )
+
+        direction = self._fov_pulse_direction(active, err_ctrl_active, ctrl) if ctrl else 0
+        if direction == 0:
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command("A,0,0")
+            return out
+
+        st["pre_adc"] = adc_active
+        st["pre_err"] = err_traj_active
+        self._fov_pulse_count += 1
+
+        if use_atom:
+            # Misma asignación que coarse A,pwm_a,pwm_b: X→Motor A, Y→Motor B.
+            # (Un mapeo X→B rompía el fine tras calibrar Motor A / Sensor 2 = eje X.)
+            fw_axis = "A" if active == "x" else "B"
+            idx = self._fov_atom_idx(st, err_traj_active, axis=active)
+            sign = 1 if direction > 0 else -1
+            st["pre_pwm"] = direction * max(1, idx + 1)  # escala pequeña p/ gain
+            st["atom_idx"] = idx
+            # LUT t_on ≈ 3..15 ms + margen OFF MCU; luego reposo host.
+            atom_on_ms = 4.0 + 2.0 * float(idx) + 10.0
+            st["rest_until"] = now + (atom_on_ms + self.config.fov_pulse_rest_ms) / 1000.0
+            st["pstate"] = "rest"
+            self._fov_brake_pending = False
+            out.pwm_a, out.pwm_b = 0, 0
+            self._send_command(MotorProtocol.format_atom_pulse(fw_axis, sign, idx))
+            logger.info(
+                "[StepController] FOV_ATOM punto %d eje %s P,%s,%+d,%d err=%.1fµm",
+                self._point_index + 1,
+                active.upper(),
+                fw_axis,
+                sign,
+                idx,
+                err_traj_active,
+            )
+            return out
+
+        pulse = direction * st["pwm"]
+        pwm_a = pulse if active == "x" else 0
+        pwm_b = pulse if active == "y" else 0
+        out.pwm_a, out.pwm_b = pwm_a, pwm_b
+        st["pre_pwm"] = pulse
+        # Ventana ON en ms (wall-clock): el pulso se mantiene hasta pulse_on_until.
+        st["pulse_on_until"] = now + self.config.fov_pulse_on_ms / 1000.0
+        st["pstate"] = "on"
+        self._fov_brake_pending = True
+        self._send_command(f"A,{pwm_a},{pwm_b}")
         return out
 
     def _complete_current_step(self, status: str) -> None:
@@ -1211,6 +1752,29 @@ class StepController:
                 err_x,
                 err_y,
                 tol_fov,
+            )
+
+        if self._hinf_native:
+            accepted_valid = int(
+                abs(err_x) <= self.config.tol_fov_um
+                and abs(err_y) <= self.config.tol_fov_um
+            )
+            logger.info(
+                "[StepController] POINT_METRICS idx=%d residual=(%.1f,%.1f)µm tol=%.1f "
+                "best=%.1fµm pulses=%d t_verify=%.0fms retries=%d settle_ms=%.0f "
+                "locks=(X=%d,Y=%d) accepted_valid=%d",
+                self._point_index + 1,
+                err_x,
+                err_y,
+                self.config.tol_fov_um,
+                self._fov_best_max_um if self._fov_best_max_um is not None else -1.0,
+                self._fov_pulse_count,
+                t_fov_verify_ms,
+                self._fov_retries,
+                self.config.fov_settle_ms,
+                int(self._fov_locked["x"]),
+                int(self._fov_locked["y"]),
+                accepted_valid,
             )
 
         t_move = (time.perf_counter() - self._transition_started_mono) * 1000.0

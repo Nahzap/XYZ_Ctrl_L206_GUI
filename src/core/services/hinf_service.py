@@ -106,9 +106,18 @@ def synthesize_hinf_controller(tab):
 def _read_config_from_ui(tab) -> SynthesisConfig:
     """Lee configuración desde los widgets de la UI."""
     try:
+        K = float(tab.K_input.text())
+        tau = float(tab.tau_input.text())
+        if abs(K) < 1e-9:
+            raise ValueError("K≈0 — carga una planta válida desde Análisis (Motor A o B).")
+        if tau <= 1e-6:
+            raise ValueError(
+                "τ≈0 — la identificación de esta planta no es usable.\n"
+                "Re-identifica en Análisis (Motor A/Sensor 2) o carga el slot H∞ guardado A_2."
+            )
         config = SynthesisConfig(
-            K=float(tab.K_input.text()),
-            tau=float(tab.tau_input.text()),
+            K=K,
+            tau=tau,
             Ms=float(tab.w1_Ms.text()),
             wb=float(tab.w1_wb.text()),
             eps=float(tab.w1_eps.text()),

@@ -1,7 +1,7 @@
 # 🎛️ Sistema de Control y Análisis - Plataforma Microscópica L206
 
-![Version](https://img.shields.io/badge/version-2.2-blue.svg)
-![Python](https://img.shields.io/badge/python-3.8+-green.svg)
+![Version](https://img.shields.io/badge/version-2.3-blue.svg)
+![Python](https://img.shields.io/badge/python-3.11-green.svg)
 ![License](https://img.shields.io/badge/license-Open%20Source-orange.svg)
 ![Standards](https://img.shields.io/badge/standards-IEEE-red.svg)
 
@@ -36,8 +36,9 @@ Este sistema proporciona una solución completa para el control y análisis de m
 - **Análisis de función de transferencia** utilizando métodos numéricos avanzados
 - **Diseño de controladores H∞** (H-infinity) con síntesis robusta
 - **Grabación de experimentos** en formato CSV para análisis posterior
-- **Integración con cámara Thorlabs** para reconocimiento de imagen
+- **Integración con cámaras Thorlabs / Basler** para reconocimiento de imagen
 - **Buffer optimizado con NumPy** para alto rendimiento
+- **Lazo host desacoplado:** telemetría en hilo RX → `SensorBuffer`; UI ~30 Hz; control dual en `ControlWorker` @ 200 Hz
 
 ---
 
@@ -49,7 +50,7 @@ Este sistema proporciona una solución completa para el control y análisis de m
   - Modo AUTO: Control automático con valores programables
 - **Control dual:** Manejo simultáneo de Motor A y Motor B
 - **Potencia ajustable:** Rango -255 a +255 (PWM)
-- **Comunicación serial:** Baudrate 115200 para baja latencia
+- **Comunicación serial:** Baudrate **1 000 000** (STM32 ST-Link VCP)
 
 ### 📊 Visualización en Tiempo Real
 - **Gráficos PyQtGraph optimizados:**
@@ -274,7 +275,7 @@ ingenieriles.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    ArduinoGUI (QMainWindow)                 │
+│                    CTRL_GUI (QMainWindow)                   │
 │  ┌───────────┬───────────┬───────────┬───────────┬────────┐ │
 │  │  Control  │ Grabación │ Análisis  │ H∞ Design │ Prueba │ │
 │  └───────────┴───────────┴───────────┴───────────┴────────┘ │
@@ -285,14 +286,14 @@ ingenieriles.
 │ SerialReaderThread│  │ OptimizedSignal │  │  CameraWorker  │
 │                  │  │     Window      │  │                 │
 │ • Lectura async  │  │ • Buffer NumPy  │  │ • Thread async  │
-│ • Baudrate 115k  │  │ • FPS control   │  │ • Thorlabs SDK  │
+│ • Baudrate 1M    │  │ • FPS control   │  │ • Basler/Thor   │
 │ • Signal emit    │  │ • Estadísticas  │  │ • Live preview  │
 └──────────────────┘  └──────────────────┘  └─────────────────┘
           │                    │                    │
           ▼                    ▼                    ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Arduino + L206 Driver                    │
-│  Motor A ←→ Sensor 1     │     Motor B ←→ Sensor 2         │
+│                 STM32F767ZI + L298N / L206                    │
+│  Motor A ←→ Sensor 2 (X) │     Motor B ←→ Sensor 1 (Y)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -301,80 +302,57 @@ ingenieriles.
 ## 💻 Requisitos del Sistema
 
 ### Hardware
-- **Microcontrolador:** Arduino compatible (Uno, Mega, etc.)
-- **Driver de motores:** L206 dual H-bridge
-- **Sensores:** 2x sensores analógicos (ADC 10-bit)
-- **Puerto serial:** USB o UART
-- **Cámara (opcional):** Thorlabs compatible con SDK
+- **Microcontrolador:** STM32F767ZI (NUCLEO) — firmware `MycoViT_XY_Controller`
+- **Driver de motores:** L298N / L206 (PWM)
+- **Sensores:** 2× canales láser ADC **12-bit** (0–4095)
+- **Puerto serial:** ST-Link VCP @ **1 Mbps**
+- **Cámara:** Basler (Pylon) y/o Thorlabs (ThorCam)
 
 ### Software
-- **Sistema operativo:** Windows 10/11 (para Thorlabs SDK)
-- **Python:** 3.8 o superior
-- **Espacio en disco:** 100 MB mínimo
+- **SO:** Windows 10/11
+- **Python:** **3.11** vía `CTRL_ENV` (canónico)
+- **CUDA 12.1** (recomendado para U2-Net)
+- **Disco:** ~4 GB (incluye torch cu121)
 
 ### Dependencias Python
 
+Lista canónica en la **raíz** del repo: [`../requirements.txt`](../requirements.txt).
+
+Resumen (CTRL_ENV, 2026-07-14):
+
 ```txt
-# Core GUI
-PyQt5>=5.15.0
-pyqtgraph>=0.12.0
-
-# Análisis y control
-numpy>=1.20.0
-pandas>=1.3.0
-scipy>=1.7.0
-control>=0.9.0
-
-# Visualización
-matplotlib>=3.4.0
-
-# Comunicación serial
+PyQt5==5.15.11
+pyqtgraph>=0.13.7
+numpy>=2.2 / pandas>=2.3 / scipy>=1.16 / matplotlib>=3.10
+control>=0.10 / slycot>=0.6
 pyserial>=3.5
-
-# Cámara Thorlabs (opcional)
-pylablib>=1.4.0
+opencv-python>=4.12 / scikit-image>=0.26 / h5py>=3.10
+pylablib>=1.4.4          # Thorlabs
+pypylon>=26.6            # Basler
+# torch==2.5.1+cu121 + torchvision — índice PyTorch (ver requirements.txt)
 ```
 
 ---
 
 ## 🚀 Instalación
 
-### 1. Clonar el repositorio
+Usar el **README raíz** (`../README.md`) como guía completa. Resumen:
 
-```bash
-git clone https://github.com/tu-usuario/XYZ_Ctrl_L206_GUI.git
-cd XYZ_Ctrl_L206_GUI
+```powershell
+# Desde la raíz del repo
+$env:PYTHONNOUSERSITE = "1"
+.\CTRL_ENV\python.exe -m pip install -r requirements.txt
+.\CTRL_ENV\python.exe -m pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+.\CTRL_ENV\python.exe src\main.py
 ```
 
-### 2. Crear entorno virtual (recomendado)
+`CTRL_ENV\Lib\site-packages\sitecustomize.py` aísla el intérprete del user-site.
 
-```bash
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
-```
-
-### 3. Instalar dependencias
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Configurar puerto serial
-
-Editar `src/main.py`, línea 164:
+Configuración serial: `src/config/constants.py` / `calibration.json`
 
 ```python
-SERIAL_PORT = 'COM5'  # Cambiar al puerto de tu Arduino
-BAUD_RATE = 115200
-```
-
-### 5. Ejecutar la aplicación
-
-```bash
-python src/main.py
+SERIAL_PORT = 'COM5'
+BAUD_RATE = 1000000
 ```
 
 ---
@@ -383,8 +361,8 @@ python src/main.py
 
 ### Inicio Rápido
 
-1. **Conectar Arduino** al puerto USB configurado
-2. **Ejecutar** `python src/main.py`
+1. **Conectar NUCLEO-F767ZI** (ST-Link VCP) al USB
+2. **Ejecutar** `.\CTRL_ENV\python.exe src\main.py`
 3. **Abrir ventana de señales:** Botón "📊 Abrir Señales de Control"
 4. **Configurar buffer optimizado:**
    - Ajustar tamaño de buffer (50-2000 muestras)
@@ -515,8 +493,8 @@ Thread asíncrono para lectura serial sin bloqueo de UI.
 **Señales:**
 - `data_received(str)`: Emite datos recibidos
 
-#### `ArduinoGUI`
-Interfaz principal con sistema de pestañas.
+#### `CTRL_GUI`
+Interfaz principal (`QMainWindow`) con sistema de pestañas — host Python + STM32F767ZI.
 
 **Pestañas:**
 1. **Control:** Modos MANUAL/AUTO, configuración de buffer
@@ -646,7 +624,7 @@ XYZ_Ctrl_L206_GUI/
 # 6. Thread serial asíncrono (líneas 221-276)
 # 7. Ventanas auxiliares (líneas 280-437)
 # 8. Worker de cámara Thorlabs (líneas 441-827)
-# 9. Interfaz principal ArduinoGUI (líneas 912+)
+# 9. Interfaz principal CTRL_GUI
 ```
 
 ---
@@ -656,19 +634,33 @@ XYZ_Ctrl_L206_GUI/
 ### Ajustar Parámetros del Buffer
 
 ```python
-# En ArduinoGUI.__init__()
+# En CTRL_GUI.__init__()
 self.signal_buffer_size = 500  # 200-2000 muestras
 self.signal_render_fps = 60    # 1-120 FPS
 ```
 
-### Modificar Constantes Físicas
+### Calibración física (ADC ↔ µm) — no hardcodear recorrido
 
-```python
-# Calibración ADC → Distancia
-ADC_MAX = 1023.0              # Resolución 10-bit
-RECORRIDO_UM = 25000.0        # Recorrido en micrómetros
-FACTOR_ESCALA = 24.4379       # μm/unidad_ADC
+La conversión de posición **no** usa un recorrido fijo de 25 mm ni un `FACTOR_ESCALA` global.  
+Cada eje tiene su propia recta en `src/config/calibration.json`, cargada por `constants.py`:
+
+```json
+"calibration": {
+  "x_axis": { "intercept_um": ..., "slope_um_per_adc": ... },
+  "y_axis": { "intercept_um": ..., "slope_um_per_adc": ... }
+}
 ```
+
+```text
+um  = intercept − adc · slope          (adc_to_um)
+adc = (intercept − um) / slope         (um_to_adc)
+```
+
+El span físico puede ser **3 mm, 20 mm, 25 mm, etc.**: lo define la calibración medida
+(análisis / procedimiento de laboratorio), no una constante en el README. A futuro el
+flujo de identificación actualizará `slope`/`intercept` (y opcionalmente `system.recorrido_um`
+como metadato informativo). `FACTOR_ESCALA = recorrido/ADC_MAX` es solo un cociente
+aproximado legado — **no** entra en el lazo de control.
 
 ### Habilitar/Deshabilitar Módulos
 
@@ -691,20 +683,16 @@ ERROR: Puerto COM5 no encontrado
 ```
 
 **Solución:**
-1. Verificar conexión física del Arduino
+1. Verificar ST-Link VCP del STM32
 2. Identificar puerto en Administrador de Dispositivos (Windows)
-3. Actualizar `SERIAL_PORT` en `main.py`
+3. Actualizar `SERIAL_PORT` en `src/config/constants.py`
 
-### Error: Cámara Thorlabs no detectada
+### Error: Cámara no detectada
 
-```
-WARNING: pylablib no está instalado
-```
+**Basler:** instalar Pylon Runtime; `pypylon` en CTRL_ENV;  
+`.\CTRL_ENV\python.exe -c "from pypylon import pylon; print(len(pylon.TlFactory.GetInstance().EnumerateDevices()))"`
 
-**Solución:**
-1. Instalar Thorlabs SDK desde: [thorlabs.com](https://www.thorlabs.com)
-2. Verificar ruta del SDK en línea 128
-3. `pip install pylablib`
+**Thorlabs:** instalar ThorCam; `pylablib` en CTRL_ENV.
 
 ### UI lenta o congelada
 
@@ -731,14 +719,19 @@ tiempo,power_a,power_b,sensor_1,sensor_2
 - `tiempo`: Timestamp en segundos (float)
 - `power_a`: Potencia Motor A [-255, 255]
 - `power_b`: Potencia Motor B [-255, 255]
-- `sensor_1`: Lectura ADC Sensor 1 [0, 1023]
-- `sensor_2`: Lectura ADC Sensor 2 [0, 1023]
+- `sensor_1`: Lectura ADC Sensor 1 [0, 4095]
+- `sensor_2`: Lectura ADC Sensor 2 [0, 4095]
 
-### Protocolo Serial Arduino → PC
+### Protocolo Serial STM32 → PC (@ 1 Mbps)
+
+Telemetría CSV **6 campos**: `pot_a,pot_b,sens_1,sens_2,estado,settled`  
+Sensores **0–4095** (12-bit). Estados: `MANUAL` | `AUTO` | `BRAKE`.
+
+Comandos PC→MCU: `M`, `A,<pwm_a>,<pwm_b>`, `B`  
+(Hold `H`/`S` no implementados; fine MCU `P,axis,sign,idx` = roadmap Fase 3.)
 
 ```
-Formato: POWER_A,POWER_B,SENSOR_1,SENSOR_2\n
-Ejemplo: 100,-50,520,475\n
+Ejemplo: -117,0,3850,2703,MANUAL,0
 ```
 
 ---
@@ -764,13 +757,17 @@ Las contribuciones son bienvenidas. Por favor:
 
 ## 📝 Notas de Versión
 
-### v2.2 (Actual)
+### v2.3 (Actual — 2026-07-14)
+- ✅ CTRL_ENV aislado (`sitecustomize`; sin user-site)
+- ✅ `requirements.txt` actualizado (Basler `pypylon`, `h5py`, torch cu121 aparte)
+- ✅ ControlWorker @ 200 Hz + UI ~30 Hz + `SensorBuffer` en hilo RX
+- ✅ Pulsos FOV wall-clock (ms) + permanencia 300 ms (plan micrométrico Fases 0–2)
+- ✅ Telemetría STM32 @ 1 Mbps, ADC 12-bit
+
+### v2.2
 - ✅ Buffer circular optimizado con NumPy
 - ✅ Control de frecuencia de rendering (FPS configurable)
-- ✅ Estadísticas de rendimiento en tiempo real
-- ✅ Panel de configuración dinámica de buffer
-- ✅ Gestión de memoria mejorada (90% reducción)
-- ✅ Integración con cámara Thorlabs
+- ✅ Integración con cámara Thorlabs / Basler
 - ✅ Diseño de controladores H∞
 
 ### v2.1
@@ -815,7 +812,8 @@ Se permite el uso, copia, modificación y distribución libre
 
 - [Documentación NumPy](https://numpy.org/doc/)
 - [PyQt5 Tutorial](https://www.riverbankcomputing.com/static/Docs/PyQt5/)
-- [Arduino Serial Communication](https://www.arduino.cc/reference/en/language/functions/communication/serial/)
+- [STM32 NUCLEO-F767ZI / MycoViT_XY_Controller](https://www.st.com/)
+- [Basler pypylon](https://github.com/basler/pypylon)
 - [Control Systems Primer](https://python-control.readthedocs.io/)
 
 ---

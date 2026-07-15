@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+from config.constants import ADC_MAX
+
 
 @dataclass
 class SensorData:
@@ -22,11 +24,11 @@ class SensorData:
         if self.timestamp is None:
             self.timestamp = datetime.now()
         
-        # Validar rangos
-        if not 0 <= self.sensor_1 <= 1023:
-            raise ValueError(f"sensor_1 debe estar entre 0-1023: {self.sensor_1}")
-        if not 0 <= self.sensor_2 <= 1023:
-            raise ValueError(f"sensor_2 debe estar entre 0-1023: {self.sensor_2}")
+        adc_hi = int(ADC_MAX)
+        if not 0 <= self.sensor_1 <= adc_hi:
+            raise ValueError(f"sensor_1 debe estar entre 0-{adc_hi}: {self.sensor_1}")
+        if not 0 <= self.sensor_2 <= adc_hi:
+            raise ValueError(f"sensor_2 debe estar entre 0-{adc_hi}: {self.sensor_2}")
         if not -255 <= self.power_a <= 255:
             raise ValueError(f"power_a debe estar entre -255 y 255: {self.power_a}")
         if not -255 <= self.power_b <= 255:
@@ -38,28 +40,20 @@ class SensorData:
         Crea SensorData desde línea serial.
         
         Formato esperado: "power_a,power_b,sensor_1,sensor_2"
+        o 6 campos STM32: "power_a,power_b,sensor_1,sensor_2,state,settled"
         """
         try:
             parts = line.strip().split(',')
-            if len(parts) != 4:
-                raise ValueError(f"Formato inválido, esperado 4 valores: {line}")
+            if len(parts) < 4:
+                raise ValueError(f"Formato inválido, esperado >=4 valores: {line}")
             
-            power_a, power_b, sensor_1, sensor_2 = map(int, parts)
+            power_a, power_b, sensor_1, sensor_2 = map(int, parts[:4])
             
             return cls(
                 sensor_1=sensor_1,
                 sensor_2=sensor_2,
                 power_a=power_a,
-                power_b=power_b
+                power_b=power_b,
             )
         except (ValueError, IndexError) as e:
-            raise ValueError(f"Error parseando línea serial: {e}")
-    
-    def to_csv_row(self, start_time: datetime) -> list:
-        """Convierte a fila CSV con timestamp relativo."""
-        if self.timestamp and start_time:
-            time_ms = int((self.timestamp - start_time).total_seconds() * 1000)
-        else:
-            time_ms = 0
-        
-        return [time_ms, self.power_a, self.power_b, self.sensor_1, self.sensor_2]
+            raise ValueError(f"Error parseando SensorData: {line}") from e

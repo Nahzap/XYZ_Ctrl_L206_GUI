@@ -15,7 +15,7 @@ class BaseTab(QWidget):
         Inicializa la pestaña base.
         
         Args:
-            parent: Widget padre (típicamente ArduinoGUI)
+            parent: Widget padre (típicamente CTRL_GUI)
         """
         super().__init__(parent)
         self.parent = parent

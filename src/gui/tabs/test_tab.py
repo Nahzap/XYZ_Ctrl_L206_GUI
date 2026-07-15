@@ -77,7 +77,7 @@ class TestTab(QWidget):
         
         Args:
             trajectory_generator: Instancia de TrajectoryGenerator
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
         self.trajectory_gen = trajectory_generator
@@ -249,7 +249,15 @@ class TestTab(QWidget):
         self.motor_b_sensor1 = self._widgets.get('motor_b_sensor1')
         self.motor_b_sensor2 = self._widgets.get('motor_b_sensor2')
         self.motor_b_invert = self._widgets.get('motor_b_invert')
-        
+
+        if self.motor_a_invert is not None:
+            self.motor_a_invert.toggled.connect(
+                lambda checked: self._on_invert_toggled('A', checked)
+            )
+        if self.motor_b_invert is not None:
+            self.motor_b_invert.toggled.connect(
+                lambda checked: self._on_invert_toggled('B', checked)
+            )
         
         # Control por posición
         self.ref_a_input = self._widgets.get('ref_a_input')
@@ -545,42 +553,61 @@ class TestTab(QWidget):
             motor: 'A' o 'B'
             controller_data: Dict con 'Kp', 'Ki', 'K', 'U_max', etc.
         """
+        from copy import deepcopy
+        if not isinstance(controller_data, dict):
+            logger.error(f"set_controller({motor}): datos inválidos")
+            return
+
+        # Copia independiente de escalares (A y B no deben compartir dict)
+        tf_obj = controller_data.get('controller')
+        data = deepcopy({k: v for k, v in controller_data.items() if k != 'controller'})
+        if tf_obj is not None:
+            data['controller'] = tf_obj
+
         if motor == 'A':
-            self.controller_a = controller_data
-            info = f"Kp={controller_data['Kp']:.4f}, Ki={controller_data['Ki']:.4f}\n"
-            info += f"γ={controller_data.get('gamma', 0):.4f}, U_max={controller_data.get('U_max', 100):.1f}"
+            self.controller_a = data
+            info = f"Kp={data['Kp']:.4f}, Ki={data['Ki']:.4f}\n"
+            info += f"γ={data.get('gamma', 0):.4f}, U_max={data.get('U_max', 100):.1f}"
+            if data.get('slot_key'):
+                info += f"\n[{data.get('slot_key')}]"
             self.set_controller_a(info, True)
             
-            # Configurar en TestService
             sensor_key = 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1'
             config = ControllerConfig(
-                Kp=controller_data['Kp'],
-                Ki=controller_data['Ki'],
-                U_max=controller_data.get('U_max', 150),
+                Kp=float(data['Kp']),
+                Ki=float(data['Ki']),
+                U_max=float(data.get('U_max', 150)),
                 invert=self.motor_a_invert.isChecked(),
                 sensor_key=sensor_key,
-                K_plant=float(controller_data.get('K', 1.0)),
+                K_plant=float(data.get('K', 1.0)),
             )
             self.test_service.set_controller_a(config)
-            logger.info(f"Controlador A guardado en TestTab y TestService")
+            logger.info(
+                f"Controlador A guardado: Kp={data['Kp']:.4f}, Ki={data['Ki']:.4f}, "
+                f"slot={data.get('slot_key')}"
+            )
         else:
-            self.controller_b = controller_data
-            info = f"Kp={controller_data['Kp']:.4f}, Ki={controller_data['Ki']:.4f}\n"
-            info += f"γ={controller_data.get('gamma', 0):.4f}, U_max={controller_data.get('U_max', 100):.1f}"
+            self.controller_b = data
+            info = f"Kp={data['Kp']:.4f}, Ki={data['Ki']:.4f}\n"
+            info += f"γ={data.get('gamma', 0):.4f}, U_max={data.get('U_max', 100):.1f}"
+            if data.get('slot_key'):
+                info += f"\n[{data.get('slot_key')}]"
             self.set_controller_b(info, True)
             
-            # Configurar en TestService
             sensor_key = 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2'
             config = ControllerConfig(
-                Kp=controller_data['Kp'],
-                Ki=controller_data['Ki'],
-                U_max=controller_data.get('U_max', 150),
+                Kp=float(data['Kp']),
+                Ki=float(data['Ki']),
+                U_max=float(data.get('U_max', 150)),
                 invert=self.motor_b_invert.isChecked(),
                 sensor_key=sensor_key,
-                K_plant=float(controller_data.get('K', 1.0)),
+                K_plant=float(data.get('K', 1.0)),
             )
             self.test_service.set_controller_b(config)
-            logger.info(f"Controlador B guardado en TestTab y TestService")
+            logger.info(
+                f"Controlador B guardado: Kp={data['Kp']:.4f}, Ki={data['Ki']:.4f}, "
+                f"slot={data.get('slot_key')}"
+            )
 
     def get_controller_preferences(self):
         """Retorna preferencias de sensor/inversión por motor."""
@@ -611,10 +638,12 @@ class TestTab(QWidget):
         elif sensor_b == 'sensor_2':
             self.motor_b_sensor2.setChecked(True)
 
-        if 'A' in invert_map:
-            self.motor_a_invert.setChecked(bool(invert_map.get('A')))
-        if 'B' in invert_map:
-            self.motor_b_invert.setChecked(bool(invert_map.get('B')))
+        # invert_map vacío/None → no tocar checkboxes (respetar UI del operador)
+        if invert_map:
+            if 'A' in invert_map:
+                self.motor_a_invert.setChecked(bool(invert_map.get('A')))
+            if 'B' in invert_map:
+                self.motor_b_invert.setChecked(bool(invert_map.get('B')))
 
     def _serializable_controller(self, controller_data):
         """Convierte controlador de UI a formato serializable."""
@@ -695,6 +724,75 @@ class TestTab(QWidget):
     # CONTROL DUAL EN TIEMPO REAL (delegado a TestService)
     # ============================================================
     
+    def _enforce_canonical_axis_mapping(self) -> list:
+        """
+        Fuerza solo el mapa físico de calibración/síntesis:
+          Motor A → Sensor 2 (eje X), Motor B → Sensor 1 (eje Y).
+
+        Invertir PWM lo decide el operador en la UI (no se pisa con el slot).
+        """
+        notes = []
+        want_a = 'sensor_2'
+        want_b = 'sensor_1'
+
+        cur_a = 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1'
+        cur_b = 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2'
+
+        # Respetar checkboxes de inversión (antes se sobreescribían con invert_pwm del slot)
+        inv_a = bool(self.motor_a_invert.isChecked())
+        inv_b = bool(self.motor_b_invert.isChecked())
+
+        if cur_a != want_a or cur_b != want_b:
+            notes.append(
+                f"Mapa sensor corregido: A {cur_a}→{want_a}, B {cur_b}→{want_b} "
+                "(calibración / TF A_2 y B_1)"
+            )
+            self.apply_controller_preferences(
+                {'A': want_a, 'B': want_b},
+                None,  # no tocar invert
+            )
+        else:
+            # Asegurar preferencias de sensor sin tocar invert
+            self.apply_controller_preferences({'A': want_a, 'B': want_b}, None)
+
+        if self.controller_a:
+            self.test_service.update_controller_a_sensor(want_a, inv_a)
+            if isinstance(self.controller_a, dict):
+                self.controller_a['invert_pwm'] = inv_a
+        if self.controller_b:
+            self.test_service.update_controller_b_sensor(want_b, inv_b)
+            if isinstance(self.controller_b, dict):
+                self.controller_b['invert_pwm'] = inv_b
+
+        if notes:
+            for n in notes:
+                self.results_text.append(f"⚠️ {n}")
+                logger.warning(n)
+        logger.info(
+            f"Ejes listos: A→{want_a} invert={inv_a}, B→{want_b} invert={inv_b}"
+        )
+        return notes
+
+    def _on_invert_toggled(self, motor: str, checked: bool) -> None:
+        """Aplica Invertir PWM al instante (también con control ya activo)."""
+        motor = motor.upper()
+        if motor == 'A':
+            sensor_key = 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1'
+            if self.controller_a:
+                self.test_service.update_controller_a_sensor(sensor_key, bool(checked))
+                if isinstance(self.controller_a, dict):
+                    self.controller_a['invert_pwm'] = bool(checked)
+            logger.info(f"Invert PWM Motor A = {checked}")
+        else:
+            sensor_key = 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2'
+            if self.controller_b:
+                self.test_service.update_controller_b_sensor(sensor_key, bool(checked))
+                if isinstance(self.controller_b, dict):
+                    self.controller_b['invert_pwm'] = bool(checked)
+            logger.info(f"Invert PWM Motor B = {checked}")
+        if hasattr(self.parent_gui, '_save_session_state'):
+            self.parent_gui._save_session_state()
+
     def start_dual_control(self):
         """Inicia control dual de ambos motores usando TestService."""
         logger.info("=== INICIANDO CONTROL DUAL (via TestService) ===")
@@ -712,13 +810,7 @@ class TestTab(QWidget):
         self.ref_b_um = ref_b
         self._position_reached = False
         
-        # Actualizar configuración de sensores en el servicio antes de iniciar
-        if self.controller_a:
-            sensor_key = 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1'
-            self.test_service.update_controller_a_sensor(sensor_key, self.motor_a_invert.isChecked())
-        if self.controller_b:
-            sensor_key = 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2'
-            self.test_service.update_controller_b_sensor(sensor_key, self.motor_b_invert.isChecked())
+        self._enforce_canonical_axis_mapping()
         
         # Delegar al servicio
         self.test_service.start_dual_control(ref_a, ref_b)
@@ -732,6 +824,34 @@ class TestTab(QWidget):
     # EJECUCIÓN DE TRAYECTORIA ZIG-ZAG
     # ============================================================
     
+    def _confirm_tolerance_vs_fov(self, tolerance_um: float) -> bool:
+        """True si la tolerancia de cierre es segura frente al FOV, o el usuario confirma.
+
+        Regla operativa: tolerancia ≤ FOV/10 para conservar el solape del mosaico.
+        """
+        try:
+            fov_min = min(
+                float(self.fov_x_input.text()), float(self.fov_y_input.text())
+            )
+        except (ValueError, AttributeError):
+            return True
+        if fov_min <= 0:
+            return True
+        limit = fov_min / 10.0
+        if tolerance_um <= limit:
+            return True
+        pct = tolerance_um / fov_min * 100.0
+        reply = QMessageBox.warning(
+            self.parent_gui,
+            "Tolerancia demasiado amplia",
+            f"La tolerancia de cierre ({tolerance_um:.0f} µm) es {pct:.0f}% del FOV "
+            f"({fov_min:.0f} µm). Recomendado ≤ {limit:.0f} µm para no perder solape.\n\n"
+            "¿Continuar de todas formas?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def start_trajectory_execution(self):
         """Inicia la ejecución de la trayectoria zig-zag (delegado a TestService)."""
         logger.info("=== INICIANDO EJECUCIÓN DE TRAYECTORIA (via TestService) ===")
@@ -748,18 +868,19 @@ class TestTab(QWidget):
             tolerance = POSITION_TOLERANCE_UM
             pause = 2.0
         
+        # Guardrail: la tolerancia de cierre no debe acercarse al tamaño del FOV.
+        if not self._confirm_tolerance_vs_fov(tolerance):
+            self.results_text.append("⏹️ Ejecución cancelada: ajusta la tolerancia de cierre")
+            return
+
         # Guardar para compatibilidad
         self.trajectory_tolerance = tolerance
         self.trajectory_pause = pause
         self.trajectory_index = 0
         
-        # Actualizar configuración de sensores en el servicio
-        if self.controller_a:
-            sensor_key = 'sensor_2' if self.motor_a_sensor2.isChecked() else 'sensor_1'
-            self.test_service.update_controller_a_sensor(sensor_key, self.motor_a_invert.isChecked())
-        if self.controller_b:
-            sensor_key = 'sensor_1' if self.motor_b_sensor1.isChecked() else 'sensor_2'
-            self.test_service.update_controller_b_sensor(sensor_key, self.motor_b_invert.isChecked())
+        # CRÍTICO: sin el mapa canónico el error µm no coincide con Synthesis
+        # y el punto 1 nunca entra en tolerancia (p.ej. A→S1 muestra ~+200µm fantasma).
+        self._enforce_canonical_axis_mapping()
         
         # Convertir trayectoria a lista de tuplas
         trajectory_list = [(p[0], p[1]) for p in self.current_trajectory]

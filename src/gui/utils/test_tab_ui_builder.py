@@ -180,6 +180,7 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     # Grupo de botones para Motor A (independiente de Motor B)
     widgets['motor_a_sensor1'] = QCheckBox("Sensor 1")
     widgets['motor_a_sensor2'] = QCheckBox("Sensor 2")
+    widgets['motor_a_sensor2'].setChecked(True)  # calibración: Motor A → Sensor 2
     
     # Exclusión mutua manual para Motor A
     widgets['motor_a_sensor1'].toggled.connect(
@@ -204,6 +205,7 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     # Grupo de botones para Motor B (independiente de Motor A)
     widgets['motor_b_sensor1'] = QCheckBox("Sensor 1")
     widgets['motor_b_sensor2'] = QCheckBox("Sensor 2")
+    widgets['motor_b_sensor1'].setChecked(True)  # calibración: Motor B → Sensor 1
     
     # Exclusión mutua manual para Motor B
     widgets['motor_b_sensor1'].toggled.connect(
@@ -222,7 +224,10 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     layout.addLayout(row_b)
     
     # Nota informativa
-    info = QLabel("⚠️ Configura sensor e inversión ANTES de iniciar control.")
+    info = QLabel(
+        "⚠️ Sensores: A→S2, B→S1 (fijos). "
+        "Invertir PWM es libre: úsalo si 20000µm va hacia el mínimo."
+    )
     info.setStyleSheet("padding: 5px; background: #FFF3CD; border: 1px solid #FFC107; border-radius: 3px;")
     layout.addWidget(info)
     
@@ -406,8 +411,13 @@ def create_zigzag_section(widgets: dict, start_callback, stop_callback) -> QGrou
     # Parámetros de ejecución
     exec_layout = QGridLayout()
     
-    exec_layout.addWidget(QLabel("Tolerancia (µm):"), 0, 0)
-    widgets['tolerance_input'] = QLineEdit("25")
+    tol_label = QLabel("Tolerancia cierre (µm):")
+    tol_label.setToolTip(
+        "Banda de aceptación por punto (NO es el tamaño del FOV). "
+        "Debe mantenerse ≤ FOV/10 para conservar el solape del mosaico."
+    )
+    exec_layout.addWidget(tol_label, 0, 0)
+    widgets['tolerance_input'] = QLineEdit("8")
     widgets['tolerance_input'].setStyleSheet("background: white; color: black;")
     exec_layout.addWidget(widgets['tolerance_input'], 0, 1)
     

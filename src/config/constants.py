@@ -13,10 +13,25 @@ import logging
 
 logger = logging.getLogger('MotorControl_L206')
 
-# --- CONFIGURACIÓN SERIAL ---
-SERIAL_PORT = 'COM5' 
+# --- CONFIGURACIÓN SERIAL (fábrica STM32 @ 1 Mbps) ---
+SERIAL_PORT = 'COM5'
 BAUD_RATE = 1000000
 PLOT_LENGTH = 100
+
+# Fase 5.3: UI de producto — baud/COM avanzada oculta; operador no elige 100 Hz.
+# False = modo lab (muestra baudrate y permite overrides).
+FACTORY_UI = True
+
+# --- SEPARACIÓN DE PLANOS (Fase 1: lazo máquina-rápido + UI ~30 Hz) ---
+# La UI (labels/plots) se refresca a esta tasa; la medida (SensorBuffer) y el
+# control corren a la tasa de la máquina, sin depender del repintado.
+# Ver: Docs/20260714_0032_Plan_Implementacion_Control_Micrometrico_Rapido.md
+UI_REFRESH_HZ = 30
+
+# Tasa del lazo de control (ControlWorker en QThread propio, fuera del hilo GUI).
+# 400 Hz (2.5 ms): host más rápido; fine micrométrico sigue siendo MCU (Fase 3+).
+# No se expone en UI de fábrica (FACTORY_UI).
+CONTROL_RATE_HZ = 400
 
 # =============================================================================
 # CARGA DINÁMICA DE CALIBRACIÓN DESDE JSON
@@ -31,15 +46,17 @@ _DEFAULT_CALIBRATION = {
     'y_axis': {'intercept_um': 21601.0, 'slope_um_per_adc': 12.22}
 }
 _DEFAULT_CONTROL = {
-    'deadzone_adc': 2,
+    'deadzone_adc': 8,
     'position_tolerance_um': 25.0,
     'settling_cycles': 4,
     'max_attempts_per_point': 500,
     'fallback_tolerance_multiplier': 2.0,
     'default_trajectory_pause_s': 2.0
 }
+# recorrido_um: metadato opcional del span físico estimado (puede ser 3 mm, 20 mm, …).
+# NO se usa en um_to_adc/adc_to_um — la conversión es por eje (slope/intercept).
 _DEFAULT_SYSTEM = {
-    'adc_max': 1023.0,
+    'adc_max': 4095.0,
     'recorrido_um': 20000.0
 }
 
@@ -153,7 +170,7 @@ def reload_calibration():
     
     # Sistema
     sys_cfg = data.get('system', _DEFAULT_SYSTEM)
-    ADC_MAX = sys_cfg.get('adc_max', 1023.0)
+    ADC_MAX = sys_cfg.get('adc_max', 4095.0)
     RECORRIDO_UM = sys_cfg.get('recorrido_um', 20000.0)
     FACTOR_ESCALA = RECORRIDO_UM / ADC_MAX
     
@@ -165,54 +182,38 @@ def reload_calibration():
 # --- Cargar calibración al importar el módulo ---
 CALIBRATION_X = {}
 CALIBRATION_Y = {}
-DEADZONE_ADC = 2
+DEADZONE_ADC = 8
 POSITION_TOLERANCE_UM = 25.0
 SETTLING_CYCLES = 4
 MAX_ATTEMPTS_PER_POINT = 500
 FALLBACK_TOLERANCE_MULTIPLIER = 2.0
 DEFAULT_TRAJECTORY_PAUSE = 2.0
-ADC_MAX = 1023.0
+ADC_MAX = 4095.0
+# Span estimado (metadato). La escala real de control es slope_um_per_adc por eje.
 RECORRIDO_UM = 20000.0
+# Cociente grueso recorrido/ADC_MAX — NO usar para control; preferir CALIBRATION_X/Y['slope'].
 FACTOR_ESCALA = RECORRIDO_UM / ADC_MAX
 
 reload_calibration()
 
 
 # =============================================================================
-# FUNCIONES DE CONVERSIÓN
+# FUNCIONES DE CONVERSIÓN (por eje, desde calibration.json)
 # =============================================================================
 
 def um_to_adc(um: float, axis: str = 'x') -> float:
     """
-    Convierte posición en µm a valor ADC.
-    
-    IMPORTANTE: NO satura artificialmente. Si la posición está fuera del rango
-    físico del sensor, retorna el valor calculado para que el controlador
-    pueda detectar el error correctamente.
-    
-    Args:
-        um: Posición en micrómetros
-        axis: 'x' o 'y' para seleccionar calibración
-        
-    Returns:
-        Valor ADC correspondiente (puede estar fuera de 0-1023 si fuera de rango)
+    Convierte posición en µm a valor ADC con la calibración del eje.
+
+    Usa intercept/slope del eje (no RECORRIDO_UM ni FACTOR_ESCALA).
+    No satura: fuera de rango físico se deja al controlador decidir.
     """
     cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
-    adc = (cal['intercept'] - um) / cal['slope']
-    return adc  # NO saturar - dejar que el controlador maneje límites
+    return (cal['intercept'] - um) / cal['slope']
 
 
 def adc_to_um(adc: float, axis: str = 'x') -> float:
-    """
-    Convierte valor ADC a posición en µm.
-    
-    Args:
-        adc: Valor ADC (0-1023)
-        axis: 'x' o 'y' para seleccionar calibración
-        
-    Returns:
-        Posición en micrómetros
-    """
+    """Convierte ADC → µm con la calibración del eje (intercept − adc·slope)."""
     cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
     return cal['intercept'] - (adc * cal['slope'])
 
@@ -225,6 +226,8 @@ def get_calibration_info() -> dict:
         'deadzone_adc': DEADZONE_ADC,
         'tolerance_um': POSITION_TOLERANCE_UM,
         'settling_cycles': SETTLING_CYCLES,
+        'adc_max': ADC_MAX,
+        'recorrido_um_meta': RECORRIDO_UM,  # informativo; no es la ley de conversión
         'config_file': _CALIBRATION_FILE
     }
 # --------------------

@@ -66,7 +66,7 @@ class HInfTab(QWidget):
         Args:
             hinf_controller: Instancia de HInfTrackingController (Zhou & Doyle)
             tf_analyzer: Instancia de TransferFunctionAnalyzer
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
         
@@ -373,7 +373,7 @@ class HInfTab(QWidget):
             return 0.1
     
     def load_plant_from_analysis(self):
-        """Carga K y τ desde funciones de transferencia identificadas."""
+        """Carga K y τ desde funciones de transferencia identificadas (elige A/B)."""
         logger.info("HInfTab: Cargando planta desde análisis")
         
         if not self.tf_analyzer:
@@ -381,51 +381,120 @@ class HInfTab(QWidget):
             logger.error("tf_analyzer no disponible")
             return
         
-        tf_list = self.tf_analyzer.identified_functions
+        tf_list = list(self.tf_analyzer.identified_functions)
         
         if not tf_list:
-            self.results_text.setText("ℹ️ Realiza primero un análisis en la pestaña 'Análisis' para identificar funciones de transferencia.")
+            self.results_text.setText(
+                "ℹ️ Realiza primero un análisis en la pestaña 'Análisis' "
+                "para identificar funciones de transferencia."
+            )
             logger.warning("No hay funciones de transferencia identificadas")
             return
         
-        # Si solo hay una, cargarla directamente
+        tf = None
         if len(tf_list) == 1:
             tf = tf_list[0]
-            self.set_plant_params(tf['K'], tf['tau'])
-            self.current_slot_key = f"{tf['motor']}_{tf['sensor']}"
-            
-            tau_slow = tf.get('tau_slow', 1000.0)
-            msg = (
-                f"✅ Parámetros cargados:\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"  Motor {tf['motor']} / Sensor {tf['sensor']}\n"
-                f"  Fecha: {tf['timestamp']}\n\n"
-                f"📐 MODELO:\n"
-                f"  G(s) = K / ((τ₁s + 1)(τ₂s + 1))\n\n"
-                f"  K  = {tf['K']:.4f} µm/s/PWM\n"
-                f"  τ₁ = {tf['tau']:.4f}s (polo rápido)\n"
-                f"  τ₂ = {tau_slow:.1f}s (polo lento)\n\n"
-                f"Ahora puedes ajustar las ponderaciones y sintetizar el controlador."
+        else:
+            # Diálogo: no asumir siempre la última (antes B bloqueaba a A)
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Seleccionar planta (Análisis)")
+            dialog.setMinimumWidth(420)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel(
+                "Hay varias TF identificadas. Elige cuál cargar en H∞:"
+            ))
+            radios = []
+            for i, entry in enumerate(tf_list):
+                motor = entry.get('motor', '?')
+                sensor = entry.get('sensor', '?')
+                K = float(entry.get('K', 0.0))
+                tau = float(entry.get('tau', 0.0))
+                ts = entry.get('timestamp', '')
+                label = (
+                    f"Motor {motor} / Sensor {sensor}  |  "
+                    f"K={K:.4f}  τ={tau:.4f}s  |  {ts}"
+                )
+                rb = QRadioButton(label)
+                rb.setProperty('tf_index', i)
+                if str(motor).upper() == 'A' and str(sensor) in ('2', 'S2'):
+                    # Preferir A_2 si el combo de control está en A
+                    prefer_a = (
+                        hasattr(self, 'control_motor_combo')
+                        and 'A' in str(self.control_motor_combo.currentText()).upper()
+                    )
+                    if prefer_a or not radios:
+                        rb.setChecked(True)
+                elif not any(r.isChecked() for r in radios):
+                    rb.setChecked(True)
+                radios.append(rb)
+                layout.addWidget(rb)
+            # Si ninguna quedó marcada, marcar la última
+            if radios and not any(r.isChecked() for r in radios):
+                radios[-1].setChecked(True)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            if dialog.exec_() != QDialog.Accepted:
+                return
+            chosen = next((r for r in radios if r.isChecked()), None)
+            if chosen is None:
+                return
+            tf = tf_list[int(chosen.property('tf_index'))]
+
+        self._apply_loaded_plant_tf(tf)
+
+    def _apply_loaded_plant_tf(self, tf: dict) -> None:
+        """Aplica K/τ de una TF identificada y avisa si no es sintetizable."""
+        motor = str(tf.get('motor', '?'))
+        sensor = str(tf.get('sensor', '?'))
+        K = float(tf.get('K', 0.0))
+        tau = float(tf.get('tau', 0.0))
+        tau_slow = float(tf.get('tau_slow', 1000.0))
+        self.set_plant_params(K, tau)
+        self.current_slot_key = f"{motor}_{sensor}"
+
+        # Sincronizar combo de motor de control H∞ live
+        if hasattr(self, 'control_motor_combo'):
+            want = f"Motor {motor}"
+            idx = self.control_motor_combo.findText(want)
+            if idx < 0:
+                idx = self.control_motor_combo.findText(motor)
+            if idx >= 0:
+                self.control_motor_combo.setCurrentIndex(idx)
+
+        warn = ""
+        if tau <= 1e-6:
+            warn = (
+                "\n\n⚠️ BLOQUEO: τ≈0 — esta identificación no es usable para síntesis H∞.\n"
+                "Re-identifica Motor "
+                f"{motor}/Sensor {sensor} en Análisis (necesitas τ>0) "
+                "o carga un controlador previo / slot guardado."
             )
-            self.results_text.setText(msg)
-            logger.info(f"Parámetros cargados: Motor {tf['motor']}/Sensor {tf['sensor']}, K={tf['K']:.4f}, τ={tf['tau']:.4f}")
-            return
-        
-        # Si hay múltiples, mostrar solo la más reciente
-        tf = tf_list[-1]  # La más reciente
-        self.set_plant_params(tf['K'], tf['tau'])
-        self.current_slot_key = f"{tf['motor']}_{tf['sensor']}"
-        
+            logger.warning(
+                f"Planta {motor}_{sensor} con τ={tau} — síntesis quedará bloqueada"
+            )
+
         msg = (
-            f"✅ Parámetros cargados (última función):\n"
+            f"✅ Parámetros cargados:\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  Motor {tf['motor']} / Sensor {tf['sensor']}\n"
-            f"  K  = {tf['K']:.4f} µm/s/PWM\n"
-            f"  τ  = {tf['tau']:.4f}s\n\n"
-            f"💡 Hay {len(tf_list)} funciones identificadas. Usando la más reciente."
+            f"  Slot: {self.current_slot_key}\n"
+            f"  Motor {motor} / Sensor {sensor}\n"
+            f"  Fecha: {tf.get('timestamp', '')}\n\n"
+            f"📐 MODELO:\n"
+            f"  K  = {K:.4f} µm/s/PWM\n"
+            f"  τ₁ = {tau:.4f}s (polo rápido)\n"
+            f"  τ₂ = {tau_slow:.1f}s (polo lento)"
+            f"{warn}\n\n"
+            f"Luego: Sintetizar → Transferir a Prueba → Solo Motor {motor}."
         )
         self.results_text.setText(msg)
-        logger.info(f"Cargada función más reciente: K={tf['K']:.4f}, τ={tf['tau']:.4f}")
+        logger.info(
+            f"Parámetros cargados: Motor {motor}/Sensor {sensor}, "
+            f"K={K:.4f}, τ={tau:.4f}, slot={self.current_slot_key}"
+        )
     
     # ================================================================
     # LÓGICA DE CONTROLADOR H∞ (movida desde main.py)
@@ -639,24 +708,20 @@ class HInfTab(QWidget):
             return False
     
     def transfer_to_test(self):
-        """Transfiere el controlador sintetizado a TestTab."""
+        """Transfiere el controlador sintetizado a TestTab (A y B independientes)."""
         logger.info("HInfTab: Iniciando transferencia a TestTab")
         
-        # Verificar que hay controlador sintetizado
         if self.synthesized_controller is None:
             QMessageBox.warning(self, "Error", "No hay controlador sintetizado para transferir")
             logger.warning("No hay controlador sintetizado")
             return
         
-        # Verificar que TestTab está configurado
         if self.test_tab_reference is None:
             QMessageBox.warning(self, "Error", "TestTab no está configurado")
             logger.error("TestTab reference no configurada")
             return
         
-        # Obtener parámetros del controlador con verificación detallada
         try:
-            # Verificar atributos críticos uno por uno
             if not hasattr(self, 'Kp_designed'):
                 raise AttributeError("Kp_designed no está definido. Sintetiza o carga un controlador primero.")
             if not hasattr(self, 'Ki_designed'):
@@ -677,10 +742,20 @@ class HInfTab(QWidget):
             wb = float(self.w1_wb.text())
             U_max = self.Umax_designed
             gamma = self.gamma
+            slot_key = self.get_active_slot_key()
+            invert_pwm = bool(self.invert_pwm.isChecked())
             
-            logger.info(f"Parámetros a transferir: Kp={Kp:.4f}, Ki={Ki:.4f}, K={K_abs:.4f}, τ={tau:.4f}")
+            logger.info(
+                f"Parámetros a transferir [{slot_key}]: "
+                f"Kp={Kp:.4f}, Ki={Ki:.4f}, K={K_abs:.4f}, τ={tau:.4f}, invert={invert_pwm}"
+            )
         except AttributeError as e:
-            QMessageBox.warning(self, "Error", f"Parámetros incompletos:\n\n{str(e)}\n\nPasos necesarios:\n1. Cargar planta desde Análisis\n2. Sintetizar controlador H∞\n3. Transferir a Prueba")
+            QMessageBox.warning(
+                self, "Error",
+                f"Parámetros incompletos:\n\n{str(e)}\n\n"
+                "Pasos necesarios:\n1. Cargar planta desde Análisis\n"
+                "2. Sintetizar controlador H∞\n3. Transferir a Prueba"
+            )
             logger.error(f"Error obteniendo parámetros: {e}")
             return
         except Exception as e:
@@ -688,95 +763,207 @@ class HInfTab(QWidget):
             logger.error(f"Error obteniendo parámetros: {e}")
             return
         
-        # Preguntar a qué motor transferir
         dialog = QDialog(self)
         dialog.setWindowTitle("Transferir Controlador H∞")
-        dialog.setGeometry(100, 100, 500, 600)
+        dialog.setGeometry(100, 100, 520, 640)
         layout = QVBoxLayout()
         
-        # Mostrar resumen
         summary = QTextEdit()
         summary.setReadOnly(True)
-        summary.setMaximumHeight(400)
+        summary.setMaximumHeight(360)
         summary_text = (
-            f"╔══════════════════════════════════════════════════╗\n"
-            f"║  PARÁMETROS DEL CONTROLADOR H∞                   ║\n"
-            f"╠══════════════════════════════════════════════════╣\n"
-            f"║  PLANTA G(s):                                    ║\n"
-            f"║    K = {K_original:+.4f} µm/s/PWM                     ║\n"
-            f"║    τ = {tau:.4f} s                                    ║\n"
-            f"║    G(s) = {K_abs:.4f} / (s·({tau:.4f}s + 1))         ║\n"
-            f"╠══════════════════════════════════════════════════╣\n"
-            f"║  CONTROLADOR K(s):                               ║\n"
-            f"║    Kp = {Kp:.4f}                                     ║\n"
-            f"║    Ki = {Ki:.4f}                                     ║\n"
-            f"║    K(s) = ({Kp:.4f}·s + {Ki:.4f}) / s               ║\n"
-            f"╠══════════════════════════════════════════════════╣\n"
-            f"║  PONDERACIONES:                                  ║\n"
-            f"║    Ms = {Ms:.2f}, ωb = {wb:.2f} rad/s                 ║\n"
-            f"║    U_max = {U_max:.1f} PWM                             ║\n"
-            f"║    γ = {gamma:.4f}                                    ║\n"
-            f"╚══════════════════════════════════════════════════╝\n"
+            f"Slot activo: {slot_key}\n"
+            f"Invert PWM (síntesis): {invert_pwm}\n\n"
+            f"Planta: K={K_original:+.4f} µm/s/PWM, τ={tau:.4f} s\n"
+            f"Controlador: Kp={Kp:.4f}, Ki={Ki:.4f}\n"
+            f"Ms={Ms:.2f}, ωb={wb:.2f}, U_max={U_max:.1f}, γ={gamma:.4f}\n"
         )
         summary.setText(summary_text)
         summary.setStyleSheet("font-family: 'Courier New'; font-size: 10px;")
         layout.addWidget(summary)
         
-        layout.addWidget(QLabel("\n¿A qué motor deseas transferir?"))
+        layout.addWidget(QLabel("¿A qué motor deseas transferir?"))
         
-        motor_a_radio = QRadioButton("Motor A (X)")
-        motor_b_radio = QRadioButton("Motor B (Y)")
-        both_radio = QRadioButton("Ambos motores")
-        motor_b_radio.setChecked(True)  # Por defecto Motor B
+        motor_a_radio = QRadioButton("Solo Motor A (X) — deja B intacto")
+        motor_b_radio = QRadioButton("Solo Motor B (Y) — deja A intacto")
+        both_same_radio = QRadioButton("Ambos con ESTE diseño (idénticos — no recomendado)")
+        both_slots_radio = QRadioButton("Slots guardados: A_* → Motor A y B_* → Motor B")
+        
+        # Destino por defecto = letra del slot (A_2→A, B_1→B). Nunca default a B a ciegas.
+        default_motor = 'A' if str(slot_key).upper().startswith('A') else 'B'
+        if default_motor == 'A':
+            motor_a_radio.setChecked(True)
+        else:
+            motor_b_radio.setChecked(True)
         
         layout.addWidget(motor_a_radio)
         layout.addWidget(motor_b_radio)
-        layout.addWidget(both_radio)
+        layout.addWidget(both_same_radio)
+        layout.addWidget(both_slots_radio)
+        
+        hint = QLabel(
+            "Para controladores distintos: sintetiza/carga A_2 → Solo Motor A, "
+            "luego B_1 → Solo Motor B.\n"
+            "O usa 'Slots guardados' si ambos ya están en la sesión."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #AAAAAA; font-size: 10px;")
+        layout.addWidget(hint)
         
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        
         dialog.setLayout(layout)
         
-        if dialog.exec_() == QDialog.Accepted:
-            transferred_motors = []
-            
-            # Crear info del controlador
-            controller_data = {
-                'controller': self.synthesized_controller,
-                'Kp': Kp,
-                'Ki': Ki,
-                'K': K_abs,
-                'K_sign': np.sign(K_original),
-                'tau': tau,
-                'Ms': Ms,
-                'wb': wb,
-                'U_max': U_max,
-                'gamma': gamma
-            }
-            
-            if motor_a_radio.isChecked() or both_radio.isChecked():
-                self.test_tab_reference.set_controller('A', controller_data)
-                transferred_motors.append("Motor A")
-                logger.info("Controlador transferido a Motor A")
-            
-            if motor_b_radio.isChecked() or both_radio.isChecked():
-                self.test_tab_reference.set_controller('B', controller_data)
-                transferred_motors.append("Motor B")
-                logger.info("Controlador transferido a Motor B")
-            
-            motor_names = " y ".join(transferred_motors)
-            
-            QMessageBox.information(self, "✅ Transferencia Exitosa",
-                                   f"Controlador transferido a {motor_names}:\n\n"
-                                   f"Kp = {Kp:.4f}\n"
-                                   f"Ki = {Ki:.4f}\n\n"
-                                   f"Planta: K = {K_abs:.4f} µm/s/PWM, τ = {tau:.4f} s\n\n"
-                                   f"Revisa la pestaña 'Prueba' para usar el controlador.")
-            
-            logger.info(f"Transferencia completada a {motor_names}")
-            if hasattr(self.parent_gui, '_save_session_state'):
-                self.parent_gui._save_session_state()
-    
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        if both_slots_radio.isChecked():
+            ok, msg = self._transfer_slots_to_test()
+            if ok:
+                QMessageBox.information(self, "Transferencia Exitosa", msg)
+            else:
+                QMessageBox.warning(self, "Transferencia incompleta", msg)
+            return
+
+        controller_data = {
+            'controller': self.synthesized_controller,
+            'Kp': float(Kp),
+            'Ki': float(Ki),
+            'K': float(K_abs),
+            'K_sign': float(np.sign(K_original)),
+            'tau': float(tau),
+            'Ms': float(Ms),
+            'wb': float(wb),
+            'U_max': float(U_max),
+            'gamma': float(gamma),
+            'slot_key': slot_key,
+            'invert_pwm': invert_pwm,
+        }
+
+        transferred_motors = []
+        if motor_a_radio.isChecked() or both_same_radio.isChecked():
+            self._push_controller_to_test('A', controller_data)
+            transferred_motors.append(f"Motor A (Kp={Kp:.4f}, Ki={Ki:.4f})")
+        if motor_b_radio.isChecked() or both_same_radio.isChecked():
+            self._push_controller_to_test('B', controller_data)
+            transferred_motors.append(f"Motor B (Kp={Kp:.4f}, Ki={Ki:.4f})")
+
+        motor_names = "\n".join(f"• {m}" for m in transferred_motors)
+        warn = ""
+        if both_same_radio.isChecked():
+            warn = (
+                "\n\nAVISO: Ambos motores recibieron el MISMO diseño. "
+                "Si querías A≠B, usa transferencias por separado o 'Slots guardados'."
+            )
+        QMessageBox.information(
+            self, "Transferencia Exitosa",
+            f"Transferido:\n{motor_names}{warn}\n\nRevisa la pestaña Prueba."
+        )
+        logger.info(f"Transferencia completada: {transferred_motors}")
+        if hasattr(self.parent_gui, '_save_session_state'):
+            self.parent_gui._save_session_state()
+
+    def _controller_data_from_hinf_snapshot(self, snapshot: dict) -> dict:
+        """Convierte snapshot de slot H∞ a dict usable por TestTab."""
+        result = snapshot.get('result', {}) or {}
+        weights = snapshot.get('weights', {}) or {}
+        plant = snapshot.get('plant', {}) or {}
+        K_val = float(result.get('K_value', plant.get('K', 1.0)))
+        return {
+            'Kp': float(result.get('Kp', 0.0)),
+            'Ki': float(result.get('Ki', 0.0)),
+            'K': abs(K_val),
+            'K_sign': float(np.sign(K_val) if K_val != 0 else 1.0),
+            'tau': float(result.get('tau_value', plant.get('tau', 0.0))),
+            'Ms': float(weights.get('Ms', 0.0)),
+            'wb': float(weights.get('wb', 0.0)),
+            'U_max': float(result.get('Umax_designed', weights.get('U_max', 150.0))),
+            'gamma': float(result.get('gamma', 0.0)),
+            'slot_key': str(snapshot.get('slot_key', '')),
+            'invert_pwm': bool(weights.get('invert_pwm', False)),
+        }
+
+    def _push_controller_to_test(self, motor: str, controller_data: dict) -> None:
+        """Entrega una COPIA independiente al motor indicado + preferencias de slot."""
+        from copy import deepcopy
+        tf_obj = controller_data.get('controller')
+        payload = deepcopy({k: v for k, v in controller_data.items() if k != 'controller'})
+        if tf_obj is not None:
+            payload['controller'] = tf_obj
+
+        motor = motor.upper()
+        slot_key = str(payload.get('slot_key', '') or '')
+        # Sensor canónico: A→2, B→1. Invert del slot solo como valor inicial en UI.
+        if motor == 'A':
+            sensor = '2'
+            if '_' in slot_key:
+                sensor = slot_key.split('_', 1)[1][:1] or '2'
+            prefs_invert = {'A': bool(payload.get('invert_pwm', False))}
+            self.test_tab_reference.apply_controller_preferences(
+                {'A': f'sensor_{sensor}'},
+                prefs_invert,
+            )
+        else:
+            sensor = '1'
+            if '_' in slot_key:
+                sensor = slot_key.split('_', 1)[1][:1] or '1'
+            prefs_invert = {'B': bool(payload.get('invert_pwm', False))}
+            self.test_tab_reference.apply_controller_preferences(
+                {'B': f'sensor_{sensor}'},
+                prefs_invert,
+            )
+
+        self.test_tab_reference.set_controller(motor, payload)
+
+    def _transfer_slots_to_test(self):
+        """
+        Transfiere controladores distintos desde hinf.slots:
+        primer slot A_* → Motor A, primer slot B_* → Motor B.
+        """
+        parent = self.parent_gui
+        if parent is None or not hasattr(parent, 'session_store'):
+            return False, "No hay session_store disponible."
+
+        session = parent.session_store.get_session()
+        slots = (session.get('hinf') or {}).get('slots') or {}
+        if not slots:
+            return False, "No hay slots H∞ guardados en la sesión."
+
+        slot_a = next((k for k in sorted(slots) if str(k).upper().startswith('A')), None)
+        slot_b = next((k for k in sorted(slots) if str(k).upper().startswith('B')), None)
+        if not slot_a and not slot_b:
+            return False, f"Slots presentes sin prefijo A_/B_: {list(slots.keys())}"
+
+        lines = []
+        if slot_a:
+            data_a = self._controller_data_from_hinf_snapshot(slots[slot_a])
+            self._push_controller_to_test('A', data_a)
+            lines.append(
+                f"Motor A ← {slot_a}: Kp={data_a['Kp']:.4f}, Ki={data_a['Ki']:.4f}, "
+                f"invert={data_a['invert_pwm']}"
+            )
+        if slot_b:
+            data_b = self._controller_data_from_hinf_snapshot(slots[slot_b])
+            self._push_controller_to_test('B', data_b)
+            lines.append(
+                f"Motor B ← {slot_b}: Kp={data_b['Kp']:.4f}, Ki={data_b['Ki']:.4f}, "
+                f"invert={data_b['invert_pwm']}"
+            )
+
+        if hasattr(parent, '_save_session_state'):
+            parent._save_session_state()
+
+        if slot_a and slot_b:
+            same = (
+                abs(float(slots[slot_a]['result']['Kp']) - float(slots[slot_b]['result']['Kp'])) < 1e-9
+                and abs(float(slots[slot_a]['result']['Ki']) - float(slots[slot_b]['result']['Ki'])) < 1e-9
+            )
+            if same:
+                lines.append(
+                    "\nAVISO: A_* y B_* tienen los mismos Kp/Ki en la sesión "
+                    "(re-sintetiza cada slot si deben ser distintos)."
+                )
+
+        return True, "\n".join(lines)

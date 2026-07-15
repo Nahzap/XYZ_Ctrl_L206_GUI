@@ -67,7 +67,7 @@ class CameraTab(QWidget):
         
         Args:
             thorlabs_available: Si pylablib está disponible
-            parent: Widget padre (ArduinoGUI)
+            parent: Widget padre (CTRL_GUI)
             camera_service: Instancia de CameraService
             camera_orchestrator: Instancia de CameraOrchestrator (NUEVO)
         """

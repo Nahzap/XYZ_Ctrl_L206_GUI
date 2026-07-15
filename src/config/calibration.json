@@ -1,43 +1,26 @@
 {
     "_comment": "Archivo de calibración del sistema XYZ. Editar según mediciones reales.",
-    "_updated": "2026-06-26 15:05:35",
+    "_updated": "2026-07-14 19:31:04",
     "calibration": {
         "x_axis": {
             "description": "Motor A, Sensor 2 - Eje X",
-            "intercept_um": 20107.69230769231,
-            "slope_um_per_adc": 15.384615384615385
+            "intercept_um": 21104.97237569061,
+            "slope_um_per_adc": 2.907822041291073
         },
         "y_axis": {
             "description": "Motor B, Sensor 1 - Eje Y",
-            "intercept_um": 22818.181818181816,
-            "slope_um_per_adc": 12.987012987012987
+            "intercept_um": 22356.60439200262,
+            "slope_um_per_adc": 3.2776138970829236
         }
     },
     "control": {
-        "deadzone_adc": 2,
+        "deadzone_adc": 8,
         "position_tolerance_um": 25.0,
         "settling_cycles": 4,
         "default_trajectory_pause_s": 2.0
     },
     "system": {
-        "adc_max": 1023.0,
+        "adc_max": 4095.0,
         "recorrido_um": 20000.0
-    },
-    "step_control": {
-        "enabled": true,
-        "step_control_mode": "hinf_native",
-        "step_um": 20.0,
-        "tol_step_um": 25.0,
-        "tol_fov_um": 25.0,
-        "step_dwell_ms": 0,
-        "step_inter_step_brake": false,
-        "step_dual_axis_mode": "primary_only",
-        "step_hinf_pwm_min": 80,
-        "use_arduino_settled": false,
-        "sensor_max_age_ms": 60.0,
-        "homogeneity_mode": "structural",
-        "fov_creep_adc": 10,
-        "fov_creep_cooldown_ticks": 45,
-        "sensor_control_max_age_ms": 20.0
     }
 }

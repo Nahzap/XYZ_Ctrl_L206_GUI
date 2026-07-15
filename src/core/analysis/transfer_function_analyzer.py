@@ -424,8 +424,9 @@ class TransferFunctionAnalyzer:
                 break
         
         if existing_idx is not None:
-            # Actualizar entrada existente
-            self.identified_functions[existing_idx] = tf_entry
+            # Actualizar y mover al final → "más reciente" = última re-identificación
+            self.identified_functions.pop(existing_idx)
+            self.identified_functions.append(tf_entry)
             logger.info(f"Función de transferencia actualizada: Motor {motor} / Sensor {sensor}")
         else:
             # Agregar nueva entrada

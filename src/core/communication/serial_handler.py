@@ -2,8 +2,11 @@
 import serial
 import time
 import logging
+import threading
 import traceback
 from PyQt5.QtCore import QThread, pyqtSignal
+
+from core.communication.protocol import MotorProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,47 @@ class SerialHandler(QThread):
         self.ser = None
         # Buffer circular para reconstruir líneas completas
         self._buffer = ""
+        # Plano MÁQUINA: destino de la medida a tasa completa (independiente de la UI).
+        # Se llena en ESTE hilo (RX), no en el hilo GUI, para que el control no
+        # dependa del repintado. Ver plan 20260714_0032.
+        self.sensor_buffer = None
+        # TX seguro: el worker de control y la GUI pueden escribir a la vez.
+        self._tx_lock = threading.Lock()
         logger.info(f"SerialHandler inicializado: Puerto={port}, Baudrate={baudrate}")
+
+    def set_sensor_buffer(self, sensor_buffer):
+        """Conecta el SensorBuffer que se actualizará en el hilo RX (plano máquina)."""
+        self.sensor_buffer = sensor_buffer
+
+    def _update_sensor_buffer(self, line):
+        """Parsea telemetría y actualiza el buffer en el hilo RX (tasa completa).
+
+        No toca widgets: solo estado thread-safe para medida/control.
+        """
+        if self.sensor_buffer is None:
+            return
+        if not line or line[0] not in '-0123456789':
+            return  # descarta INFO:/ERROR:/cabecera sin costo de split
+        try:
+            parts = line.split(',')
+            if len(parts) >= 6:
+                parsed = MotorProtocol.parse_sensor_data_with_status(line)
+                if not parsed:
+                    return
+                self.sensor_buffer.update(
+                    parsed['sens_1'], parsed['sens_2'],
+                    pot_a=parsed['pot_a'], pot_b=parsed['pot_b'],
+                    settled=bool(parsed.get('settled', False)),
+                    state=str(parsed.get('state', '')),
+                )
+            elif len(parts) == 4:
+                pot_a, pot_b, sens_1, sens_2 = map(int, parts)
+                self.sensor_buffer.update(
+                    sens_1, sens_2, pot_a=pot_a, pot_b=pot_b,
+                    settled=False, state='LEGACY',
+                )
+        except (ValueError, IndexError):
+            return
 
     def run(self):
         """
@@ -53,7 +96,7 @@ class SerialHandler(QThread):
             )
             logger.info(f"Puerto {self.port} @ {self.baudrate} bps - Buffer circular activo")
             
-            # Espera inicial para Arduino
+            # Espera breve post-open (STM32 VCP / legacy Arduino)
             time.sleep(0.1)
             self._buffer = ""  # Limpiar buffer
             self.data_received.emit("INFO: Conectado exitosamente.")
@@ -76,6 +119,9 @@ class SerialHandler(QThread):
                                 line, self._buffer = self._buffer.split('\n', 1)
                                 line = line.strip()
                                 if line:
+                                    # Plano MÁQUINA: medida fresca en el hilo RX
+                                    # (antes de emitir a la UI) → control desacoplado.
+                                    self._update_sensor_buffer(line)
                                     self.data_received.emit(line)
                             
                             # Evitar que el buffer crezca indefinidamente
@@ -116,7 +162,8 @@ class SerialHandler(QThread):
         """
         if self.ser and self.ser.is_open:
             try:
-                self.ser.write(data)
+                with self._tx_lock:
+                    self.ser.write(data)
                 return True
             except Exception as e:
                 logger.error(f"Error escribiendo al serial: {e}")
@@ -136,7 +183,8 @@ class SerialHandler(QThread):
         if self.ser and self.ser.is_open:
             try:
                 full_command = command + '\n'
-                self.ser.write(full_command.encode('utf-8'))
+                with self._tx_lock:
+                    self.ser.write(full_command.encode('utf-8'))
                 logger.debug(f"Comando enviado: {command}")
                 return True
             except Exception as e:
