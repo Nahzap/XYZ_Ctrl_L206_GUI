@@ -13,7 +13,7 @@ import logging
 from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QLabel, QLineEdit, QPushButton, QTextEdit, QWidget,
                              QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QRadioButton)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QLocale
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -145,7 +145,8 @@ def create_config_section(widgets: dict, apply_exposure_cb, apply_fps_cb, apply_
     
     # FPS
     layout.addWidget(QLabel("FPS:"), 1, 0)
-    widgets['fps_input'] = QLineEdit("30")
+    # acA2500-14uc: techo ~14 fps @ full frame
+    widgets['fps_input'] = QLineEdit("14")
     widgets['fps_input'].setFixedWidth(100)
     layout.addWidget(widgets['fps_input'], 1, 1)
     
@@ -157,9 +158,11 @@ def create_config_section(widgets: dict, apply_exposure_cb, apply_fps_cb, apply_
     
     # Buffer de imágenes
     layout.addWidget(QLabel("Buffer (frames):"), 2, 0)
-    widgets['buffer_input'] = QLineEdit("1")
+    widgets['buffer_input'] = QLineEdit("2")
     widgets['buffer_input'].setFixedWidth(100)
-    widgets['buffer_input'].setToolTip("Número de frames en buffer (1-10). Usar 2 para estabilidad.")
+    widgets['buffer_input'].setToolTip(
+        "Frames en buffer (2 recomendado con LatestImageOnly)."
+    )
     layout.addWidget(widgets['buffer_input'], 2, 1)
     
     widgets['apply_buffer_btn'] = QPushButton("✓ Aplicar")
@@ -399,8 +402,9 @@ def create_capture_section(widgets: dict, browse_cb, capture_cb, focus_cb) -> QG
     return group
 
 
-def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb, 
-                               browse_folder_cb, update_estimate_cb) -> QGroupBox:
+def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
+                               browse_folder_cb, update_estimate_cb,
+                               open_folder_cb=None) -> QGroupBox:
     """
     Crea la sección de microscopía automatizada.
     
@@ -411,6 +415,7 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
         stop_cb: Callback para detener microscopía
         browse_folder_cb: Callback para explorar carpeta
         update_estimate_cb: Callback para actualizar estimación de almacenamiento
+        open_folder_cb: Callback opcional para abrir la carpeta destino en el explorador
         
     Returns:
         QGroupBox configurado
@@ -458,6 +463,26 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     traj_layout.addWidget(refresh_traj_btn)
     traj_layout.addStretch()
     layout.addLayout(traj_layout)
+
+    # Continuar desde un punto (reanudación tras FOV / stop)
+    resume_layout = QHBoxLayout()
+    resume_layout.addWidget(QLabel("Continuar desde punto:"))
+    widgets['resume_point_spin'] = QSpinBox()
+    widgets['resume_point_spin'].setRange(1, 1)
+    widgets['resume_point_spin'].setValue(1)
+    widgets['resume_point_spin'].setFixedWidth(80)
+    widgets['resume_point_spin'].setToolTip(
+        "Punto 1-based de la trayectoria zig-zag.\n"
+        "• 1 = empezar desde el inicio\n"
+        "• Si falló el P36, pon 36 para reintentar ese punto\n"
+        "• Las capturas ya guardadas (índices anteriores) no se borran"
+    )
+    resume_layout.addWidget(widgets['resume_point_spin'])
+    widgets['resume_hint_label'] = QLabel("(1 = inicio)")
+    widgets['resume_hint_label'].setStyleSheet("color: #95A5A6; font-style: italic;")
+    resume_layout.addWidget(widgets['resume_hint_label'])
+    resume_layout.addStretch()
+    layout.addLayout(resume_layout)
     
     # Fila 1: Nombre de clase + Tamaño imagen
     row1_layout = QHBoxLayout()
@@ -470,13 +495,20 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     
     row1_layout.addSpacing(20)
     row1_layout.addWidget(QLabel("Tamaño imagen (px):"))
-    widgets['img_width_input'] = QLineEdit("1920")
+    # Defaults Basler acA2500 nativo (se sobrescriben al conectar con ROI real)
+    widgets['img_width_input'] = QLineEdit("2590")
     widgets['img_width_input'].setFixedWidth(60)
+    widgets['img_width_input'].setToolTip(
+        "Se autocompleta con la resolución real de la Basler al conectar"
+    )
     widgets['img_width_input'].textChanged.connect(update_estimate_cb)
     row1_layout.addWidget(widgets['img_width_input'])
     row1_layout.addWidget(QLabel("×"))
-    widgets['img_height_input'] = QLineEdit("1080")
+    widgets['img_height_input'] = QLineEdit("1942")
     widgets['img_height_input'].setFixedWidth(60)
+    widgets['img_height_input'].setToolTip(
+        "Se autocompleta con la resolución real de la Basler al conectar"
+    )
     widgets['img_height_input'].textChanged.connect(update_estimate_cb)
     row1_layout.addWidget(widgets['img_height_input'])
     row1_layout.addStretch()
@@ -512,14 +544,25 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     # Fila 3: Carpeta de destino
     folder_layout = QHBoxLayout()
     folder_layout.addWidget(QLabel("Carpeta destino:"))
-    widgets['microscopy_folder_input'] = QLineEdit("C:\\MicroscopyData")
+    widgets['microscopy_folder_input'] = QLineEdit(
+        "F:/MICROSCOPIA/MIELES/APICOLA QUINCHAO/SAMPLE 001"
+    )
     widgets['microscopy_folder_input'].setMinimumWidth(300)
-    widgets['microscopy_folder_input'].setToolTip("Carpeta donde se guardarán las imágenes")
+    widgets['microscopy_folder_input'].setToolTip(
+        "Carpeta exacta donde se escriben las PNG/JSON de microscopía"
+    )
     folder_layout.addWidget(widgets['microscopy_folder_input'])
     
     browse_btn = QPushButton("Explorar")
     browse_btn.clicked.connect(browse_folder_cb)
     folder_layout.addWidget(browse_btn)
+    open_btn = QPushButton("Abrir")
+    open_btn.setToolTip("Abrir esta carpeta en el Explorador de Windows")
+    if open_folder_cb is not None:
+        open_btn.clicked.connect(open_folder_cb)
+    else:
+        open_btn.setEnabled(False)
+    folder_layout.addWidget(open_btn)
     folder_layout.addStretch()
     layout.addLayout(folder_layout)
     
@@ -542,13 +585,17 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     
     # Botones de microscopía
     btn_layout = QHBoxLayout()
-    widgets['microscopy_start_btn'] = QPushButton("🚀 Iniciar Microscopía")
+    widgets['microscopy_start_btn'] = QPushButton("🚀 Iniciar / Continuar Microscopía")
     widgets['microscopy_start_btn'].setStyleSheet("""
         QPushButton { font-size: 13px; font-weight: bold; padding: 10px; background-color: #27AE60; }
         QPushButton:hover { background-color: #2ECC71; }
         QPushButton:disabled { background-color: #505050; color: #808080; }
     """)
     widgets['microscopy_start_btn'].setEnabled(False)
+    widgets['microscopy_start_btn'].setToolTip(
+        "Inicia desde el punto indicado arriba. "
+        "Tras un fallo FOV, el spin se rellena solo con el punto detenido."
+    )
     widgets['microscopy_start_btn'].clicked.connect(start_cb)
     
     widgets['microscopy_stop_btn'] = QPushButton("⏹️ Detener")
@@ -651,21 +698,22 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     
     detection_form.addWidget(QLabel("Área mínima:"), 0, 0)
     widgets['min_pixels_spin'] = QSpinBox()
-    widgets['min_pixels_spin'].setRange(10, 100000)
+    # Sin tope artificial útil: hasta ~1e9 px (límite práctico de QSpinBox int)
+    widgets['min_pixels_spin'].setRange(1, 999_999_999)
     widgets['min_pixels_spin'].setValue(100)
     widgets['min_pixels_spin'].setSuffix(" px")
-    widgets['min_pixels_spin'].setToolTip("Área mínima del objeto en píxeles")
-    widgets['min_pixels_spin'].setFixedWidth(100)
+    widgets['min_pixels_spin'].setToolTip("Área mínima del objeto en píxeles (sin límite artificial)")
+    widgets['min_pixels_spin'].setFixedWidth(130)
     widgets['min_pixels_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['min_pixels_spin'], 0, 1)
     
     detection_form.addWidget(QLabel("Área máxima:"), 0, 2)
     widgets['max_pixels_spin'] = QSpinBox()
-    widgets['max_pixels_spin'].setRange(100, 500000)
+    widgets['max_pixels_spin'].setRange(1, 999_999_999)
     widgets['max_pixels_spin'].setValue(50000)
     widgets['max_pixels_spin'].setSuffix(" px")
-    widgets['max_pixels_spin'].setToolTip("Área máxima del objeto en píxeles")
-    widgets['max_pixels_spin'].setFixedWidth(100)
+    widgets['max_pixels_spin'].setToolTip("Área máxima del objeto en píxeles (sin límite artificial; escribe el valor que quieras)")
+    widgets['max_pixels_spin'].setFixedWidth(130)
     widgets['max_pixels_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['max_pixels_spin'], 0, 3)
     
@@ -674,9 +722,13 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['circularity_spin'] = QDoubleSpinBox()
     widgets['circularity_spin'].setRange(0.0, 1.0)
     widgets['circularity_spin'].setSingleStep(0.05)
-    widgets['circularity_spin'].setValue(0.35)
+    widgets['circularity_spin'].setValue(0.25)
     widgets['circularity_spin'].setDecimals(2)
-    widgets['circularity_spin'].setToolTip("Circularidad mínima (0-1). 1=círculo perfecto. REDUCIR para muestras borrosas.")
+    widgets['circularity_spin'].setToolTip(
+        "Circularidad mínima (0-1). 1=círculo perfecto.\n"
+        "BAJAR (0.10-0.25) para polen/manchas irregulares.\n"
+        "0 = desactivar filtro."
+    )
     widgets['circularity_spin'].setFixedWidth(100)
     widgets['circularity_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['circularity_spin'], 1, 1)
@@ -686,23 +738,30 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     widgets['aspect_ratio_spin'] = QDoubleSpinBox()
     widgets['aspect_ratio_spin'].setRange(0.0, 1.0)
     widgets['aspect_ratio_spin'].setSingleStep(0.05)
-    widgets['aspect_ratio_spin'].setValue(0.40)
+    widgets['aspect_ratio_spin'].setValue(0.25)
     widgets['aspect_ratio_spin'].setDecimals(2)
-    widgets['aspect_ratio_spin'].setToolTip("Aspect ratio mínimo (0-1). Rechaza objetos muy alargados.")
+    widgets['aspect_ratio_spin'].setToolTip(
+        "Aspect ratio mínimo (0-1). Rechaza objetos muy alargados.\n"
+        "BAJAR (0.10-0.25) para aceptar más formas.\n"
+        "0 = desactivar filtro."
+    )
     widgets['aspect_ratio_spin'].setFixedWidth(100)
     widgets['aspect_ratio_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['aspect_ratio_spin'], 1, 3)
     
     # Parámetros de búsqueda Z
     # Fila 2: Distancia total de escaneo
-    detection_form.addWidget(QLabel("Distancia escaneo:"), 2, 0)
+    detection_form.addWidget(QLabel("Distancia fine ±:"), 2, 0)
     widgets['z_scan_range_spin'] = QDoubleSpinBox()
-    widgets['z_scan_range_spin'].setRange(1.0, 50.0)
+    widgets['z_scan_range_spin'].setRange(0.1, 500.0)
     widgets['z_scan_range_spin'].setValue(20.0)
     widgets['z_scan_range_spin'].setSuffix(" µm")
     widgets['z_scan_range_spin'].setDecimals(1)
     widgets['z_scan_range_spin'].setSingleStep(1.0)
-    widgets['z_scan_range_spin'].setToolTip("Distancia de búsqueda desde posición ACTUAL del C-Focus (±valor)\nEjemplo: Si C-Focus está en 40µm y distancia=20µm, buscará entre 20-60µm")
+    widgets['z_scan_range_spin'].setToolTip(
+        "Límite máximo ±µm alrededor del plano COARSE con mayor S.\n"
+        "El recorrido real FINE usa Paso fino × N° capas, sin exceder este Δ."
+    )
     widgets['z_scan_range_spin'].setFixedWidth(100)
     widgets['z_scan_range_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['z_scan_range_spin'], 2, 1)
@@ -721,61 +780,92 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     # Fila 3: Pasos Z
     detection_form.addWidget(QLabel("Paso grueso:"), 3, 0)
     widgets['z_step_coarse_spin'] = QDoubleSpinBox()
-    widgets['z_step_coarse_spin'].setRange(0.01, 10.0)
-    widgets['z_step_coarse_spin'].setValue(0.5)
+    widgets['z_step_coarse_spin'].setRange(0.001, 100.0)
+    widgets['z_step_coarse_spin'].setValue(2.0)
     widgets['z_step_coarse_spin'].setSuffix(" µm")
     widgets['z_step_coarse_spin'].setDecimals(3)
-    widgets['z_step_coarse_spin'].setSingleStep(0.01)
-    widgets['z_step_coarse_spin'].setToolTip("Paso grueso para escaneo inicial (debe ser > Paso fino)")
+    widgets['z_step_coarse_spin'].setSingleStep(0.1)
+    widgets['z_step_coarse_spin'].setToolTip(
+        "Paso grueso del escaneo Z (debe ser > Paso fino).\n"
+        "Recomendado: 1–3 µm para no saltarse el pico."
+    )
     widgets['z_step_coarse_spin'].setFixedWidth(100)
     widgets['z_step_coarse_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['z_step_coarse_spin'], 3, 1)
     
     detection_form.addWidget(QLabel("Paso fino:"), 3, 2)
     widgets['z_step_fine_spin'] = QDoubleSpinBox()
-    widgets['z_step_fine_spin'].setRange(0.001, 5.0)
-    widgets['z_step_fine_spin'].setValue(0.1)
+    widgets['z_step_fine_spin'].setRange(0.001, 100.0)
+    widgets['z_step_fine_spin'].setValue(0.5)
     widgets['z_step_fine_spin'].setSuffix(" µm")
     widgets['z_step_fine_spin'].setDecimals(3)
-    widgets['z_step_fine_spin'].setSingleStep(0.01)
-    widgets['z_step_fine_spin'].setToolTip("Paso fino para refinamiento (debe ser < Paso grueso)")
+    widgets['z_step_fine_spin'].setSingleStep(0.05)
+    widgets['z_step_fine_spin'].setToolTip(
+        "Paso real entre candidatos FINE alrededor de Z_coarse*.\n"
+        "Junto con N° capas define el recorrido simétrico. "
+        "Recomendado: 0.2–0.5 µm."
+    )
     widgets['z_step_fine_spin'].setFixedWidth(100)
     widgets['z_step_fine_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['z_step_fine_spin'], 3, 3)
     
-    # Fila 4: N° capturas multi-focales y settle time
+    # Fila 4: N° capturas multi-focales y tolerancia de llegada Z
     detection_form.addWidget(QLabel("N° capturas:"), 4, 0)
     widgets['n_captures_spin'] = QSpinBox()
-    widgets['n_captures_spin'].setRange(1, 11)
+    widgets['n_captures_spin'].setRange(3, 11)
     widgets['n_captures_spin'].setValue(3)
     widgets['n_captures_spin'].setSingleStep(2)  # Solo impares
     widgets['n_captures_spin'].setToolTip(
-        "Número de capturas multi-focales (siempre impar: 1, 3, 5, 7...)\n"
-        "BPoF en el centro (f1 para n=3), ±paso captura arriba/abajo"
+        "Capturas multi-focales (impar ≥3).\n"
+        "Con n=3 y paso 10µm: BPoF-10, BPoF, BPoF+10 (f0,f1,f2)."
     )
     widgets['n_captures_spin'].setFixedWidth(100)
     widgets['n_captures_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['n_captures_spin'], 4, 1)
     
-    detection_form.addWidget(QLabel("Settle (ms):"), 4, 2)
-    widgets['z_settle_spin'] = QSpinBox()
-    widgets['z_settle_spin'].setRange(10, 1000)
-    widgets['z_settle_spin'].setValue(100)
-    widgets['z_settle_spin'].setSuffix(" ms")
-    widgets['z_settle_spin'].setToolTip("Tiempo de estabilización después de cada movimiento Z")
-    widgets['z_settle_spin'].setFixedWidth(100)
-    widgets['z_settle_spin'].valueChanged.connect(update_params_cb)
-    detection_form.addWidget(widgets['z_settle_spin'], 4, 3)
+    detection_form.addWidget(QLabel("Tol. Z llegada:"), 4, 2)
+    widgets['z_arrive_tol_spin'] = QDoubleSpinBox()
+    widgets['z_arrive_tol_spin'].setRange(0.05, 5.0)
+    widgets['z_arrive_tol_spin'].setValue(0.5)
+    widgets['z_arrive_tol_spin'].setSuffix(" µm")
+    widgets['z_arrive_tol_spin'].setDecimals(2)
+    widgets['z_arrive_tol_spin'].setSingleStep(0.05)
+    widgets['z_arrive_tol_spin'].setLocale(QLocale(QLocale.C))
+    widgets['z_arrive_tol_spin'].setToolTip(
+        "Condición de cumplimiento: |Z_read − Z_cmd| ≤ tol en lecturas\n"
+        "consecutivas. No es un tiempo de asentamiento fijo."
+    )
+    widgets['z_arrive_tol_spin'].setFixedWidth(100)
+    widgets['z_arrive_tol_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['z_arrive_tol_spin'], 4, 3)
+    # Compat: alias antiguo (tests / código que aún busque z_settle_spin)
+    widgets['z_settle_spin'] = widgets['z_arrive_tol_spin']
 
-    detection_form.addWidget(QLabel("Paso captura:"), 5, 0)
+    detection_form.addWidget(QLabel("N° capas fine:"), 5, 2)
+    widgets['n_fine_planes_spin'] = QSpinBox()
+    widgets['n_fine_planes_spin'].setRange(3, 101)
+    widgets['n_fine_planes_spin'].setValue(15)
+    widgets['n_fine_planes_spin'].setSingleStep(2)
+    widgets['n_fine_planes_spin'].setToolTip(
+        "N candidatos FINE (impar), centrados exactamente en Z_coarse*.\n"
+        "Semirango solicitado = Paso fino × (N−1)/2; Δ fine es el máximo."
+    )
+    widgets['n_fine_planes_spin'].setFixedWidth(100)
+    widgets['n_fine_planes_spin'].valueChanged.connect(update_params_cb)
+    detection_form.addWidget(widgets['n_fine_planes_spin'], 5, 3)
+
+    detection_form.addWidget(QLabel("Variación S:"), 5, 0)
     widgets['z_step_capture_spin'] = QDoubleSpinBox()
-    widgets['z_step_capture_spin'].setRange(0.1, 20.0)
-    widgets['z_step_capture_spin'].setValue(2.0)
-    widgets['z_step_capture_spin'].setSuffix(" µm")
-    widgets['z_step_capture_spin'].setDecimals(2)
+    widgets['z_step_capture_spin'].setRange(0.1, 90.0)
+    widgets['z_step_capture_spin'].setValue(10.0)
+    widgets['z_step_capture_spin'].setSuffix(" %")
+    widgets['z_step_capture_spin'].setDecimals(1)
+    widgets['z_step_capture_spin'].setLocale(QLocale(QLocale.C))
     widgets['z_step_capture_spin'].setSingleStep(0.1)
     widgets['z_step_capture_spin'].setToolTip(
-        "Separación Z entre capas multi-focales (BPoF ± este paso)"
+        "Caída óptica objetivo del índice S respecto al BPoF.\n"
+        "Los planos se seleccionan desde la curva COARSE+FINE ya medida;\n"
+        "no se ejecuta un segundo barrido Z después de encontrar el BPoF."
     )
     widgets['z_step_capture_spin'].setFixedWidth(100)
     widgets['z_step_capture_spin'].valueChanged.connect(update_params_cb)
@@ -784,10 +874,14 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     # Fila 6: ROI margin
     detection_form.addWidget(QLabel("ROI Margin:"), 6, 0)
     widgets['roi_margin_spin'] = QSpinBox()
-    widgets['roi_margin_spin'].setRange(0, 9999)
-    widgets['roi_margin_spin'].setValue(20)
+    widgets['roi_margin_spin'].setRange(0, 10000)
+    widgets['roi_margin_spin'].setValue(200)
     widgets['roi_margin_spin'].setSuffix(" px")
-    widgets['roi_margin_spin'].setToolTip("Margen adicional alrededor del bbox para cálculo de sharpness (sin límite)")
+    widgets['roi_margin_spin'].setToolTip(
+        "Margen solicitado alrededor del bbox/ROI (px).\n"
+        "El índice S usa la máscara del objeto y un contexto máximo de 16 px\n"
+        "para no procesar fondo descartado ni ralentizar COARSE/FINE."
+    )
     widgets['roi_margin_spin'].setFixedWidth(100)
     widgets['roi_margin_spin'].valueChanged.connect(update_params_cb)
     detection_form.addWidget(widgets['roi_margin_spin'], 6, 1)
@@ -841,12 +935,12 @@ def create_u2net_config_section(widgets: dict, mode_change_cb, update_params_cb)
     # Fila 0: Umbral de Saliencia
     advanced_form.addWidget(QLabel("Umbral Saliencia:"), 0, 0)
     widgets['saliency_threshold_spin'] = QDoubleSpinBox()
-    widgets['saliency_threshold_spin'].setRange(0.10, 0.50)
+    widgets['saliency_threshold_spin'].setRange(0.05, 0.60)
     widgets['saliency_threshold_spin'].setSingleStep(0.05)
     widgets['saliency_threshold_spin'].setValue(0.30)
     widgets['saliency_threshold_spin'].setDecimals(2)
     widgets['saliency_threshold_spin'].setToolTip(
-        "Sensibilidad de detección (0.10-0.50)\n"
+        "Sensibilidad de detección (0.05-0.60)\n"
         "• Menor valor = más objetos detectados\n"
         "• Mayor valor = solo objetos muy salientes\n"
         "Default: 0.30 (Normal), 0.15 (Sensible)"

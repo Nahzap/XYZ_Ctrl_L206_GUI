@@ -3,34 +3,37 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-07-14T19:37:44.441178",
+  "last_updated": "2026-08-07T09:47:58.089152",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
-    "points": 336,
+    "points": 1344,
     "fov": {
-      "x": 162.9,
-      "y": 122.1,
+      "x": 320.0,
+      "y": 240.0,
       "unit": "µm"
     },
     "x_range": {
-      "min": 12500.0,
-      "max": 15000.0,
+      "min": 10000.0,
+      "max": 20000.0,
       "unit": "µm"
     },
     "y_range": {
-      "min": 12500.0,
-      "max": 15000.0,
+      "min": 10000.0,
+      "max": 20000.0,
       "unit": "µm"
     },
-    "delay_between_points": 1.0,
+    "delay_between_points": 0.0,
     "delay_unit": "seconds"
   },
   "test_service": {
     "description": "Parámetros de TestService para ejecución de trayectoria",
-    "tolerance": 100.0,
+    "tolerance": 12.0,
     "tolerance_unit": "µm",
+    "tolerance_note": "≤ FOV_min/10 (p.ej. 122/10≈12) — tol≥FOV/2 acepta varios puntos en el mismo XY",
     "pause_duration": 0.5,
     "pause_unit": "seconds",
+    "point_timeout_s": 6.0,
+    "point_timeout_note": "Máx. segundos por punto; si no cierra tol → accept con error y avanza",
     "mode": "AUTO-ADVANCE",
     "modes_available": [
       "AUTO-ADVANCE",
@@ -39,17 +42,17 @@
   },
   "microscopy": {
     "description": "Parámetros de microscopía automatizada",
-    "class_name": "Escalonia_pulverulenta",
-    "total_points": 475,
+    "class_name": "APICOLA_QUINCHAO",
+    "total_points": 1344,
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 50000,
-        "max": 500000,
+        "min": 12000,
+        "max": 2000000,
         "unit": "px"
       }
     },
-    "channels": "G",
+    "channels": "RGB",
     "channels_available": [
       "R",
       "G",
@@ -69,8 +72,8 @@
       16
     ],
     "delays": {
-      "before_capture": 1750,
-      "after_capture": 750,
+      "before_capture": 1000,
+      "after_capture": 1000,
       "unit": "ms"
     },
     "learning_mode": {
@@ -85,21 +88,102 @@
     "min_area": 500,
     "min_probability": 0.3,
     "morphological_filters": {
-      "min_circularity": 0.42,
+      "min_circularity": 0.4,
       "min_aspect_ratio": 0.4,
       "description": "Filtros morfológicos para rechazar manchas irregulares"
     }
   },
   "camera": {
-    "description": "Parámetros de cámara Thorlabs",
-    "model": "CS235MU",
-    "serial_number": "09213",
-    "frame_rate": 30,
+    "description": "Parámetros base de cámara (perfil científico acA2500-14uc)",
+    "model": "Basler acA2500-14uc",
+    "serial_number": "",
+    "frame_rate": 14,
     "frame_rate_unit": "FPS",
     "exposure": 0.015,
     "exposure_unit": "seconds",
-    "buffer_size": 1,
-    "buffer_unit": "frames"
+    "buffer_size": 5,
+    "buffer_unit": "frames",
+    "gain_db": 0.0,
+    "scientific": {
+      "disable_auto_exposure": true,
+      "disable_auto_gain": true,
+      "preserve_bit_depth": true,
+      "load_user_set": "Default",
+      "pixel_format_priority": [
+        "BayerGB12",
+        "BayerGB12p",
+        "BayerGB8",
+        "Mono8",
+        "YCbCr422_8"
+      ],
+      "native_width": 2590,
+      "native_height": 1942,
+      "pixel_size_um": 2.2,
+      "native_bit_depth": 12,
+      "shutter": "rolling"
+    }
+  },
+  "camera_tab": {
+    "version": 1,
+    "description": "Últimas opciones editables de la pestaña Cámara",
+    "camera": {
+      "exposure": 0.05,
+      "fps": 14,
+      "buffer_frames": 1
+    },
+    "capture": {
+      "save_folder": "C:\\CapturasCamara",
+      "image_format": "PNG",
+      "use_16bit": true,
+      "mode": "simple",
+      "zstack": {
+        "z_step_um": 0.05,
+        "save_json": true,
+        "channels": {
+          "R": false,
+          "G": true,
+          "B": false
+        }
+      }
+    },
+    "microscopy": {
+      "class_name": "APICOLA_QUINCHAO",
+      "xy_only": false,
+      "img_width": 2590,
+      "img_height": 1942,
+      "save_folder": "F:\\MICROSCOPIA\\MIELES\\APICOLA QUINCHAO\\SAMPLE 001",
+      "delay_before_s": 1.0,
+      "delay_after_s": 1.0,
+      "channels": {
+        "R": true,
+        "G": true,
+        "B": true
+      }
+    },
+    "autofocus": {
+      "enabled": true,
+      "full_scan": true,
+      "min_pixels": 12000,
+      "max_pixels": 2000000,
+      "min_circularity": 0.4,
+      "min_aspect_ratio": 0.4,
+      "z_scan_range_um": 7.0,
+      "z_step_coarse_um": 4.0,
+      "z_step_fine_um": 1.0,
+      "n_captures": 3,
+      "capture_s_drop_percent": 5.0,
+      "n_fine_planes": 23,
+      "z_arrive_tol_um": 1.0,
+      "roi_margin_px": 15
+    },
+    "u2net": {
+      "detection_mode": "Sensible (Polen)",
+      "saliency_threshold": 0.15,
+      "adaptive_k": 0.5,
+      "morph_kernel": "3×3 (Sensible)",
+      "clahe_clip": 2.0,
+      "clahe_tile": "4×4 (Detalle)"
+    }
   },
   "cfocus": {
     "description": "Parámetros de C-Focus (autofoco)",

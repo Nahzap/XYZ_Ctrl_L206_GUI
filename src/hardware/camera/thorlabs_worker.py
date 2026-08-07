@@ -178,6 +178,10 @@ class ThorlabsWorker(BaseCameraWorker):
                     frame = self.cam.read_oldest_image()
                     
                     if frame is not None:
+                        # Contrato AF: publicar la imagen antes de anunciar
+                        # el serial/contador correspondiente.
+                        raw_frame = frame.copy()
+                        self.current_frame = raw_frame
                         self.frame_count += 1
                         
                         # GESTIÓN DE MEMORIA: Limpiar buffer cada 30 frames
@@ -194,10 +198,6 @@ class ThorlabsWorker(BaseCameraWorker):
                                 gc.collect()
                             except Exception as e:
                                 pass  # Ignorar errores de limpieza
-                        
-                        # GUARDAR frame para captura (una sola copia)
-                        raw_frame = frame.copy()
-                        self.current_frame = raw_frame
                         
                         # Normalizar a uint8 para visualización
                         if frame.dtype != np.uint8:
@@ -308,6 +308,36 @@ class ThorlabsWorker(BaseCameraWorker):
                 pass
             return False
     
+    def acquire_scientific_frame(self, timeout_s: float = 2.0):
+        """Única vía pública: mono nativo → ScientificFrame (prepare único)."""
+        from hardware.camera.scientific_image import scientific_frame_from_raw
+
+        if not self.running:
+            raise RuntimeError(
+                "[ThorlabsWorker] acquire_scientific_frame requiere live view"
+            )
+        start_id = int(self.frame_count)
+        deadline = time.perf_counter() + float(timeout_s)
+        while time.perf_counter() < deadline:
+            if int(self.frame_count) > start_id and self.current_frame is not None:
+                raw = np.asarray(self.current_frame)
+                if raw.dtype != np.uint16:
+                    # Contenedor uint16 LSB; prepare empaqueta a MSB
+                    if raw.dtype == np.uint8:
+                        raw = raw.astype(np.uint16)
+                    else:
+                        raw = raw.astype(np.uint16, copy=False)
+                return scientific_frame_from_raw(
+                    raw,
+                    pixel_format="Mono12",
+                    wb_gains=(1.0, 1.0, 1.0),
+                    frame_id=int(self.frame_count),
+                )
+            time.sleep(0.005)
+        raise TimeoutError(
+            f"[ThorlabsWorker] acquire_scientific_frame timeout ({timeout_s}s)"
+        )
+
     def change_exposure(self, exposure_value: float):
         """Cambia la exposición de la cámara en tiempo real."""
         try:

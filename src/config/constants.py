@@ -18,9 +18,15 @@ SERIAL_PORT = 'COM5'
 BAUD_RATE = 1000000
 PLOT_LENGTH = 100
 
-# Fase 5.3: UI de producto — baud/COM avanzada oculta; operador no elige 100 Hz.
-# False = modo lab (muestra baudrate y permite overrides).
-FACTORY_UI = True
+# False = modo lab: muestra combo de baudrate (default BAUD_RATE = 1 Mbps).
+# True ocultaba el selector y dejaba solo "Enlace: 1000 kbps (fijo)".
+FACTORY_UI = False
+
+# --- PERFIL MCU (STM32 MycoViT | Arduino UNO emergencia) ---
+# Se sobrescribe al arrancar / al cambiar el selector vía mcu_profiles.apply_mcu_profile.
+MCU_TYPE = 'ARDUINO'
+MCU_SUPPORTS_CZ = False
+MCU_USE_CZ_DEFAULT = False
 
 # --- SEPARACIÓN DE PLANOS (Fase 1: lazo máquina-rápido + UI ~30 Hz) ---
 # La UI (labels/plots) se refresca a esta tasa; la medida (SensorBuffer) y el
@@ -205,17 +211,95 @@ def um_to_adc(um: float, axis: str = 'x') -> float:
     """
     Convierte posición en µm a valor ADC con la calibración del eje.
 
-    Usa intercept/slope del eje (no RECORRIDO_UM ni FACTOR_ESCALA).
-    No satura: fuera de rango físico se deja al controlador decidir.
+    Ley unificada (misma que el ajuste del analizador):
+        um = intercept + slope * adc
+    con ``slope`` con signo (DIRECTA > 0, INVERSA < 0).
     """
     cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
-    return (cal['intercept'] - um) / cal['slope']
+    slope = cal['slope']
+    if slope == 0:
+        raise ValueError(f"slope de calibración eje {axis} es 0")
+    return (um - cal['intercept']) / slope
 
 
 def adc_to_um(adc: float, axis: str = 'x') -> float:
-    """Convierte ADC → µm con la calibración del eje (intercept − adc·slope)."""
+    """Convierte ADC → µm: ``intercept + slope * adc`` (slope con signo)."""
     cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
-    return cal['intercept'] - (adc * cal['slope'])
+    return cal['intercept'] + (adc * cal['slope'])
+
+
+def position_error_um(target_um: float, adc: float, axis: str = 'x') -> float:
+    """Error de posición (µm): target − medición. Única ley de error del stack."""
+    return target_um - adc_to_um(adc, axis=axis)
+
+
+def slope_um_per_adc(axis: str = 'x') -> float:
+    """Pendiente con signo (DIRECTA > 0, INVERSA < 0)."""
+    cal = CALIBRATION_X if axis.lower() == 'x' else CALIBRATION_Y
+    return float(cal['slope'])
+
+
+def lsb_um(axis: str = 'x') -> float:
+    """Magnitud µm por LSB ADC (siempre ≥ 0)."""
+    return abs(slope_um_per_adc(axis))
+
+
+def mcu_cz_invert(axis: str = 'x', host_invert: bool = False) -> bool:
+    """
+    Polaridad C(z) (comando ``I``): True si PWM+ disminuye el ADC del eje.
+
+    El checkbox Invertir PWM del host actúa en espacio µm; C(z) actúa en ADC.
+    Hay que combinar slope (DIRECTA/INVERSA) con ese invert:
+
+    - DIRECTA (slope>0): act_inv == host_invert
+    - INVERSA (slope<0): act_inv == not host_invert
+
+    Con ambos Invert marcados y Y INVERSA → típico ``I,1,0`` (no ``I,0,1``).
+    """
+    if slope_um_per_adc(axis) < 0.0:
+        return not bool(host_invert)
+    return bool(host_invert)
+
+
+# Banda real de movimiento (perfil MCU; defaults = Arduino emergencia):
+#   STM32 (app_cz.h): UMIN=95, UMAX approach=150
+#   Arduino UNO+DRV8871: arranque útil |pwm| >= 110 (hasta 255)
+# Toda actuación host/MCU de approach DEBE quedar en [MIN, MAX] o 0.
+STITION_PWM_MIN = 110
+STITION_PWM_MAX = 255
+
+
+def mcu_supports_cz() -> bool:
+    """True solo en perfil STM32 (C(z) F/I/P + Settled)."""
+    return bool(MCU_SUPPORTS_CZ)
+
+
+def host_pwm_sign(error_um: float, host_invert: bool = False) -> int:
+    """Signo de comando ``A`` en espacio µm (checkbox Invertir)."""
+    if abs(float(error_um)) < 1e-12:
+        return 0
+    sgn = 1 if float(error_um) > 0.0 else -1
+    return -sgn if host_invert else sgn
+
+
+def host_slew_pwm(
+    error_um: float,
+    *,
+    host_invert: bool = False,
+    magnitude: int = STITION_PWM_MAX,
+    local_sign: int = 1,
+) -> int:
+    """PWM open-loop en [STITION_PWM_MIN, STITION_PWM_MAX] (o 0)."""
+    sgn = host_pwm_sign(error_um, host_invert)
+    if sgn == 0:
+        return 0
+    mag = abs(int(magnitude))
+    if mag <= 0:
+        return 0
+    mag = max(int(STITION_PWM_MIN), min(int(STITION_PWM_MAX), mag))
+    if int(local_sign) < 0:
+        sgn = -sgn
+    return int(sgn * mag)
 
 
 def get_calibration_info() -> dict:

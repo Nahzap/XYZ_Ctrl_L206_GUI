@@ -144,6 +144,12 @@ class ParameterManager:
         
         logger.info(f"📝 Detección actualizada: circ≥{min_circularity}, aspect≥{min_aspect_ratio}")
         self.save()
+
+    def update_camera_tab(self, settings: Dict[str, Any]) -> bool:
+        """Guarda el formulario completo de la pestaña Cámara."""
+        self.parameters['camera_tab'] = settings
+        logger.debug("📝 Opciones de CameraTab actualizadas")
+        return self.save()
     
     def get_trajectory_defaults(self) -> Dict[str, Any]:
         """Obtiene valores por defecto de trayectoria."""
@@ -171,10 +177,14 @@ class ParameterManager:
         """Obtiene valores por defecto de detección."""
         return self.parameters.get('detection', {
             'morphological_filters': {
-                'min_circularity': 0.42,
-                'min_aspect_ratio': 0.40
+                'min_circularity': 0.25,
+                'min_aspect_ratio': 0.25
             }
         })
+
+    def get_camera_tab_defaults(self) -> Dict[str, Any]:
+        """Obtiene el último formulario completo guardado de CameraTab."""
+        return self.parameters.get('camera_tab', {})
     
     def _create_default_config(self):
         """Crea configuración por defecto."""
@@ -213,9 +223,13 @@ class ParameterManager:
             
             "detection": {
                 "morphological_filters": {
-                    "min_circularity": 0.42,
-                    "min_aspect_ratio": 0.40
+                    "min_circularity": 0.25,
+                    "min_aspect_ratio": 0.25
                 }
+            },
+
+            "camera_tab": {
+                "description": "Últimas opciones editables de la pestaña Cámara"
             }
         }
         

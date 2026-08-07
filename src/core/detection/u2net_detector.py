@@ -859,7 +859,7 @@ class U2NetDetector:
                                clahe_tile_size: tuple = None):
         """Actualiza parámetros avanzados de detección."""
         if saliency_threshold is not None:
-            self.saliency_threshold = np.clip(saliency_threshold, 0.1, 0.5)
+            self.saliency_threshold = np.clip(saliency_threshold, 0.05, 0.6)
         if adaptive_k is not None:
             self.adaptive_k = np.clip(adaptive_k, 0.1, 1.0)
         if morph_kernel_size is not None:

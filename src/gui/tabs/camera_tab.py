@@ -10,16 +10,19 @@ Reducción: 1472 → ~450 líneas
 """
 
 import logging
+import os
 import time
+import json
 import numpy as np
 import cv2
 from datetime import datetime
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QScrollArea,
                              QFileDialog, QMessageBox)
-from PyQt5.QtCore import pyqtSignal, Qt
+from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 
 from gui.windows.camera_window import CameraViewWindow
+from gui.tabs.camera_live_bridge import CameraLiveBridge
 from gui.utils.camera_tab_ui_builder import (
     create_connection_section,
     create_live_view_section,
@@ -32,7 +35,13 @@ from gui.utils.camera_tab_ui_builder import (
 )
 from core.services import CameraOrchestrator
 from core.models import AutofocusConfig
+from core.utils.folder_reveal import reveal_folder
+from hardware.camera.scientific_image import save_scientific_image
 from utils.parameter_manager import get_parameter_manager
+
+# Defaults Basler acA2500 nativo (se reemplazan al conectar con ROI real)
+_DEFAULT_IMG_WIDTH = 2590
+_DEFAULT_IMG_HEIGHT = 1942
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -93,6 +102,18 @@ class CameraTab(QWidget):
         
         # Referencia a TestTab para obtener trayectoria
         self.test_tab = None
+
+        # Path live (SRP): frames → ventana + preview_enabled
+        self._live_bridge = CameraLiveBridge(
+            get_window=lambda: self.camera_view_window,
+            camera_service=self.camera_service,
+            sync_resolution=lambda: self._sync_resolution_from_camera(persist=True),
+            apply_resolution_from_qimage=lambda w, h: self._apply_camera_resolution(
+                w, h, persist=True
+            ),
+        )
+        # Sin ventana al inicio: no construir QImage full/preview en worker
+        self._live_bridge.notify_window_visibility(False)
         
         # Configurar UI
         self._setup_ui()
@@ -149,8 +170,11 @@ class CameraTab(QWidget):
             self._widgets,
             self.refresh_trajectory_from_test_tab,
             self._on_start_microscopy, self._on_stop_microscopy,
-            self._browse_microscopy_folder, self._update_storage_estimate
+            self._browse_microscopy_folder, self._update_storage_estimate,
+            self._open_microscopy_folder,
         ))
+        self._resolution_synced_from_frame = False
+        self._opened_save_folder_this_run = False
         
         # Sección 6: Autofoco
         main_layout.addWidget(create_autofocus_section(
@@ -177,6 +201,7 @@ class CameraTab(QWidget):
         
         # Cargar parámetros por defecto
         self._load_default_parameters()
+        self._setup_settings_persistence()
         
         # Conectar botón de calibración DESPUÉS del mapeo
         self.cfocus_calibrate_btn.clicked.connect(self._on_calibrate_cfocus)
@@ -255,6 +280,10 @@ class CameraTab(QWidget):
         self.microscopy_start_btn = self._widgets.get('microscopy_start_btn')
         self.microscopy_stop_btn = self._widgets.get('microscopy_stop_btn')
         self.microscopy_progress_label = self._widgets.get('microscopy_progress_label')
+        self.resume_point_spin = self._widgets.get('resume_point_spin')
+        self.resume_hint_label = self._widgets.get('resume_hint_label')
+        if self.resume_point_spin is not None:
+            self.resume_point_spin.valueChanged.connect(self._update_resume_button_label)
         
         # Autofoco
         self.autofocus_enabled_cb = self._widgets.get('autofocus_enabled_cb')
@@ -272,7 +301,9 @@ class CameraTab(QWidget):
         self.z_step_fine_spin = self._widgets.get('z_step_fine_spin')
         self.n_captures_spin = self._widgets.get('n_captures_spin')
         self.z_step_capture_spin = self._widgets.get('z_step_capture_spin')
-        self.z_settle_spin = self._widgets.get('z_settle_spin')
+        self.z_settle_spin = self._widgets.get('z_settle_spin')  # alias Tol. Z
+        self.z_arrive_tol_spin = self._widgets.get('z_arrive_tol_spin') or self.z_settle_spin
+        self.n_fine_planes_spin = self._widgets.get('n_fine_planes_spin')
         self.roi_margin_spin = self._widgets.get('roi_margin_spin')
         self.estimated_images_label = self._widgets.get('estimated_images_label')
         self.cfocus_status_label = self._widgets.get('cfocus_status_label')
@@ -315,39 +346,580 @@ class CameraTab(QWidget):
         self._update_zstack_storage_estimate()
     
     def _load_default_parameters(self):
-        """Carga parámetros por defecto desde ParameterManager."""
+        """Carga el formulario CameraTab desde JSON camera_tab (último guardado).
+
+        Única fuente: parameters['camera_tab']. Sin secciones legacy ni re-aplicación.
+        """
         try:
             pm = get_parameter_manager()
-            
-            # Cargar parámetros de microscopía
-            micro_defaults = pm.get_microscopy_defaults()
-            if self.class_name_input:
-                self.class_name_input.setText(micro_defaults.get('class_name', 'Quillaja_Saponaria'))
-            delay_before_ms = micro_defaults.get('delays', {}).get('before_capture', 700)
-            delay_after_ms = micro_defaults.get('delays', {}).get('after_capture', 100)
-            self._set_numeric_widget_value(self.delay_before_input, float(delay_before_ms) / 1000.0)
-            self._set_numeric_widget_value(self.delay_after_input, float(delay_after_ms) / 1000.0)
-            
-            # Cargar parámetros de autofoco
-            af_config = micro_defaults.get('autofocus', {})
-            if self.autofocus_enabled_cb:
-                self.autofocus_enabled_cb.setChecked(af_config.get('enabled', False))
-            if self.min_pixels_spin:
-                self.min_pixels_spin.setValue(af_config.get('area_range', {}).get('min', 5000))
-            if self.max_pixels_spin:
-                self.max_pixels_spin.setValue(af_config.get('area_range', {}).get('max', 120000))
-            
-            # Cargar parámetros de detección
-            detect_defaults = pm.get_detection_defaults()
-            filters = detect_defaults.get('morphological_filters', {})
-            if self.circularity_spin:
-                self.circularity_spin.setValue(filters.get('min_circularity', 0.42))
-            if self.aspect_ratio_spin:
-                self.aspect_ratio_spin.setValue(filters.get('min_aspect_ratio', 0.40))
-            
-            logger.info("✅ Parámetros de microscopía cargados desde configuración")
+            saved = pm.get_camera_tab_defaults()
+            if not saved:
+                logger.warning(
+                    "[CameraTab] Sin sección camera_tab en JSON; "
+                    "se mantienen valores del builder hasta el primer guardado"
+                )
+                return
+
+            camera = saved.get('camera', {})
+            capture = saved.get('capture', {})
+            microscopy = saved.get('microscopy', {})
+            autofocus = saved.get('autofocus', {})
+            u2net = saved.get('u2net', {})
+
+            self._set_text(self.exposure_input, camera.get('exposure'))
+            self._set_text(self.fps_input, camera.get('fps'))
+            self._set_text(self.buffer_input, camera.get('buffer_frames'))
+
+            self._set_text(self.save_folder_input, capture.get('save_folder'))
+            self._set_combo(self.image_format_combo, capture.get('image_format'))
+            self._set_checked(self.use_16bit_check, capture.get('use_16bit'))
+            mode = capture.get('mode')
+            if mode == 'zstack' and self.capture_zstack_radio:
+                self.capture_zstack_radio.setChecked(True)
+            elif mode == 'simple' and self.capture_simple_radio:
+                self.capture_simple_radio.setChecked(True)
+            zstack = capture.get('zstack', {})
+            self._set_value(self.zstack_z_step_spin, zstack.get('z_step_um'))
+            self._set_checked(self.zstack_save_json_check, zstack.get('save_json'))
+            z_channels = zstack.get('channels', {})
+            self._set_checked(self.zstack_channel_r_check, z_channels.get('R'))
+            self._set_checked(self.zstack_channel_g_check, z_channels.get('G'))
+            self._set_checked(self.zstack_channel_b_check, z_channels.get('B'))
+
+            self._set_text(self.class_name_input, microscopy.get('class_name'))
+            self._set_checked(self.xy_only_cb, microscopy.get('xy_only'))
+            self._set_text(self.img_width_input, microscopy.get('img_width'))
+            self._set_text(self.img_height_input, microscopy.get('img_height'))
+            self._set_text(
+                self.microscopy_folder_input, microscopy.get('save_folder')
+            )
+            self._set_text(
+                self.delay_before_input, microscopy.get('delay_before_s')
+            )
+            self._set_text(
+                self.delay_after_input, microscopy.get('delay_after_s')
+            )
+            micro_channels = microscopy.get('channels', {})
+            self._set_checked(self.channel_r_check, micro_channels.get('R'))
+            self._set_checked(self.channel_g_check, micro_channels.get('G'))
+            self._set_checked(self.channel_b_check, micro_channels.get('B'))
+
+            self._set_checked(
+                self.autofocus_enabled_cb, autofocus.get('enabled')
+            )
+            self._set_checked(self.full_scan_cb, autofocus.get('full_scan'))
+            for widget, key in (
+                (self.min_pixels_spin, 'min_pixels'),
+                (self.max_pixels_spin, 'max_pixels'),
+                (self.circularity_spin, 'min_circularity'),
+                (self.aspect_ratio_spin, 'min_aspect_ratio'),
+                (self.z_scan_range_spin, 'z_scan_range_um'),
+                (self.z_step_coarse_spin, 'z_step_coarse_um'),
+                (self.z_step_fine_spin, 'z_step_fine_um'),
+                (self.n_captures_spin, 'n_captures'),
+                (self.z_arrive_tol_spin, 'z_arrive_tol_um'),
+                (self.n_fine_planes_spin, 'n_fine_planes'),
+                (self.roi_margin_spin, 'roi_margin_px'),
+            ):
+                self._set_value(widget, autofocus.get(key))
+            self._set_value(
+                self.z_step_capture_spin,
+                autofocus.get(
+                    'capture_s_drop_percent',
+                    autofocus.get('z_step_capture_um'),
+                ),
+            )
+
+            # Bloquear combo de modo: currentIndexChanged aplica presets y
+            # pisaría valores ya restaurados desde camera_tab.
+            if self.detection_mode_combo is not None:
+                self.detection_mode_combo.blockSignals(True)
+            self._set_combo(
+                self.detection_mode_combo, u2net.get('detection_mode')
+            )
+            if self.detection_mode_combo is not None:
+                self.detection_mode_combo.blockSignals(False)
+            self._set_value(
+                self.saliency_threshold_spin, u2net.get('saliency_threshold')
+            )
+            self._set_value(self.adaptive_k_spin, u2net.get('adaptive_k'))
+            self._set_combo(self.morph_kernel_combo, u2net.get('morph_kernel'))
+            self._set_value(self.clahe_clip_spin, u2net.get('clahe_clip'))
+            self._set_combo(self.clahe_tile_combo, u2net.get('clahe_tile'))
+
+            # Propagar formulario → scorer / U2-Net / autofoco
+            self.sync_runtime_params_from_ui()
+
+            logger.info("✅ CameraTab cargado desde JSON camera_tab")
         except Exception as e:
-            logger.warning(f"No se pudieron cargar parámetros de microscopía: {e}")
+            logger.warning(f"No se pudieron cargar parámetros de CameraTab: {e}")
+
+    @staticmethod
+    def _set_text(widget, value):
+        if widget is not None and value is not None:
+            widget.setText(str(value))
+
+    @staticmethod
+    def _set_checked(widget, value):
+        if widget is not None and value is not None:
+            widget.setChecked(bool(value))
+
+    @staticmethod
+    def _set_value(widget, value):
+        """Aplica el valor del JSON tal cual; amplía el rango del spin si hace falta."""
+        if widget is None or value is None:
+            return
+        try:
+            numeric = float(value) if isinstance(widget.value(), float) else int(round(float(value)))
+        except (TypeError, ValueError):
+            return
+        if hasattr(widget, 'minimum') and hasattr(widget, 'setMinimum'):
+            if numeric < widget.minimum():
+                widget.setMinimum(numeric)
+        if hasattr(widget, 'maximum') and hasattr(widget, 'setMaximum'):
+            if numeric > widget.maximum():
+                widget.setMaximum(numeric)
+        widget.setValue(numeric)
+
+    @staticmethod
+    def _set_combo(widget, value):
+        if widget is not None and value is not None:
+            index = widget.findText(str(value))
+            if index >= 0:
+                widget.setCurrentIndex(index)
+
+    def _setup_settings_persistence(self):
+        """Autoguarda las opciones editables con debounce de 750 ms."""
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(750)
+        self._settings_save_timer.timeout.connect(self.save_camera_tab_settings)
+
+        line_edits = (
+            self.exposure_input,
+            self.fps_input,
+            self.buffer_input,
+            self.save_folder_input,
+            self.class_name_input,
+            self.img_width_input,
+            self.img_height_input,
+            self.microscopy_folder_input,
+            self.delay_before_input,
+            self.delay_after_input,
+        )
+        combos = (
+            self.image_format_combo,
+            self.detection_mode_combo,
+            self.morph_kernel_combo,
+            self.clahe_tile_combo,
+        )
+        checks = (
+            self.use_16bit_check,
+            self.capture_simple_radio,
+            self.capture_zstack_radio,
+            self.zstack_save_json_check,
+            self.zstack_channel_r_check,
+            self.zstack_channel_g_check,
+            self.zstack_channel_b_check,
+            self.xy_only_cb,
+            self.channel_r_check,
+            self.channel_g_check,
+            self.channel_b_check,
+            self.autofocus_enabled_cb,
+            self.full_scan_cb,
+        )
+        numeric = (
+            self.zstack_z_step_spin,
+            self.min_pixels_spin,
+            self.max_pixels_spin,
+            self.circularity_spin,
+            self.aspect_ratio_spin,
+            self.z_scan_range_spin,
+            self.z_step_coarse_spin,
+            self.z_step_fine_spin,
+            self.n_captures_spin,
+            self.z_step_capture_spin,
+            self.z_arrive_tol_spin,
+            self.n_fine_planes_spin,
+            self.roi_margin_spin,
+            self.saliency_threshold_spin,
+            self.adaptive_k_spin,
+            self.clahe_clip_spin,
+        )
+        for widget in line_edits:
+            if widget:
+                widget.textChanged.connect(self._schedule_settings_save)
+        for widget in combos:
+            if widget:
+                widget.currentTextChanged.connect(self._schedule_settings_save)
+        for widget in checks:
+            if widget:
+                widget.toggled.connect(self._schedule_settings_save)
+        for widget in numeric:
+            if widget:
+                widget.valueChanged.connect(self._schedule_settings_save)
+        # Materializa la sección camera_tab aun si el usuario solo abre la app.
+        self._schedule_settings_save()
+
+    def _schedule_settings_save(self, *_):
+        if hasattr(self, '_settings_save_timer'):
+            self._settings_save_timer.start()
+
+    @staticmethod
+    def _number_from_text(widget, converter, default):
+        try:
+            return converter(widget.text())
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+    def _spin_value(self, widget, default):
+        try:
+            return widget.value() if widget is not None else default
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+    def read_detection_form_params(self) -> dict:
+        """Lee en vivo filtros de detección / morfología desde el formulario."""
+        return {
+            'min_pixels': int(self._spin_value(self.min_pixels_spin, 500)),
+            'max_pixels': int(self._spin_value(self.max_pixels_spin, 3_000_000)),
+            'min_circularity': float(self._spin_value(self.circularity_spin, 0.25)),
+            'min_aspect_ratio': float(self._spin_value(self.aspect_ratio_spin, 0.25)),
+            'saliency_threshold': float(
+                self._spin_value(self.saliency_threshold_spin, 0.30)
+            ),
+            'adaptive_k': float(self._spin_value(self.adaptive_k_spin, 0.5)),
+            'clahe_clip': float(self._spin_value(self.clahe_clip_spin, 2.0)),
+            'morph_kernel_index': (
+                self.morph_kernel_combo.currentIndex()
+                if self.morph_kernel_combo is not None else 1
+            ),
+            'clahe_tile_index': (
+                self.clahe_tile_combo.currentIndex()
+                if self.clahe_tile_combo is not None else 1
+            ),
+        }
+
+    def read_autofocus_form_params(self) -> dict:
+        """Lee en vivo pasos Z / ROI / tol. llegada Z desde el formulario."""
+        if self.z_arrive_tol_spin is None or self.z_step_coarse_spin is None:
+            raise RuntimeError("Spins de autofoco no inicializados")
+        n_fine = int(self.n_fine_planes_spin.value()) if self.n_fine_planes_spin else 15
+        if n_fine % 2 == 0:
+            n_fine += 1
+        return {
+            'autofocus_enabled': bool(
+                self.autofocus_enabled_cb.isChecked()
+                if self.autofocus_enabled_cb else False
+            ),
+            'full_scan': bool(
+                self.full_scan_cb.isChecked() if self.full_scan_cb else False
+            ),
+            'z_scan_range_um': float(self.z_scan_range_spin.value()),
+            'z_step_coarse': float(self.z_step_coarse_spin.value()),
+            'z_step_fine': float(self.z_step_fine_spin.value()),
+            'n_fine_planes': n_fine,
+            'z_step_capture': round(float(self.z_step_capture_spin.value()), 3),
+            'n_captures': int(self.n_captures_spin.value()),
+            'z_arrive_tol_um': float(self.z_arrive_tol_spin.value()),
+            'roi_margin_px': int(self.roi_margin_spin.value()),
+        }
+
+    def sync_runtime_params_from_ui(self, *, apply_u2net_advanced: bool = True) -> dict:
+        """Propaga el formulario Camera → U2-Net, SmartFocusScorer y Autofocus.
+
+        Misma idea que TestTab.sync_trajectory_params_from_ui: la UI es la
+        fuente de verdad; no dejar valores cacheados en el scorer (microscopía
+        usa assess_image del scorer, no solo U2NetDetector).
+        """
+        det = self.read_detection_form_params()
+        af = self.read_autofocus_form_params()
+        min_area = max(1, int(det['min_pixels']))
+        max_area = max(min_area, int(det['max_pixels']))
+        saliency = float(det['saliency_threshold'])
+        min_circ = float(det['min_circularity'])
+        min_aspect = float(det['min_aspect_ratio'])
+
+        try:
+            from core.detection.u2net_detector import U2NetDetector
+            detector = U2NetDetector.get_instance()
+            detector.set_parameters(
+                min_area=min_area,
+                max_area=max_area,
+                saliency_threshold=saliency,
+            )
+            if apply_u2net_advanced:
+                kernel_sizes = [3, 5, 7]
+                tile_sizes = [(4, 4), (8, 8), (16, 16)]
+                k_idx = max(0, min(2, int(det['morph_kernel_index'])))
+                t_idx = max(0, min(2, int(det['clahe_tile_index'])))
+                detector.set_advanced_parameters(
+                    saliency_threshold=saliency,
+                    adaptive_k=float(det['adaptive_k']),
+                    morph_kernel_size=kernel_sizes[k_idx],
+                    clahe_clip_limit=float(det['clahe_clip']),
+                    clahe_tile_size=tile_sizes[t_idx],
+                )
+        except Exception as e:
+            logger.warning("[CameraTab] No se pudo sincronizar U2NetDetector: %s", e)
+
+        # Scorer usado por microscopía / Test Detección (assess_image)
+        scorer = None
+        if self.orchestrator is not None:
+            scorer = getattr(self.orchestrator, 'scorer', None)
+        if scorer is None and self.parent_gui is not None:
+            scorer = getattr(self.parent_gui, 'smart_focus_scorer', None)
+        if scorer is not None:
+            try:
+                if hasattr(scorer, 'set_parameters'):
+                    scorer.set_parameters(
+                        threshold=saliency,
+                        min_area=min_area,
+                        max_area=max_area,
+                    )
+                if hasattr(scorer, 'set_morphology_params'):
+                    scorer.set_morphology_params(
+                        min_circularity=min_circ,
+                        min_aspect_ratio=min_aspect,
+                    )
+                if hasattr(scorer, 'roi_margin'):
+                    scorer.roi_margin = int(af['roi_margin_px'])
+            except Exception as e:
+                logger.warning("[CameraTab] No se pudo sincronizar SmartFocusScorer: %s", e)
+
+        if self.camera_view_window:
+            try:
+                self.camera_view_window.set_detection_params(
+                    min_area, max_area, threshold=saliency
+                )
+            except Exception:
+                pass
+
+        if self.parent_gui is not None:
+            det_svc = getattr(self.parent_gui, 'detection_service', None)
+            if det_svc is not None and hasattr(det_svc, 'set_parameters'):
+                try:
+                    det_svc.set_parameters(min_area, max_area, saliency)
+                except Exception:
+                    pass
+
+        if self.orchestrator is not None:
+            try:
+                self.orchestrator.update_scorer_morphology_params(
+                    min_circularity=min_circ,
+                    min_aspect_ratio=min_aspect,
+                )
+            except Exception:
+                pass
+            try:
+                from core.models import AutofocusConfig
+                af_cfg = AutofocusConfig(
+                    use_full_range=bool(af['full_scan']),
+                    z_scan_range=float(af['z_scan_range_um']),
+                    z_step_coarse=float(af['z_step_coarse']),
+                    z_step_fine=float(af['z_step_fine']),
+                    n_fine_planes=int(af['n_fine_planes']),
+                    z_arrive_tol_um=float(af['z_arrive_tol_um']),
+                    settle_time=0.0,
+                    capture_settle_time=0.0,
+                    roi_margin=int(af['roi_margin_px']),
+                    n_captures=int(af['n_captures']),
+                    z_step_capture=float(af['z_step_capture']),
+                )
+                self.orchestrator.update_autofocus_params(af_cfg)
+            except Exception as e:
+                logger.warning("[CameraTab] No se pudo sincronizar Autofocus: %s", e)
+
+        merged = {**det, **af, 'min_pixels': min_area, 'max_pixels': max_area}
+        logger.info(
+            "[CameraTab] UI→runtime: área=[%d-%d]px circ≥%.2f aspect≥%.2f "
+            "saliency=%.2f Z coarse=%.3f Δfine=±%.1f capas=%d tolZ=±%.2f "
+            "capture_ΔS=%.1f%% n=%d margin=%dpx",
+            min_area,
+            max_area,
+            min_circ,
+            min_aspect,
+            saliency,
+            af['z_step_coarse'],
+            af['z_scan_range_um'],
+            af['n_fine_planes'],
+            af['z_arrive_tol_um'],
+            af['z_step_capture'],
+            af['n_captures'],
+            af['roi_margin_px'],
+        )
+        return merged
+
+    def get_microscopy_execution_config(self) -> dict:
+        """Config de microscopía leída en vivo del formulario (+ sync runtime)."""
+        runtime = self.sync_runtime_params_from_ui()
+        delay_before_val = self._get_numeric_widget_value(
+            self.delay_before_input, default=0.7
+        )
+        delay_after_val = self._get_numeric_widget_value(
+            self.delay_after_input, default=0.1
+        )
+        class_name = (
+            self.class_name_input.text().strip().replace(' ', '_')
+            if self.class_name_input else 'sample'
+        )
+        xy_only = bool(self.xy_only_cb.isChecked()) if self.xy_only_cb else False
+        af_enabled = False if xy_only else bool(runtime.get('autofocus_enabled', False))
+        return {
+            'class_name': class_name or 'sample',
+            'save_folder': (
+                self.microscopy_folder_input.text()
+                if self.microscopy_folder_input else ''
+            ),
+            'img_width': int(
+                self._number_from_text(
+                    self.img_width_input, int, _DEFAULT_IMG_WIDTH
+                )
+            ),
+            'img_height': int(
+                self._number_from_text(
+                    self.img_height_input, int, _DEFAULT_IMG_HEIGHT
+                )
+            ),
+            'img_format': (
+                self.image_format_combo.currentText().lower()
+                if self.image_format_combo else 'png'
+            ),
+            'use_16bit': bool(
+                self.use_16bit_check.isChecked() if self.use_16bit_check else True
+            ),
+            'channels': {
+                'R': bool(self.channel_r_check.isChecked()) if self.channel_r_check else False,
+                'G': bool(self.channel_g_check.isChecked()) if self.channel_g_check else True,
+                'B': bool(self.channel_b_check.isChecked()) if self.channel_b_check else False,
+            },
+            'delay_before': float(delay_before_val),
+            'delay_after': float(delay_after_val),
+            'n_points': int(self._trajectory_n_points),
+            'autofocus_enabled': af_enabled,
+            'xy_only': xy_only,
+            'min_pixels': int(runtime['min_pixels']),
+            'max_pixels': int(runtime['max_pixels']),
+            'min_circularity': float(runtime['min_circularity']),
+            'min_aspect_ratio': float(runtime['min_aspect_ratio']),
+            'saliency_threshold': float(runtime['saliency_threshold']),
+            'z_step_coarse': float(runtime['z_step_coarse']),
+            'z_step_fine': float(runtime['z_step_fine']),
+            'z_step_capture': float(runtime['z_step_capture']),
+            'z_scan_range_um': float(runtime['z_scan_range_um']),
+            'n_captures': int(runtime['n_captures']),
+            'n_fine_planes': int(runtime['n_fine_planes']),
+            'z_arrive_tol_um': float(runtime['z_arrive_tol_um']),
+            'roi_margin_px': int(runtime['roi_margin_px']),
+            'full_scan': bool(runtime['full_scan']),
+            'start_point_1based': int(
+                self.resume_point_spin.value()
+                if self.resume_point_spin is not None else 1
+            ),
+        }
+
+    def get_area_range(self) -> tuple:
+        """Rango de área en vivo (para MicroscopyService / lambdas)."""
+        det = self.read_detection_form_params()
+        return int(det['min_pixels']), int(det['max_pixels'])
+
+    def _camera_tab_settings(self):
+        """Serializa únicamente opciones de usuario, no estados de conexión."""
+        return {
+            'version': 1,
+            'description': 'Últimas opciones editables de la pestaña Cámara',
+            'camera': {
+                'exposure': self._number_from_text(
+                    self.exposure_input, float, 0.015
+                ),
+                'fps': self._number_from_text(self.fps_input, int, 30),
+                'buffer_frames': self._number_from_text(
+                    self.buffer_input, int, 1
+                ),
+            },
+            'capture': {
+                'save_folder': self.save_folder_input.text(),
+                'image_format': self.image_format_combo.currentText(),
+                'use_16bit': self.use_16bit_check.isChecked(),
+                'mode': (
+                    'zstack'
+                    if self.capture_zstack_radio.isChecked()
+                    else 'simple'
+                ),
+                'zstack': {
+                    'z_step_um': self.zstack_z_step_spin.value(),
+                    'save_json': self.zstack_save_json_check.isChecked(),
+                    'channels': {
+                        'R': self.zstack_channel_r_check.isChecked(),
+                        'G': self.zstack_channel_g_check.isChecked(),
+                        'B': self.zstack_channel_b_check.isChecked(),
+                    },
+                },
+            },
+            'microscopy': {
+                'class_name': self.class_name_input.text(),
+                'xy_only': self.xy_only_cb.isChecked(),
+                'img_width': self._number_from_text(
+                    self.img_width_input, int, _DEFAULT_IMG_WIDTH
+                ),
+                'img_height': self._number_from_text(
+                    self.img_height_input, int, _DEFAULT_IMG_HEIGHT
+                ),
+                'save_folder': self.microscopy_folder_input.text(),
+                'delay_before_s': self._number_from_text(
+                    self.delay_before_input, float, 2.0
+                ),
+                'delay_after_s': self._number_from_text(
+                    self.delay_after_input, float, 0.2
+                ),
+                'channels': {
+                    'R': self.channel_r_check.isChecked(),
+                    'G': self.channel_g_check.isChecked(),
+                    'B': self.channel_b_check.isChecked(),
+                },
+            },
+            'autofocus': {
+                'enabled': self.autofocus_enabled_cb.isChecked(),
+                'full_scan': self.full_scan_cb.isChecked(),
+                'min_pixels': self.min_pixels_spin.value(),
+                'max_pixels': self.max_pixels_spin.value(),
+                'min_circularity': self.circularity_spin.value(),
+                'min_aspect_ratio': self.aspect_ratio_spin.value(),
+                'z_scan_range_um': self.z_scan_range_spin.value(),
+                'z_step_coarse_um': self.z_step_coarse_spin.value(),
+                'z_step_fine_um': self.z_step_fine_spin.value(),
+                'n_captures': self.n_captures_spin.value(),
+                'capture_s_drop_percent': self.z_step_capture_spin.value(),
+                'n_fine_planes': (
+                    self.n_fine_planes_spin.value()
+                    if self.n_fine_planes_spin else 15
+                ),
+                'z_arrive_tol_um': (
+                    self.z_arrive_tol_spin.value()
+                    if self.z_arrive_tol_spin else 0.5
+                ),
+                'roi_margin_px': self.roi_margin_spin.value(),
+            },
+            'u2net': {
+                'detection_mode': self.detection_mode_combo.currentText(),
+                'saliency_threshold': self.saliency_threshold_spin.value(),
+                'adaptive_k': self.adaptive_k_spin.value(),
+                'morph_kernel': self.morph_kernel_combo.currentText(),
+                'clahe_clip': self.clahe_clip_spin.value(),
+                'clahe_tile': self.clahe_tile_combo.currentText(),
+            },
+        }
+
+    def save_camera_tab_settings(self):
+        """Persiste inmediatamente el formulario; se usa también al cerrar."""
+        try:
+            if hasattr(self, '_settings_save_timer'):
+                self._settings_save_timer.stop()
+            get_parameter_manager().update_camera_tab(
+                self._camera_tab_settings()
+            )
+        except Exception as e:
+            logger.warning(f"No se pudieron guardar opciones de CameraTab: {e}")
     
     def _connect_orchestrator_signals(self):
         """Conecta señales del CameraOrchestrator con handlers de UI."""
@@ -487,12 +1059,16 @@ class CameraTab(QWidget):
                 )
                 self.log_message("🔗 Botones de control conectados a MicroscopyService")
                 logger.info("[CameraTab] Señales microscopía conectadas a CameraViewWindow")
+            self.camera_view_window.window_closed.connect(
+                lambda: self._live_bridge.notify_window_visibility(False)
+            )
         
         logger.info("[CameraTab] Actualizando parámetros de detección antes de mostrar ventana")
         self._update_detection_params()
         self.camera_view_window.show()
         self.camera_view_window.raise_()
         self.camera_view_window.activateWindow()
+        self._live_bridge.notify_window_visibility(True)
         self.log_message("📹 Ventana de cámara abierta")
         logger.info("[CameraTab] Ventana de cámara visible")
     
@@ -779,18 +1355,19 @@ class CameraTab(QWidget):
         return 0.0
     
     def _volumetry_capture_image(self, filepath: str, config: dict) -> bool:
-        """Captura y guarda imagen Z-Stack en monobanda (8/16-bit según formato)."""
-        if not self.camera_service or not self.camera_service.worker:
-            logger.error("[CameraTab] No hay camera_service o worker disponible")
+        """Captura Z-Stack solo vía acquire_scientific_frame (única vía CMOS)."""
+        if not self.camera_service:
+            logger.error("[CameraTab] No hay camera_service disponible")
             return False
-        
-        if self.camera_service.worker.current_frame is None:
-            logger.error("[CameraTab] current_frame es None")
-            return False
-        
+
         try:
-            # Obtener frame actual - COPIA
-            frame = self.camera_service.worker.current_frame.copy()
+            from hardware.camera.scientific_image import (
+                image16_to_u8_preview,
+                save_scientific_image,
+            )
+
+            sci = self.camera_service.acquire_scientific_frame(timeout_s=2.0)
+            frame = np.asarray(sci.image16)
             channel_mode = str(config.get('channel_mode', 'G')).upper()
             img_format = str(config.get('img_format', 'tiff')).lower()
             use_16bit = bool(config.get('use_16bit', True))
@@ -799,41 +1376,42 @@ class CameraTab(QWidget):
             if img_format == 'jpg':
                 use_16bit = False
 
-            # Convertir SIEMPRE a 1 canal (sin color artificial)
             if frame.ndim == 3:
                 channel_idx = {'B': 0, 'G': 1, 'R': 2}[channel_mode]
-                mono = frame[:, :, channel_idx]
+                mono16 = frame[:, :, channel_idx]
             else:
-                mono = frame
-
-            # Convertir a contenedor 16-bit base para procesamiento uniforme
-            if mono.dtype == np.uint16:
-                mono16 = mono
-            elif mono.dtype == np.uint8:
-                mono16 = (mono.astype(np.uint16) << 8)
-            else:
-                mono_float = mono.astype(np.float32)
-                max_val = float(np.max(mono_float)) if mono_float.size else 0.0
-                mono16 = ((mono_float / max_val) * 65535.0).astype(np.uint16) if max_val > 0 else np.zeros_like(mono_float, dtype=np.uint16)
+                mono16 = frame
 
             if use_16bit and img_format in ('png', 'tiff'):
-                success = cv2.imwrite(filepath, mono16)
+                success = save_scientific_image(
+                    filepath, mono16, already_prepared=True
+                )
             else:
-                mono8 = (mono16 / 256).astype(np.uint8)
+                from core.utils.image_io import safe_imwrite
+
+                mono8 = image16_to_u8_preview(mono16)
                 if img_format == 'jpg':
-                    success = cv2.imwrite(filepath, mono8, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                elif img_format == 'png':
-                    success = cv2.imwrite(filepath, mono8, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+                    success = safe_imwrite(
+                        filepath, mono8, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                    )
                 else:
-                    success = cv2.imwrite(filepath, mono8)
+                    success = safe_imwrite(filepath, mono8)
             if success:
-                dtype_saved = "uint16" if (use_16bit and img_format in ('png', 'tiff')) else "uint8"
+                dtype_saved = (
+                    "uint16"
+                    if (use_16bit and img_format in ('png', 'tiff'))
+                    else "uint8"
+                )
                 logger.debug(
-                    f"[CameraTab] Z-Stack guardado canal={channel_mode}, format={img_format}, "
-                    f"dtype={dtype_saved}, shape={mono16.shape}"
+                    "[CameraTab] Z-Stack %s canal=%s via %s dtype=%s shape=%s",
+                    filepath,
+                    channel_mode,
+                    sci.pipeline_id,
+                    dtype_saved,
+                    mono16.shape,
                 )
             return success
-            
+
         except Exception as e:
             logger.error(f"[CameraTab] Error en _volumetry_capture_image: {e}")
             return False
@@ -897,42 +1475,17 @@ class CameraTab(QWidget):
             return
         
         try:
-            # Leer delays tolerando QLineEdit/QSpinBox
-            delay_before_val = self._get_numeric_widget_value(self.delay_before_input, default=0.7)
-            delay_after_val = self._get_numeric_widget_value(self.delay_after_input, default=0.1)
-            if delay_before_val < 0 or delay_after_val < 0:
+            config = self.get_microscopy_execution_config()
+            if config['delay_before'] < 0 or config['delay_after'] < 0:
                 raise ValueError("Las demoras no pueden ser negativas")
-
-            if delay_before_val > 0.5:
-                self.log_message(f"⚠️ Aviso: Delay antes ({delay_before_val}s) se sumará a la pausa de trayectoria.")
-
-            class_name = self.class_name_input.text().strip().replace(' ', '_')
-            if not class_name:
+            if not config['class_name']:
                 raise ValueError("El nombre de clase no puede estar vacío")
-            
-            config = {
-                'class_name': class_name,
-                'save_folder': self.microscopy_folder_input.text(),
-                'img_width': int(self.img_width_input.text()),
-                'img_height': int(self.img_height_input.text()),
-                'img_format': self.image_format_combo.currentText().lower(),  # tiff/png/jpg
-                'use_16bit': self.use_16bit_check.isChecked(),  # True=16-bit, False=8-bit
-                'channels': {
-                    'R': self.channel_r_check.isChecked(),
-                    'G': self.channel_g_check.isChecked(),
-                    'B': self.channel_b_check.isChecked()
-                },
-                'delay_before': delay_before_val,
-                'delay_after': delay_after_val,
-                'n_points': self._trajectory_n_points,
-                # Si el usuario activa "Sólo trayectoria XY", forzamos autofoco en False
-                'autofocus_enabled': False if (self.xy_only_cb and self.xy_only_cb.isChecked()) else self.autofocus_enabled_cb.isChecked(),
-                'min_pixels': self.min_pixels_spin.value(),
-                'max_pixels': self.max_pixels_spin.value(),
-                'z_step_coarse': self.z_step_coarse_spin.value(),
-                'z_step_fine': self.z_step_fine_spin.value()
-            }
-            
+            if config['delay_before'] > 0.5:
+                self.log_message(
+                    f"⚠️ Aviso: Delay antes ({config['delay_before']}s) "
+                    f"se sumará a la pausa de trayectoria."
+                )
+
             # Guardar parámetros para autocompletado futuro
             try:
                 pm = get_parameter_manager()
@@ -949,9 +1502,10 @@ class CameraTab(QWidget):
                     delay_after=int(round(config['delay_after'] * 1000))
                 )
                 pm.update_detection(
-                    min_circularity=self.circularity_spin.value(),
-                    min_aspect_ratio=self.aspect_ratio_spin.value()
+                    min_circularity=config['min_circularity'],
+                    min_aspect_ratio=config['min_aspect_ratio']
                 )
+                self.save_camera_tab_settings()
             except Exception as e:
                 logger.warning(f"No se pudieron guardar parámetros: {e}")
         except ValueError as e:
@@ -962,17 +1516,40 @@ class CameraTab(QWidget):
             self.log_message("❌ Error: Selecciona una carpeta de destino")
             return
         
-        import os
-        os.makedirs(config['save_folder'], exist_ok=True)
+        save_abs = os.path.abspath(config['save_folder'])
+        os.makedirs(save_abs, exist_ok=True)
+        config['save_folder'] = save_abs
+        if self.microscopy_folder_input:
+            self.microscopy_folder_input.setText(save_abs)
+        self._opened_save_folder_this_run = False
         
+        start_pt = int(config.get('start_point_1based', 1) or 1)
         # Log de inicio
         self.log_message("=" * 40)
-        self.log_message("INICIANDO MICROSCOPÍA AUTOMATIZADA")
+        self.log_message(f"💾 Carpeta destino (absoluta): {save_abs}")
+        reveal_folder(save_abs, create=False)
+        self._opened_save_folder_this_run = True
+        if start_pt > 1:
+            self.log_message(
+                f"CONTINUANDO MICROSCOPÍA DESDE PUNTO {start_pt}/{config['n_points']}"
+            )
+        else:
+            self.log_message("INICIANDO MICROSCOPÍA AUTOMATIZADA")
         self.log_message(f"   Clase: {config['class_name']}")
-        self.log_message(f"   Puntos: {config['n_points']}")
+        self.log_message(f"   Puntos: {config['n_points']} (desde P{start_pt})")
         self.log_message(f"   Autofoco: {'ACTIVADO' if config['autofocus_enabled'] else 'DESACTIVADO'}")
+        self.log_message(
+            f"   Detección: área=[{config['min_pixels']}-{config['max_pixels']}]px "
+            f"circ≥{config['min_circularity']:.2f} aspect≥{config['min_aspect_ratio']:.2f} "
+            f"saliency={config['saliency_threshold']:.2f}"
+        )
         if config['autofocus_enabled']:
-             self.log_message(f"   Rango AF: {config['min_pixels']}-{config['max_pixels']} px")
+            self.log_message(
+                f"   AF Z: coarse={config['z_step_coarse']:.3f} "
+                f"fine={config['z_step_fine']:.3f} "
+                f"capture_ΔS={config['z_step_capture']:.1f}% "
+                f"margin={config['roi_margin_px']}px"
+            )
         
         channels_str = ''.join([c for c in ['R', 'G', 'B'] if config['channels'][c]])
         self.log_message(f"   Canales: {channels_str}")
@@ -984,8 +1561,6 @@ class CameraTab(QWidget):
             self.log_message(f"   Formato: {fmt} ({bits})")
         self.log_message("=" * 40)
         
-        # Sincronizar parámetros de autofoco antes de iniciar
-        self._update_detection_params()
         if config['autofocus_enabled']:
             if not self.camera_service or not self.camera_service.is_streaming():
                 self.log_message("❌ Error: Inicia vista en vivo antes de microscopía con autofoco")
@@ -996,18 +1571,23 @@ class CameraTab(QWidget):
                     self.log_message("❌ Error: Configura C-Focus y cámara antes del autofoco")
                     logger.error("[CameraTab] initialize_autofocus falló antes de microscopía")
                     return
+                # Re-sync tras initialize_autofocus (puede resetear pasos)
+                self.sync_runtime_params_from_ui()
             logger.info(
-                "[CameraTab] Microscopía con autofoco: coarse=%.2f fine=%.2f capture_step=%.2f",
+                "[CameraTab] Microscopía con autofoco: coarse=%.2f fine=%.2f "
+                "capture_ΔS=%.1f%%",
                 config['z_step_coarse'],
                 config['z_step_fine'],
-                self.z_step_capture_spin.value() if self.z_step_capture_spin else 2.0,
+                config['z_step_capture'],
             )
         
         # Actualizar UI
         self.microscopy_start_btn.setEnabled(False)
         self.microscopy_stop_btn.setEnabled(True)
-        self._microscopy_image_counter = 0
-        self.set_microscopy_progress(0, config['n_points'])
+        if self.resume_point_spin is not None:
+            self.resume_point_spin.setEnabled(False)
+        self._microscopy_image_counter = max(0, start_pt - 1)
+        self.set_microscopy_progress(max(0, start_pt - 1), config['n_points'])
         
         # Deshabilitar volumetría durante microscopía (Método 2 es el único disponible)
         if self.capture_volumetry_radio:
@@ -1016,15 +1596,21 @@ class CameraTab(QWidget):
             self.capture_simple_radio.setEnabled(False)
         
         if self.camera_view_window:
-            self.camera_view_window.set_microscopy_active(True, 0)
+            self.camera_view_window.set_microscopy_active(True, max(0, start_pt - 1))
         
         self.microscopy_start_requested.emit(config)
     
     def _on_stop_microscopy(self):
-        """Handler para detener microscopía."""
-        self.log_message("⏹️ DETENIENDO MICROSCOPÍA...")
+        """Handler para detener microscopía — corte inmediato de TODO."""
+        self.log_message("⏹ DETENIENDO MICROSCOPÍA AHORA (hard stop)...")
+        # Emitir PRIMERO para cortar motores/trayectoria/autofoco sin esperar UI
+        self.microscopy_stop_requested.emit()
+
         self.microscopy_start_btn.setEnabled(True)
         self.microscopy_stop_btn.setEnabled(False)
+        if self.resume_point_spin is not None:
+            self.resume_point_spin.setEnabled(True)
+        self._update_resume_button_label()
         
         # Rehabilitar selección de método de captura
         if self.capture_volumetry_radio:
@@ -1033,8 +1619,6 @@ class CameraTab(QWidget):
         
         if self.camera_view_window:
             self.camera_view_window.set_microscopy_active(False)
-        
-        self.microscopy_stop_requested.emit()
     
     # ==================================================================
     # HANDLERS DE AUTOFOCO / C-FOCUS
@@ -1181,6 +1765,29 @@ class CameraTab(QWidget):
         
         # Aplicar preset del modo
         detector.set_detection_mode(mode)
+
+        # Presets de área / morfología usados por microscopía (_get_area_range + scorer)
+        preset_filters = {
+            DetectionMode.SENSITIVE: {
+                "min_pixels": 100,
+                "max_pixels": 5_000_000,
+                "min_circularity": 0.15,
+                "min_aspect_ratio": 0.15,
+            },
+            DetectionMode.ROBUST: {
+                "min_pixels": 1000,
+                "max_pixels": 3_000_000,
+                "min_circularity": 0.35,
+                "min_aspect_ratio": 0.30,
+            },
+            DetectionMode.NORMAL: {
+                "min_pixels": 500,
+                "max_pixels": 3_000_000,
+                "min_circularity": 0.25,
+                "min_aspect_ratio": 0.25,
+            },
+        }
+        filt = preset_filters.get(mode, preset_filters[DetectionMode.NORMAL])
         
         # Actualizar UI con valores del preset (sin disparar callbacks)
         self.saliency_threshold_spin.blockSignals(True)
@@ -1188,6 +1795,14 @@ class CameraTab(QWidget):
         self.morph_kernel_combo.blockSignals(True)
         self.clahe_clip_spin.blockSignals(True)
         self.clahe_tile_combo.blockSignals(True)
+        if self.min_pixels_spin:
+            self.min_pixels_spin.blockSignals(True)
+        if self.max_pixels_spin:
+            self.max_pixels_spin.blockSignals(True)
+        if self.circularity_spin:
+            self.circularity_spin.blockSignals(True)
+        if self.aspect_ratio_spin:
+            self.aspect_ratio_spin.blockSignals(True)
         
         self.saliency_threshold_spin.setValue(detector.saliency_threshold)
         self.adaptive_k_spin.setValue(detector.adaptive_k)
@@ -1198,12 +1813,32 @@ class CameraTab(QWidget):
         
         tile_map = {(4, 4): 0, (8, 8): 1, (16, 16): 2}
         self.clahe_tile_combo.setCurrentIndex(tile_map.get(detector.clahe_tile_size, 1))
+
+        if self.min_pixels_spin:
+            self.min_pixels_spin.setValue(filt["min_pixels"])
+        if self.max_pixels_spin:
+            self.max_pixels_spin.setValue(filt["max_pixels"])
+        if self.circularity_spin:
+            self.circularity_spin.setValue(filt["min_circularity"])
+        if self.aspect_ratio_spin:
+            self.aspect_ratio_spin.setValue(filt["min_aspect_ratio"])
         
         self.saliency_threshold_spin.blockSignals(False)
         self.adaptive_k_spin.blockSignals(False)
         self.morph_kernel_combo.blockSignals(False)
         self.clahe_clip_spin.blockSignals(False)
         self.clahe_tile_combo.blockSignals(False)
+        if self.min_pixels_spin:
+            self.min_pixels_spin.blockSignals(False)
+        if self.max_pixels_spin:
+            self.max_pixels_spin.blockSignals(False)
+        if self.circularity_spin:
+            self.circularity_spin.blockSignals(False)
+        if self.aspect_ratio_spin:
+            self.aspect_ratio_spin.blockSignals(False)
+
+        # Propagar a detector/scorer/UI de cámara
+        self._update_detection_params()
         
         # Actualizar label de estado
         params = detector.get_parameters()
@@ -1212,159 +1847,115 @@ class CameraTab(QWidget):
         if self.u2net_status_label:
             self.u2net_status_label.setText(f"Modelo: {model_str} | Device: {device_str}")
         
-        # Mostrar confirmación en UI y log
-        params = detector.get_parameters()
-        self.log_message(f"✅ Modo U2NET: {mode.value} | thr={params['saliency_threshold']:.2f}, k={params['adaptive_k']:.1f}")
-        logger.info(f"[CameraTab] ✅ Modo aplicado: {mode.value}, thr={params['saliency_threshold']:.2f}, "
-                   f"k={params['adaptive_k']:.1f}, kernel={params['morph_kernel_size']}")
+        self.log_message(
+            f"✅ Modo {mode.value}: thr={params['saliency_threshold']:.2f}, "
+            f"área=[{filt['min_pixels']}-{filt['max_pixels']}], "
+            f"circ≥{filt['min_circularity']:.2f}, aspect≥{filt['min_aspect_ratio']:.2f}"
+        )
+        logger.info(
+            f"[CameraTab] ✅ Modo aplicado: {mode.value}, thr={params['saliency_threshold']:.2f}, "
+            f"k={params['adaptive_k']:.1f}, área=[{filt['min_pixels']}-{filt['max_pixels']}], "
+            f"circ≥{filt['min_circularity']:.2f}, aspect≥{filt['min_aspect_ratio']:.2f}"
+        )
     
     def _update_u2net_params(self, restore_defaults=False):
-        """Actualiza parámetros individuales del detector U2NET."""
-        from core.detection.u2net_detector import U2NetDetector
-        
-        logger.info(f"[CameraTab] _update_u2net_params() LLAMADO (restore_defaults={restore_defaults})")
-        
-        detector = U2NetDetector.get_instance()
-        
+        """Actualiza parámetros individuales del detector U2NET desde el formulario."""
+        logger.info(
+            "[CameraTab] _update_u2net_params() LLAMADO (restore_defaults=%s)",
+            restore_defaults,
+        )
         if restore_defaults:
-            # Llamar al callback de cambio de modo para aplicar preset
             logger.info("[CameraTab] Restaurando defaults...")
             self._on_detection_mode_changed()
             return
-        
-        # Actualizar parámetros individuales desde UI
-        # Esto permite edición libre sin importar el modo
-        saliency_thr = self.saliency_threshold_spin.value()
-        adaptive_k = self.adaptive_k_spin.value()
-        clahe_clip = self.clahe_clip_spin.value()
-        
-        logger.info(f"[CameraTab] Leyendo valores UI: thr={saliency_thr:.2f}, k={adaptive_k:.1f}, clip={clahe_clip:.1f}")
-        
-        # Mapear combo a tamaño de kernel
-        kernel_idx = self.morph_kernel_combo.currentIndex()
-        kernel_sizes = [3, 5, 7]
-        morph_kernel = kernel_sizes[kernel_idx]
-        
-        # Mapear combo a tile size
-        tile_idx = self.clahe_tile_combo.currentIndex()
-        tile_sizes = [(4, 4), (8, 8), (16, 16)]
-        clahe_tiles = tile_sizes[tile_idx]
-        
-        logger.info(f"[CameraTab] Aplicando parámetros: thr={saliency_thr:.2f}, k={adaptive_k:.1f}, "
-                   f"kernel={morph_kernel}, clip={clahe_clip:.1f}, tiles={clahe_tiles}")
-        
-        detector.set_advanced_parameters(
-            saliency_threshold=saliency_thr,
-            adaptive_k=adaptive_k,
-            morph_kernel_size=morph_kernel,
-            clahe_clip_limit=clahe_clip,
-            clahe_tile_size=clahe_tiles
+
+        runtime = self.sync_runtime_params_from_ui(apply_u2net_advanced=True)
+        self.log_message(
+            f"✅ Parámetros U2NET actualizados: thr={runtime['saliency_threshold']:.2f}, "
+            f"k={runtime['adaptive_k']:.1f}"
         )
-        
-        self.log_message(f"✅ Parámetros U2NET actualizados: thr={saliency_thr:.2f}, k={adaptive_k:.1f}")
-        logger.info(f"[CameraTab] ✅ Parámetros U2NET aplicados correctamente")
     
     def _update_detection_params(self):
-        """Actualiza parámetros de detección y autofocus."""
-        from core.detection.u2net_detector import U2NetDetector
-        
-        min_area = self.min_pixels_spin.value()
-        max_area = self.max_pixels_spin.value()
-        
-        # Actualizar min_area y max_area en el detector U2NET
-        detector = U2NetDetector.get_instance()
-        detector.set_parameters(min_area=min_area, max_area=max_area)
-        logger.info(f"[CameraTab] Área actualizada en U2NET: min={min_area}, max={max_area}")
-        
-        # Actualizar ventana de cámara
-        if self.camera_view_window:
-            self.camera_view_window.set_detection_params(min_area, max_area, threshold=0.3)
-        
-        # Actualizar parámetros morfológicos usando orchestrator
-        if self.orchestrator:
-            min_circ = self.circularity_spin.value()
-            min_aspect = self.aspect_ratio_spin.value()
-            self.orchestrator.update_scorer_morphology_params(
-                min_circularity=min_circ,
-                min_aspect_ratio=min_aspect
-            )
-        
-        # Actualizar parámetros de autofocus usando orchestrator
-        if self.orchestrator:
+        """Actualiza detección/autofoco desde el formulario (única vía: sync UI→runtime)."""
+        runtime = self.sync_runtime_params_from_ui(apply_u2net_advanced=True)
+        z_scan_range = float(runtime['z_scan_range_um'])
+        n_captures = int(runtime['n_captures'])
+
+        if self.orchestrator and self.estimated_images_label:
             from core.models import AutofocusConfig
-            
-            z_scan_range = self.z_scan_range_spin.value()  # µm
-            z_step_coarse = self.z_step_coarse_spin.value()  # µm
-            z_step_fine = self.z_step_fine_spin.value()  # µm
-            settle_ms = self.z_settle_spin.value()  # ms
-            settle_s = settle_ms / 1000.0  # convertir a segundos
-            roi_margin = self.roi_margin_spin.value()  # px
-            
-            # Validar que coarse > fine
-            if z_step_coarse <= z_step_fine:
-                self.log_message(f"⚠️ Paso grueso ({z_step_coarse}µm) debe ser > Paso fino ({z_step_fine}µm)")
-                z_step_coarse = z_step_fine * 2  # Auto-corregir
-                self.z_step_coarse_spin.setValue(z_step_coarse)
-            
-            # Obtener n_captures y asegurar que sea impar
-            n_captures = self.n_captures_spin.value()
-            if n_captures % 2 == 0:
-                n_captures += 1
-                self.n_captures_spin.setValue(n_captures)
-            
-            # Crear config y actualizar usando orchestrator
+            n_fine = int(runtime.get('n_fine_planes', 15))
+            z_tol = float(runtime.get('z_arrive_tol_um', 0.5))
             config = AutofocusConfig(
-                use_full_range=self.full_scan_cb.isChecked() if self.full_scan_cb else True,
+                use_full_range=bool(runtime['full_scan']),
                 z_scan_range=z_scan_range,
-                z_step_coarse=z_step_coarse,
-                z_step_fine=z_step_fine,
-                settle_time=settle_s,
-                capture_settle_time=max(settle_s * 5, 0.3),
-                roi_margin=roi_margin,
+                z_step_coarse=float(runtime['z_step_coarse']),
+                z_step_fine=float(runtime['z_step_fine']),
+                n_fine_planes=n_fine,
+                z_arrive_tol_um=z_tol,
+                settle_time=0.0,
+                capture_settle_time=0.0,
+                roi_margin=int(runtime['roi_margin_px']),
                 n_captures=n_captures,
-                z_step_capture=(
-                    self.z_step_capture_spin.value()
-                    if self.z_step_capture_spin else 2.0
-                ),
+                z_step_capture=float(runtime['z_step_capture']),
             )
-            
-            self.orchestrator.update_autofocus_params(config)
-            
-            # Mostrar información de búsqueda
             search_info = self.orchestrator.get_autofocus_search_info()
-            if self.estimated_images_label and search_info:
-                # Validar rango contra límites del C-Focus
+            if search_info:
                 cfocus_limits = None
-                if self.parent_gui and hasattr(self.parent_gui, 'cfocus_enabled') and self.parent_gui.cfocus_enabled:
+                if (
+                    self.parent_gui
+                    and getattr(self.parent_gui, 'cfocus_enabled', False)
+                ):
                     cfocus = getattr(self.parent_gui, 'cfocus_controller', None)
                     if cfocus:
-                        calib = cfocus.get_calibration_info() if hasattr(cfocus, 'get_calibration_info') else {}
-                        current_z = cfocus.read_z() if hasattr(cfocus, 'read_z') else None
+                        calib = (
+                            cfocus.get_calibration_info()
+                            if hasattr(cfocus, 'get_calibration_info')
+                            else {}
+                        )
+                        current_z = (
+                            cfocus.read_z() if hasattr(cfocus, 'read_z') else None
+                        )
                         cfocus_limits = {
                             'z_min': calib.get('z_min', 0.0),
                             'z_max': calib.get('z_max', 0.0),
-                            'current_z': current_z if current_z is not None else calib.get('z_center', 0.0)
+                            'current_z': (
+                                current_z
+                                if current_z is not None
+                                else calib.get('z_center', 0.0)
+                            ),
                         }
-                
-                is_valid, msg = self.orchestrator.validate_autofocus_params(config, cfocus_limits)
-                
+
+                is_valid, msg = self.orchestrator.validate_autofocus_params(
+                    config, cfocus_limits
+                )
                 if not is_valid:
-                    self.estimated_images_label.setText("⚠️ Rango inválido")
-                    self.estimated_images_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
+                    self.estimated_images_label.setText("⚠️ Config inválida")
+                    self.estimated_images_label.setStyleSheet(
+                        "color: #E74C3C; font-weight: bold;"
+                    )
                     self.estimated_images_label.setToolTip(f"⚠️ {msg}")
                 else:
-                    # Mostrar distancia de búsqueda y número de capturas multi-focales
-                    search_dist = search_info['search_distance_um']
-                    self.estimated_images_label.setText(f"±{z_scan_range:.1f}µm ({n_captures} imgs)")
-                    self.estimated_images_label.setStyleSheet("color: #3498DB; font-weight: bold;")
+                    fine_step = float(runtime['z_step_fine'])
+                    fine_half_span = min(
+                        z_scan_range, fine_step * max(1, n_fine // 2)
+                    )
+                    self.estimated_images_label.setText(
+                        f"FINE ±{fine_half_span:.1f}µm · {fine_step:.3f}µm · N={n_fine}"
+                    )
+                    self.estimated_images_label.setStyleSheet(
+                        "color: #3498DB; font-weight: bold;"
+                    )
                     self.estimated_images_label.setToolTip(
-                        f"Distancia de búsqueda: ±{z_scan_range}µm ({search_dist}µm total)\n"
-                        f"Algoritmo: Hill climbing (pasos adaptativos)\n"
-                        f"Paso grueso: {z_step_coarse}µm, Paso fino: {z_step_fine}µm\n\n"
-                        f"Capturas multi-focales: {n_captures} imágenes\n"
-                        f"BPoF en el centro (f{n_captures // 2}) ± paso captura\n\n"
-                        f"NOTA: Autofoco busca 1 posición óptima (BPoF).\n"
-                        f"Las {n_captures} capturas son para trayectoria XY."
+                        f"COARSE → FINE centrado en Z_c*\n"
+                        f"Zona FINE real: ±{fine_half_span:.3f}µm · "
+                        f"paso {fine_step:.3f}µm · N={n_fine}\n"
+                        f"Límite Δ GUI: ±{z_scan_range:.3f}µm\n"
+                        f"Paso grueso: {runtime['z_step_coarse']}µm\n"
+                        f"Tol. llegada Z: ±{z_tol:.2f}µm (condición, no settle)\n"
+                        f"FINE → BPoF → capturas multi-focales: {n_captures} "
+                        f"por caída S={runtime['z_step_capture']}% "
+                        "(desde curva COARSE+FINE; sin segundo barrido)\n"
+                        f"ROI margin: {runtime['roi_margin_px']}px"
                     )
     
     def _run_autofocus(self, capture_after=False):
@@ -1373,7 +1964,10 @@ class CameraTab(QWidget):
 
         parent = self.parent_gui
         if parent and hasattr(parent, 'initialize_autofocus'):
-            parent.initialize_autofocus()
+            if not parent.initialize_autofocus():
+                return
+            # Reaplicar JSON/UI tras cablear hardware (única vía de params)
+            self.sync_runtime_params_from_ui()
 
         if self.camera_service and not self.camera_service.is_streaming():
             self.log_message("❌ Inicia la vista en vivo de la cámara antes del autofoco")
@@ -1385,18 +1979,25 @@ class CameraTab(QWidget):
 
         # Obtener frame actual
         current_frame = None
-        if self.camera_service and self.camera_service.current_frame is not None:
-            current_frame = self.camera_service.current_frame
-            logger.debug("[CameraTab] Frame obtenido desde camera_service")
-        elif self.camera_service and self.camera_service.worker and self.camera_service.worker.current_frame is not None:
-            current_frame = self.camera_service.worker.current_frame
-            logger.debug("[CameraTab] Frame obtenido desde camera_worker")
-        
+        if self.camera_service is not None:
+            try:
+                from hardware.camera.scientific_image import image16_to_u8_preview
+
+                sci = self.camera_service.acquire_scientific_frame(timeout_s=1.5)
+                # Detección U2-Net: derivado u8 del frame científico (no preview paralelo)
+                current_frame = image16_to_u8_preview(sci.image16)
+                logger.debug(
+                    "[CameraTab] Frame AF desde acquire_scientific_frame id=%s",
+                    sci.frame_id,
+                )
+            except Exception as exc:
+                logger.error("[CameraTab] acquire_scientific_frame falló: %s", exc)
+
         if current_frame is None:
-            self.log_message("❌ No hay frame disponible")
-            logger.error("[CameraTab] No hay frame disponible para autofoco")
+            self.log_message("❌ No hay frame científico disponible")
+            logger.error("[CameraTab] No hay frame científico para autofoco")
             return
-        
+
         # Validar orchestrator y scorer
         if self.orchestrator is None:
             self.log_message("❌ CameraOrchestrator no disponible")
@@ -1440,50 +2041,59 @@ class CameraTab(QWidget):
     # CALLBACKS DE SERVICIO
     # ==================================================================
     
+    def _apply_camera_resolution(self, width: int, height: int, *, persist: bool = True) -> None:
+        """Rellena tamaño imagen con ROI real y opcionalmente persiste en JSON."""
+        if width <= 0 or height <= 0:
+            return
+        changed = False
+        if self.img_width_input and self.img_width_input.text().strip() != str(width):
+            self.img_width_input.setText(str(width))
+            changed = True
+        if self.img_height_input and self.img_height_input.text().strip() != str(height):
+            self.img_height_input.setText(str(height))
+            changed = True
+        if changed:
+            logger.info(
+                "[CameraTab] Tamaño imagen actualizado a %dx%d (resolución real)",
+                width,
+                height,
+            )
+            self.log_message(f"📐 Resolución detectada: {width}x{height}px")
+            self._update_storage_estimate()
+            if persist:
+                self.save_camera_tab_settings()
+
+    def _sync_resolution_from_camera(self, *, persist: bool = True) -> bool:
+        """Lee resolución del CameraService y actualiza UI. True si aplicó."""
+        if not self.camera_service:
+            return False
+        resolved = self.camera_service.get_resolution()
+        if not resolved:
+            return False
+        width, height = resolved
+        self._apply_camera_resolution(width, height, persist=persist)
+        return True
+
     def _on_camera_connected(self, success: bool, info: str):
         """Callback cuando la cámara se conecta."""
         if success:
             self.set_connected(True, info)
-            
-            # Actualizar campos de resolución con la resolución REAL de la cámara
-            if self.camera_service:
-                width, height = self.camera_service.get_resolution()
-                if self.img_width_input:
-                    self.img_width_input.setText(str(width))
-                    logger.info(f"[CameraTab] img_width actualizado a {width}px (resolución real)")
-                if self.img_height_input:
-                    self.img_height_input.setText(str(height))
-                    logger.info(f"[CameraTab] img_height actualizado a {height}px (resolución real)")
-                self.log_message(f"📐 Resolución detectada: {width}x{height}px")
+            self._resolution_synced_from_frame = False
+            self._live_bridge._resolution_synced = False
+            if not self._sync_resolution_from_camera(persist=True):
+                self.log_message(
+                    "⚠️ Cámara conectada; resolución pendiente del primer frame"
+                )
         else:
             self.log_message(f"❌ Fallo al conectar: {info}")
             QMessageBox.critical(self.parent_gui, "Error", f"Fallo al conectar:\n{info}")
             self.set_connected(False)
     
     def on_camera_frame(self, q_image, raw_frame=None):
-        """Callback cuando llega un frame de cámara (hilo UI, QueuedConnection)."""
-        if not self.camera_view_window or not self.camera_view_window.isVisible():
-            return
-
-        if not hasattr(self, '_ui_frame_count'):
-            self._ui_frame_count = 0
-            self._ui_frame_log_time = 0.0
-            logger.info(
-                "[CameraTab] Primer frame entregado a ventana: qimage=%dx%d",
-                q_image.width() if q_image else 0,
-                q_image.height() if q_image else 0,
-            )
-
-        self._ui_frame_count += 1
-        now = time.perf_counter()
-        if now - self._ui_frame_log_time >= 5.0:
-            logger.info(
-                "[CameraTab] Frames entregados a ventana: %d",
-                self._ui_frame_count,
-            )
-            self._ui_frame_log_time = now
-
-        self.camera_view_window.update_frame(q_image, raw_frame)
+        """Callback live → bridge SRP (DirectConnection desde CameraService)."""
+        painted = self._live_bridge.on_frame(q_image, raw_frame)
+        if painted:
+            self._resolution_synced_from_frame = True
     
     # Alias para compatibilidad interna
     _on_camera_frame = on_camera_frame
@@ -1537,23 +2147,104 @@ class CameraTab(QWidget):
             has_trajectory = ready
         if has_trajectory is None:
             has_trajectory = False
+
+        # Si solo dicen ready=True sin n_points, conservar el total ya cargado
+        if has_trajectory and (n_points is None or int(n_points) <= 0):
+            n_points = int(self._trajectory_n_points or 0)
             
-        self._trajectory_n_points = n_points if has_trajectory else 0
+        self._trajectory_n_points = int(n_points) if has_trajectory else 0
         
-        if has_trajectory and n_points > 0:
-            self.trajectory_status.setText(f"✅ Trayectoria lista: {n_points} puntos")
+        if has_trajectory and self._trajectory_n_points > 0:
+            self.trajectory_status.setText(
+                f"✅ Trayectoria lista: {self._trajectory_n_points} puntos"
+            )
             self.trajectory_status.setStyleSheet("color: #27AE60; font-weight: bold;")
             self.microscopy_start_btn.setEnabled(True)
+            if self.resume_point_spin is not None:
+                prev = int(self.resume_point_spin.value())
+                self.resume_point_spin.setMaximum(self._trajectory_n_points)
+                self.resume_point_spin.setMinimum(1)
+                self.resume_point_spin.setValue(
+                    min(max(1, prev), self._trajectory_n_points)
+                )
+                self.resume_point_spin.setEnabled(True)
+            if self.resume_hint_label is not None:
+                self.resume_hint_label.setText(
+                    f"(1…{self._trajectory_n_points}; 1 = inicio)"
+                )
+            self._update_resume_button_label()
         else:
             self.trajectory_status.setText("⚪ Sin trayectoria")
             self.trajectory_status.setStyleSheet("color: #95A5A6; font-weight: bold;")
             self.microscopy_start_btn.setEnabled(False)
+            if self.resume_point_spin is not None:
+                self.resume_point_spin.setRange(1, 1)
+                self.resume_point_spin.setValue(1)
+            if self.resume_hint_label is not None:
+                self.resume_hint_label.setText("(sin trayectoria)")
         
         self._update_storage_estimate()
+
+    def _update_resume_button_label(self, *_):
+        """Cambia el texto del botón según el punto de continuación."""
+        if self.microscopy_start_btn is None:
+            return
+        pt = 1
+        if self.resume_point_spin is not None:
+            pt = int(self.resume_point_spin.value())
+        n = int(self._trajectory_n_points or 0)
+        if pt > 1 and n > 0:
+            self.microscopy_start_btn.setText(
+                f"▶️ Continuar desde P{pt}/{n}"
+            )
+            self.microscopy_start_btn.setStyleSheet("""
+                QPushButton { font-size: 13px; font-weight: bold; padding: 10px; background-color: #E67E22; }
+                QPushButton:hover { background-color: #F39C12; }
+                QPushButton:disabled { background-color: #505050; color: #808080; }
+            """)
+        else:
+            self.microscopy_start_btn.setText("🚀 Iniciar / Continuar Microscopía")
+            self.microscopy_start_btn.setStyleSheet("""
+                QPushButton { font-size: 13px; font-weight: bold; padding: 10px; background-color: #27AE60; }
+                QPushButton:hover { background-color: #2ECC71; }
+                QPushButton:disabled { background-color: #505050; color: #808080; }
+            """)
+
+    def suggest_resume_point(self, point_1based: int, total_points: int = 0):
+        """Tras fallo FOV / stop: rellena el spin y habilita Continuar."""
+        total = int(total_points) or int(self._trajectory_n_points or 0)
+        if total <= 0:
+            total = max(1, int(point_1based))
+        point = max(1, min(int(point_1based), total))
+        self._trajectory_n_points = max(self._trajectory_n_points, total)
+        if self.resume_point_spin is not None:
+            self.resume_point_spin.blockSignals(True)
+            self.resume_point_spin.setMaximum(self._trajectory_n_points)
+            self.resume_point_spin.setMinimum(1)
+            self.resume_point_spin.setValue(point)
+            self.resume_point_spin.setEnabled(True)
+            self.resume_point_spin.blockSignals(False)
+        if self.resume_hint_label is not None:
+            self.resume_hint_label.setText(
+                f"⚠ detenido en P{point} — reintenta o elige otro"
+            )
+            self.resume_hint_label.setStyleSheet(
+                "color: #E67E22; font-weight: bold;"
+            )
+        self.microscopy_start_btn.setEnabled(True)
+        self.microscopy_stop_btn.setEnabled(False)
+        self._update_resume_button_label()
+        self.set_microscopy_progress(max(0, point - 1), self._trajectory_n_points)
+        self.log_message(
+            f"⏸ Listo para continuar desde punto {point}/{self._trajectory_n_points}. "
+            f"Ajusta el spin si quieres saltar y pulsa Continuar."
+        )
     
     def set_microscopy_progress(self, current: int, total: int):
         """Actualiza progreso de microscopía."""
-        self.microscopy_progress_label.setText(f"Progreso: {current} / {total} imágenes capturadas")
+        self.microscopy_progress_label.setText(
+            f"Progreso: {current} / {total} (punto actual ≈ {min(current + 1, total) if total else 0})"
+        )
         
         if current == 0:
             self.microscopy_progress_label.setStyleSheet("font-weight: bold; color: #3498DB;")
@@ -1587,12 +2278,27 @@ class CameraTab(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta para microscopía")
         if folder:
             self.microscopy_folder_input.setText(folder)
+            self.save_camera_tab_settings()
+
+    def _open_microscopy_folder(self):
+        """Abre la carpeta destino de microscopía en el Explorador."""
+        folder = (
+            self.microscopy_folder_input.text().strip()
+            if self.microscopy_folder_input else ""
+        )
+        if not folder:
+            self.log_message("❌ Error: Carpeta destino vacía")
+            return
+        if reveal_folder(folder, create=True):
+            self.log_message(f"📂 Abriendo: {os.path.abspath(folder)}")
+        else:
+            self.log_message(f"❌ No se pudo abrir: {folder}")
     
     def _update_storage_estimate(self):
         """Calcula y actualiza la estimación de almacenamiento."""
         try:
-            width = int(self.img_width_input.text()) if self.img_width_input.text() else 1920
-            height = int(self.img_height_input.text()) if self.img_height_input.text() else 1080
+            width = int(self.img_width_input.text()) if self.img_width_input.text() else _DEFAULT_IMG_WIDTH
+            height = int(self.img_height_input.text()) if self.img_height_input.text() else _DEFAULT_IMG_HEIGHT
             
             n_channels = sum([
                 self.channel_r_check.isChecked(),
@@ -1688,9 +2394,10 @@ class CameraTab(QWidget):
                 self.zstack_n_images_spin.setValue(n_images)
 
             if self.camera_service:
-                width, height = self.camera_service.get_resolution()
+                resolved = self.camera_service.get_resolution()
+                width, height = resolved if resolved else (_DEFAULT_IMG_WIDTH, _DEFAULT_IMG_HEIGHT)
             else:
-                width, height = 1920, 1080
+                width, height = _DEFAULT_IMG_WIDTH, _DEFAULT_IMG_HEIGHT
 
             fmt = self.image_format_combo.currentText().strip().upper() if self.image_format_combo else "TIFF"
             use_16bit = self.use_16bit_check.isChecked() if self.use_16bit_check else True
@@ -1778,6 +2485,122 @@ class CameraTab(QWidget):
     def on_object_focused(self, obj_index: int, z_optimal: float, score: float):
         """Callback cuando se encuentra el foco óptimo de un objeto."""
         self.log_message(f"  ✓ Obj{obj_index}: Z={z_optimal:.1f}µm, S={score:.1f}")
+
+    def save_manual_autofocus_stacks(self, results: list) -> int:
+        """Guarda exactamente N planos GUI por resultado de autofoco manual."""
+        if not results:
+            return 0
+
+        config = self.get_microscopy_execution_config()
+        save_folder = str(config.get("save_folder", "") or "").strip()
+        if not save_folder and self.save_folder_input is not None:
+            save_folder = self.save_folder_input.text().strip()
+        if not save_folder:
+            self.log_message(
+                "❌ Autofoco calculó los planos, pero falta carpeta destino"
+            )
+            return 0
+
+        expected_n = int(self.read_autofocus_form_params()["n_captures"])
+        class_name = str(config.get("class_name", "sample") or "sample")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        total_saved = 0
+
+        for result in results:
+            frames = list(getattr(result, "frames", None) or [])
+            z_positions = list(getattr(result, "z_positions", None) or [])
+            scores = list(getattr(result, "focus_scores", None) or [])
+            if len(frames) != expected_n:
+                self.log_message(
+                    f"❌ Obj{result.object_index}: stack incompleto "
+                    f"{len(frames)}/{expected_n}; no se guarda parcialmente"
+                )
+                continue
+
+            records = []
+            object_saved = 0
+            created_paths = []
+            for index in range(expected_n):
+                frame = frames[index]
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    break
+                frame_to_save = np.asarray(frame)
+                filename = (
+                    f"{class_name}_manualAF_{stamp}_"
+                    f"obj{int(result.object_index):02d}_f{index}.png"
+                )
+                filepath = os.path.join(save_folder, filename)
+                if not save_scientific_image(
+                    filepath, frame_to_save, already_prepared=True
+                ):
+                    break
+                created_paths.append(filepath)
+                object_saved += 1
+                records.append(
+                    {
+                        "file": filename,
+                        "f_index": index,
+                        "z_um": (
+                            round(float(z_positions[index]), 6)
+                            if index < len(z_positions) else None
+                        ),
+                        "S": (
+                            round(float(scores[index]), 6)
+                            if index < len(scores) else None
+                        ),
+                        "is_bpof": index
+                        == int(getattr(result, "bpof_index", -1)),
+                        "channels": (
+                            int(frame_to_save.shape[2])
+                            if frame_to_save.ndim == 3 else 1
+                        ),
+                    }
+                )
+
+            if object_saved != expected_n:
+                for created_path in created_paths:
+                    try:
+                        os.remove(created_path)
+                    except OSError:
+                        pass
+                self.log_message(
+                    f"❌ Obj{result.object_index}: guardado incompleto "
+                    f"{object_saved}/{expected_n}"
+                )
+                continue
+
+            metadata_name = (
+                f"{class_name}_manualAF_{stamp}_"
+                f"obj{int(result.object_index):02d}_focus.json"
+            )
+            metadata_path = os.path.join(save_folder, metadata_name)
+            metadata = {
+                "mode": "manual_autofocus",
+                "object_index": int(result.object_index),
+                "requested_n_captures": expected_n,
+                "saved_n_captures": object_saved,
+                "z_bpof_um": float(result.z_optimal),
+                "bpof_index": int(getattr(result, "bpof_index", -1)),
+                "capture_mode": str(
+                    getattr(result, "capture_mode", "optical_s_drop")
+                ),
+                "captures": records,
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            }
+            try:
+                os.makedirs(save_folder, exist_ok=True)
+                with open(metadata_path, "w", encoding="utf-8") as stream:
+                    json.dump(metadata, stream, indent=2, ensure_ascii=False)
+            except Exception as exc:
+                self.log_message(f"⚠️ No se guardó metadata AF manual: {exc}")
+
+            total_saved += object_saved
+            self.log_message(
+                f"✅ Obj{result.object_index}: {object_saved}/{expected_n} "
+                f"planos RGB16 guardados en {save_folder}"
+            )
+
+        return total_saved
     
     # ==================================================================
     # PROPIEDADES PARA COMPATIBILIDAD

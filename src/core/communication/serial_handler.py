@@ -7,43 +7,35 @@ import traceback
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.communication.protocol import MotorProtocol
+from core.communication.serial_tx_queue import SerialTxQueue
 
 logger = logging.getLogger(__name__)
 
 
 class SerialHandler(QThread):
     """
-    Thread para lectura serial asíncrona con BUFFER CIRCULAR.
-    
-    Reconstruye líneas completas antes de emitirlas para evitar
-    datos corruptos a alta velocidad (1 Mbps).
-    
-    Signals:
-        data_received (str): Emite cada línea COMPLETA recibida del Arduino
+    Thread RX serial + cola TX gestionada.
+
+    Regla dura: el hilo RX prioriza SIEMPRE la lectura. Escribir TX desde este
+    hilo antes de leer ahoga la telemetría (síntoma: err X/Y clavados con PWM
+    subiendo). El drain TX en este hilo solo corre cuando no hay bytes RX.
+
+    send_command() encola (coalesce A,*) y drena desde el hilo del llamador
+    bajo lock — así I/F del handoff salen al instante sin tocar el RX.
     """
     data_received = pyqtSignal(str)
 
     def __init__(self, port, baudrate):
-        """
-        Inicializa el handler de comunicación serial.
-        
-        Args:
-            port (str): Puerto serial (ej: 'COM3', '/dev/ttyUSB0')
-            baudrate (int): Velocidad de comunicación (ej: 115200)
-        """
         super().__init__()
         self.port = port
         self.baudrate = baudrate
         self.running = True
         self.ser = None
-        # Buffer circular para reconstruir líneas completas
         self._buffer = ""
-        # Plano MÁQUINA: destino de la medida a tasa completa (independiente de la UI).
-        # Se llena en ESTE hilo (RX), no en el hilo GUI, para que el control no
-        # dependa del repintado. Ver plan 20260714_0032.
         self.sensor_buffer = None
-        # TX seguro: el worker de control y la GUI pueden escribir a la vez.
+        self._tx_queue = SerialTxQueue()
         self._tx_lock = threading.Lock()
+        self._last_tx_stats_log = 0.0
         logger.info(f"SerialHandler inicializado: Puerto={port}, Baudrate={baudrate}")
 
     def set_sensor_buffer(self, sensor_buffer):
@@ -51,14 +43,11 @@ class SerialHandler(QThread):
         self.sensor_buffer = sensor_buffer
 
     def _update_sensor_buffer(self, line):
-        """Parsea telemetría y actualiza el buffer en el hilo RX (tasa completa).
-
-        No toca widgets: solo estado thread-safe para medida/control.
-        """
+        """Parsea telemetría y actualiza el buffer en el hilo RX (tasa completa)."""
         if self.sensor_buffer is None:
             return
         if not line or line[0] not in '-0123456789':
-            return  # descarta INFO:/ERROR:/cabecera sin costo de split
+            return
         try:
             parts = line.split(',')
             if len(parts) >= 6:
@@ -80,58 +69,103 @@ class SerialHandler(QThread):
         except (ValueError, IndexError):
             return
 
+    def _drain_tx_queue(self, max_n: int = 8) -> int:
+        """Escribe hasta max_n comandos pendientes. Retorna cuántos envió."""
+        if not self.ser or not self.ser.is_open:
+            return 0
+        batch = self._tx_queue.pop_batch(max_n=max_n)
+        if not batch:
+            return 0
+        sent = 0
+        try:
+            with self._tx_lock:
+                payload = "".join(cmd + "\n" for cmd in batch).encode("utf-8")
+                self.ser.write(payload)
+                sent = len(batch)
+        except Exception as e:
+            logger.error(f"Error drenando TX serial: {e}")
+            return sent
+        for cmd in batch:
+            if cmd.startswith("A,") or cmd.startswith("a,"):
+                logger.debug("TX auto: %s", cmd)
+            else:
+                logger.info("TX control: %s", cmd)
+        now = time.perf_counter()
+        if (now - self._last_tx_stats_log) >= 5.0:
+            self._last_tx_stats_log = now
+            st = self._tx_queue.stats()
+            if st["dropped_a"] or st["pending_ctrl"]:
+                logger.info(
+                    "SerialTX stats enq=%d drain=%d dropA=%d pendCtrl=%d pendA=%s",
+                    st["enqueued"],
+                    st["drained"],
+                    st["dropped_a"],
+                    st["pending_ctrl"],
+                    st["pending_a"],
+                )
+        return sent
+
+    def _ingest_rx(self) -> int:
+        """Lee todo lo pendiente en el puerto. Retorna líneas completas vistas."""
+        if not self.ser or not self.ser.is_open:
+            return 0
+        waiting = self.ser.in_waiting
+        if not waiting:
+            return 0
+        chunk = self.ser.read(waiting)
+        if not chunk:
+            return 0
+        self._buffer += chunk.decode("utf-8", errors="ignore")
+        lines = 0
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            lines += 1
+            self._update_sensor_buffer(line)
+            self.data_received.emit(line)
+        # Fragmento incompleto: no borrar a ciegas (antes >200 vaciaba y perdía CSV).
+        if len(self._buffer) > 4096:
+            logger.warning("RX buffer overflow (%d B) — reset parcial", len(self._buffer))
+            self._buffer = ""
+        return lines
+
     def run(self):
-        """
-        LOOP DE LECTURA SERIAL CON BUFFER CIRCULAR.
-        Reconstruye líneas completas para evitar datos corruptos.
-        """
+        """Loop RX prioritario + drain TX solo en idle."""
         logger.debug(f"Iniciando thread de lectura serial en {self.port}")
         try:
-            # Puerto serial - timeout pequeño para lectura eficiente
             self.ser = serial.Serial(
-                port=self.port, 
-                baudrate=self.baudrate, 
-                timeout=0.001,  # 1ms - permite leer chunks
-                write_timeout=0
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=0.001,
+                write_timeout=0.05,
             )
-            logger.info(f"Puerto {self.port} @ {self.baudrate} bps - Buffer circular activo")
-            
-            # Espera breve post-open (STM32 VCP / legacy Arduino)
+            logger.info(
+                f"Puerto {self.port} @ {self.baudrate} bps — RX-first + TX queue"
+            )
             time.sleep(0.1)
-            self._buffer = ""  # Limpiar buffer
+            self._buffer = ""
+            self._tx_queue.clear()
             self.data_received.emit("INFO: Conectado exitosamente.")
-            
-            # ================================================================
-            # LOOP PRINCIPAL CON BUFFER CIRCULAR
-            # ================================================================
+
             while self.running:
                 try:
-                    # Leer bytes disponibles
-                    if self.ser.in_waiting:
-                        # Leer chunk de datos (más eficiente que readline)
-                        chunk = self.ser.read(self.ser.in_waiting)
-                        if chunk:
-                            # Agregar al buffer
-                            self._buffer += chunk.decode('utf-8', errors='ignore')
-                            
-                            # Procesar líneas completas (terminan en \n)
-                            while '\n' in self._buffer:
-                                line, self._buffer = self._buffer.split('\n', 1)
-                                line = line.strip()
-                                if line:
-                                    # Plano MÁQUINA: medida fresca en el hilo RX
-                                    # (antes de emitir a la UI) → control desacoplado.
-                                    self._update_sensor_buffer(line)
-                                    self.data_received.emit(line)
-                            
-                            # Evitar que el buffer crezca indefinidamente
-                            if len(self._buffer) > 200:
-                                self._buffer = ""
-                except:
+                    # 1) RX primero (nunca sacrificar sensores por TX).
+                    n = self._ingest_rx()
+                    # 2) TX solo si el cable está quieto (o backlog de control).
+                    if n == 0:
+                        pending = self._tx_queue.pending_count()
+                        if pending:
+                            self._drain_tx_queue(max_n=4)
+                        else:
+                            time.sleep(0.0005)
+                except Exception as e:
                     if not self.running:
                         break
-            
-            # Cierre limpio
+                    logger.error("SerialHandler loop: %s", e)
+                    time.sleep(0.01)
+
             if self.ser and self.ser.is_open:
                 self.ser.close()
                 logger.info("Puerto serial cerrado")
@@ -139,7 +173,9 @@ class SerialHandler(QThread):
             logger.error(f"Error al abrir puerto {self.port}: {e}")
             self.data_received.emit(f"ERROR: Puerto {self.port} no encontrado.")
         except Exception as e:
-            logger.critical(f"Error inesperado en SerialHandler: {e}\n{traceback.format_exc()}")
+            logger.critical(
+                f"Error inesperado en SerialHandler: {e}\n{traceback.format_exc()}"
+            )
 
     def stop(self):
         """Detiene el thread de lectura serial de forma segura."""
@@ -149,17 +185,9 @@ class SerialHandler(QThread):
             self.ser.close()
             logger.info("Puerto serial cerrado en stop()")
         self.wait()
-    
+
     def write(self, data):
-        """
-        Envía datos al puerto serial (bytes).
-        
-        Args:
-            data (bytes): Datos a enviar
-            
-        Returns:
-            bool: True si se envió exitosamente, False si no
-        """
+        """Envía bytes crudos (bypass cola). Preferir send_command()."""
         if self.ser and self.ser.is_open:
             try:
                 with self._tx_lock:
@@ -169,27 +197,20 @@ class SerialHandler(QThread):
                 logger.error(f"Error escribiendo al serial: {e}")
                 return False
         return False
-    
+
     def send_command(self, command):
         """
-        Envía un comando string al Arduino.
-        
-        Args:
-            command (str): Comando a enviar (ej: 'A,100,0' o 'M')
-            
-        Returns:
-            bool: True si se envió exitosamente
+        Encola comando (A,* coalesce; F/I/N/B prioritarios) y drena ya.
+
+        El drain corre en el hilo del llamador (control/GUI), no en el RX,
+        para no bloquear la telemetría.
         """
-        if self.ser and self.ser.is_open:
-            try:
-                full_command = command + '\n'
-                with self._tx_lock:
-                    self.ser.write(full_command.encode('utf-8'))
-                logger.debug(f"Comando enviado: {command}")
-                return True
-            except Exception as e:
-                logger.error(f"Error enviando comando: {e}")
-                return False
-        else:
-            logger.warning("Puerto no abierto, comando no enviado")
+        if not (self.ser and self.ser.is_open):
+            logger.warning("Puerto no abierto, comando no encolado: %s", command)
             return False
+        self._tx_queue.enqueue(command)
+        self._drain_tx_queue(max_n=16)
+        return True
+
+    def tx_queue_stats(self) -> dict:
+        return self._tx_queue.stats()

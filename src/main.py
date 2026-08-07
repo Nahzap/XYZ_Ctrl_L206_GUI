@@ -59,6 +59,10 @@ import numpy as np
 # Fase 1: Configuración
 from config.constants import *
 from config.settings import setup_logging
+from config.mcu_profiles import apply_mcu_profile, load_saved_mcu
+
+# Perfil MCU activo (STM32 o Arduino). Persistido en config/mcu_prefs.json.
+apply_mcu_profile(load_saved_mcu())
 
 # Fase 2: Estilos
 from gui.styles.dark_theme import DARK_STYLESHEET
@@ -231,6 +235,7 @@ class CTRL_GUI(QMainWindow):
         self.control_tab = ControlTab(serial_handler=self.serial_thread, parent=self)
         # Conectar señal de reconexión serial
         self.control_tab.serial_reconnect_requested.connect(self._on_serial_reconnect)
+        self.control_tab.mcu_profile_changed.connect(self._on_mcu_profile_changed)
         # --- NUEVAS CONEXIONES PARA POSITION HOLD ---
         self.control_tab.position_hold_requested.connect(self._on_position_hold)
         self.control_tab.brake_requested.connect(self._on_brake)
@@ -307,8 +312,9 @@ class CTRL_GUI(QMainWindow):
         )
         # Conectar CameraService con CameraTab (solo orquestación desde main)
         self.camera_service.connected.connect(self.camera_tab._on_camera_connected)
+        # Direct: CameraService y CameraTab viven en el hilo GUI; evita 2ª cola
         self.camera_service.frame_ready.connect(
-            self.camera_tab.on_camera_frame, Qt.QueuedConnection
+            self.camera_tab.on_camera_frame, Qt.DirectConnection
         )
         self.camera_service.status_changed.connect(self.camera_tab.log_message)
         self.camera_service.disconnected.connect(lambda: self.camera_tab.set_connected(False))
@@ -326,10 +332,7 @@ class CTRL_GUI(QMainWindow):
         self.microscopy_service = MicroscopyService(
             parent=self,
             get_trajectory=lambda: getattr(self.test_tab, 'current_trajectory', None),
-            get_trajectory_params=lambda: {
-                'tolerance_um': getattr(self.test_tab, 'trajectory_tolerance', 25.0),
-                'pause_s': getattr(self.test_tab, 'trajectory_pause', 2.0)
-            },
+            get_trajectory_params=lambda: self.test_tab.get_trajectory_execution_params(),
             set_dual_refs=lambda x, y: (
                 self.test_tab.ref_a_input.setText(f"{x:.0f}"),
                 self.test_tab.ref_b_input.setText(f"{y:.0f}")
@@ -341,14 +344,13 @@ class CTRL_GUI(QMainWindow):
             capture_microscopy_image=self.camera_tab.capture_microscopy_image,
             autofocus_service=self.autofocus_service,
             cfocus_enabled_getter=lambda: self.cfocus_enabled,
-            get_current_frame=lambda: self.camera_tab.camera_worker.current_frame
-            if self.camera_tab.camera_worker is not None
-            else None,
-            smart_focus_scorer=self.smart_focus_scorer,
-            get_area_range=lambda: (
-                self.camera_tab.min_pixels_spin.value(),
-                self.camera_tab.max_pixels_spin.value(),
+            get_current_frame=lambda: (
+                self.camera_service.acquire_scientific_frame(timeout_s=1.5).image16
+                if self.camera_service is not None
+                else None
             ),
+            smart_focus_scorer=self.smart_focus_scorer,
+            get_area_range=self.camera_tab.get_area_range,
             controllers_ready_getter=lambda: (
                 getattr(self.test_tab, 'controller_a', None) is not None
                 and getattr(self.test_tab, 'controller_b', None) is not None
@@ -361,6 +363,12 @@ class CTRL_GUI(QMainWindow):
         self.microscopy_service.status_changed.connect(self.camera_tab.log_message)
         self.microscopy_service.progress_changed.connect(self._on_microscopy_progress)
         self.microscopy_service.finished.connect(self._on_microscopy_finished)
+        self.microscopy_service.resume_suggested.connect(
+            self.camera_tab.suggest_resume_point
+        )
+        self.microscopy_service.stopped.connect(
+            lambda: self.camera_tab._update_resume_button_label()
+        )
         
         # Conectar señales de máscaras de autofoco con CameraViewWindow
         self.microscopy_service.show_masks.connect(self._on_show_autofocus_masks)
@@ -368,6 +376,14 @@ class CTRL_GUI(QMainWindow):
         
         # CRÍTICO: Conectar señal de detección de microscopia para actualizar lista de objetos
         self.microscopy_service.detection_complete.connect(self.camera_tab._on_microscopy_detection_complete)
+
+        # Autodetección en vivo: encolar solo cuando XY no actúa (FOV/approach libres).
+        self.detection_service.set_motion_busy_gate(
+            lambda: bool(
+                getattr(self.test_tab, "test_service", None) is not None
+                and self.test_tab.test_service.is_xy_motion_active()
+            )
+        )
 
         # Aprendizaje asistido: popup de confirmación
         if hasattr(self.microscopy_service, 'learning_confirmation_requested'):
@@ -396,8 +412,8 @@ class CTRL_GUI(QMainWindow):
         # Restaurar sesión persistida (análisis + H∞ + TestTab)
         self._load_session_state()
         
-        # Actualizar estado inicial de conexión en ControlTab
-        self._update_connection_status()
+        # Estado inicial: el puerto se abre en el hilo RX; consultar tras el open.
+        QTimer.singleShot(600, self._update_connection_status)
 
     def _on_learning_confirmation_requested(self, frame_bgr, obj, class_name, confidence, count, target):
         """Muestra popup de confirmación de ROI y retorna la respuesta al servicio."""
@@ -443,7 +459,8 @@ class CTRL_GUI(QMainWindow):
                 logger.info("Ventana de señales creada exitosamente")
             else:
                 logger.debug("Reutilizando ventana de señales existente")
-            
+
+            self.signal_window.refresh_adc_range()
             self.signal_window.show()
             self.signal_window.raise_()
             self.signal_window.activateWindow()
@@ -486,32 +503,72 @@ class CTRL_GUI(QMainWindow):
     # ============================================================================
     # ============================================================================
     
-    def _on_serial_reconnect(self, port: str, baudrate: int):
+    def _on_mcu_profile_changed(self, mcu_id: str):
+        """Aplica perfil STM32/Arduino y sincroniza flags de control FOV."""
+        profile = apply_mcu_profile(mcu_id)
+        logger.info(
+            "Perfil MCU aplicado: %s (cz=%s, stiction=[%s,%s])",
+            mcu_id,
+            profile.get("supports_cz"),
+            profile.get("stiction_pwm_min"),
+            profile.get("stiction_pwm_max"),
+        )
+        try:
+            ts = getattr(self, "test_service", None)
+            if ts is not None and getattr(ts, "step_controller", None) is not None:
+                cfg = ts.step_controller.config
+                cfg.use_mcu_cz_loop = bool(profile.get("use_mcu_cz_loop", False))
+                logger.info("TestService.use_mcu_cz_loop -> %s", cfg.use_mcu_cz_loop)
+        except Exception as e:
+            logger.debug("No se pudo sync use_mcu_cz_loop: %s", e)
+        if hasattr(self, "control_tab") and self.control_tab is not None:
+            hint = profile.get("firmware_hint", mcu_id)
+            self.control_tab.firmware_status_label.setText(
+                f"Firmware perfil: {hint} | {profile.get('telemetry', '')}"
+            )
+        if self.signal_window is not None:
+            self.signal_window.refresh_adc_range()
+
+    def _on_serial_reconnect(self, port: str, baudrate: int, allow_retry: bool = True):
         """Maneja la reconexión serial desde ControlTab."""
         logger.info(f"=== RECONEXIÓN SERIAL SOLICITADA: {port} @ {baudrate} ===")
         
         try:
-            # Detener thread anterior
-            if self.serial_thread and self.serial_thread.isRunning():
+            old = self.serial_thread
+            if old is not None:
                 logger.debug("Deteniendo thread serial anterior")
-                self.serial_thread.stop()
-                self.serial_thread.wait(1000)  # Esperar máximo 1 segundo
-            
-            # Crear nuevo thread con los nuevos parámetros
+                try:
+                    old.data_received.disconnect(self.update_data)
+                except (TypeError, RuntimeError):
+                    pass
+                old.stop()
+                if not old.wait(3000):
+                    logger.warning("SerialHandler anterior no terminó a tiempo; forzando cierre")
+                    try:
+                        if old.ser and old.ser.is_open:
+                            old.ser.close()
+                    except Exception:
+                        pass
+                # Dar tiempo a Windows a liberar el handle del VCP ST-Link.
+                time.sleep(0.35)
+
             logger.debug(f"Creando nuevo SerialHandler: {port} @ {baudrate}")
             self.serial_thread = SerialHandler(port, baudrate)
-            
-            # Reconectar señal de datos
+            self.serial_thread.set_sensor_buffer(self.sensor_buffer)
             self.serial_thread.data_received.connect(self.update_data)
-            
-            # Actualizar referencia en ControlTab
             self.control_tab.serial_handler = self.serial_thread
-            
-            # Iniciar thread
             self.serial_thread.start()
-            
-            # Esperar un momento para que intente conectar
-            QTimer.singleShot(500, self._update_connection_status)
+
+            # Verificar tras abrir; un reintento si el VCP aún está ocupado.
+            if allow_retry:
+                QTimer.singleShot(
+                    600,
+                    lambda: self._update_connection_status(
+                        retry_port=port, retry_baud=baudrate
+                    ),
+                )
+            else:
+                QTimer.singleShot(600, self._update_connection_status)
             
             logger.info(f"✅ Reconexión iniciada: {port} @ {baudrate}")
             
@@ -519,15 +576,35 @@ class CTRL_GUI(QMainWindow):
             logger.error(f"Error en reconexión serial: {e}")
             self.control_tab.set_connection_status(False)
     
-    def _update_connection_status(self):
+    def _update_connection_status(self, retry_port: str = None, retry_baud: int = None):
         """Actualiza el estado de conexión en ControlTab."""
         if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
             port = self.serial_thread.ser.port
             self.control_tab.set_connection_status(True, port)
             logger.info(f"Estado conexión actualizado: Conectado a {port}")
-        else:
-            self.control_tab.set_connection_status(False)
-            logger.info("Estado conexión actualizado: Desconectado")
+            return
+
+        self.control_tab.set_connection_status(False)
+        logger.info("Estado conexión actualizado: Desconectado")
+        if retry_port and retry_baud and not getattr(self, "_serial_retry_armed", False):
+            self._serial_retry_armed = True
+            logger.warning(
+                "COM ocupado tras reconexión; reintento único en 1.2 s (%s @ %s)",
+                retry_port,
+                retry_baud,
+            )
+            QTimer.singleShot(
+                1200,
+                lambda: self._retry_serial_once(retry_port, retry_baud),
+            )
+
+    def _retry_serial_once(self, port: str, baudrate: int):
+        """Un solo reintento automático si el VCP quedó bloqueado."""
+        self._serial_retry_armed = False
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            return
+        logger.info("Reintento automático de apertura serial: %s @ %s", port, baudrate)
+        self._on_serial_reconnect(port, baudrate, allow_retry=False)
     
     def _get_sensor_adc(self, key: str):
         """ADC de sensor para el CONTROL (plano máquina).
@@ -819,14 +896,9 @@ class CTRL_GUI(QMainWindow):
     
     # HInfTab ahora llama directamente a su método synthesize_hinf_controller()
     def send_command(self, command):
-        """Envía comando al Arduino vía serial (TX con lock, thread-safe)."""
-        logger.debug(f"Enviando comando: '{command}'")
-
-        # Ruta única de TX protegida por lock en SerialHandler: permite que el
-        # lazo de control y la GUI escriban sin corromper el flujo (Fase 1).
-        if self.serial_thread.send_command(command):
-            logger.info(f"Comando enviado exitosamente: {command}")
-        else:
+        """Encola comando al MCU (SerialTxQueue: coalesce A,*, prioridad F/I/N/B)."""
+        # El log INFO de control lo hace SerialHandler al escribir al puerto.
+        if not self.serial_thread.send_command(command):
             logger.error("Error: Puerto serial no está abierto. Comando no enviado.")
 
     # --- NUEVOS HANDLERS PARA POSITION HOLD ---
@@ -898,10 +970,11 @@ class CTRL_GUI(QMainWindow):
     
     def _on_autofocus_status_message(self, message: str):
         """Callback para mensajes de estado del autofoco."""
-        # Mostrar en ventana de cámara
-        if self.camera_tab.camera_view_window:
-            self.camera_tab.camera_view_window.set_autofocus_status(message)
-        # También mostrar en log de CameraTab
+        # Overlay: solo 1ª línea (dumps de tabla BPoF son multilínea)
+        overlay = (message.splitlines()[0] if message else "").strip()
+        if self.camera_tab.camera_view_window and overlay:
+            self.camera_tab.camera_view_window.set_autofocus_status(overlay)
+        # Log/terminal GUI: mensaje completo (incluye lista de candidatos)
         self.camera_tab.log_message(message)
     
     def _on_autofocus_progress(self, current_step: int, total_steps: int, phase_name: str):
@@ -931,31 +1004,53 @@ class CTRL_GUI(QMainWindow):
                 f"   Obj{r.object_index}: Z={r.z_optimal:.1f}µm, Score={r.focus_score:.1f}"
             )
         
-        # Verificar posición Z actual del piezo
+        # Limpiar estado de autofoco en visualización
+        if hasattr(self.camera_tab, 'saliency_widget') and self.camera_tab.saliency_widget:
+            self.camera_tab.saliency_widget.clear_autofocus_state()
+
+        # Microscopía recibe los frames ya capturados; el piezo volvió al origen.
+        if hasattr(self, 'microscopy_service') and self.microscopy_service.is_running():
+            self.microscopy_service.handle_autofocus_complete(results)
+            return
+
+        # Autofoco manual: los N planos ya están en memoria. Guardarlos todos;
+        # no sustituirlos por una captura única posterior.
+        if results:
+            saved = self.camera_tab.save_manual_autofocus_stacks(results)
+            expected_per_object = int(
+                getattr(self.autofocus_service, "n_captures", 0) or 0
+            )
+            expected_total = expected_per_object * len(results)
+            if saved != expected_total:
+                self.camera_tab.log_message(
+                    f"❌ AF manual: se esperaban {expected_total} archivos "
+                    f"({expected_per_object} por objeto) y se guardaron {saved}"
+                )
+            else:
+                self.camera_tab.log_message(
+                    f"📸 AF manual: {saved}/{expected_total} planos guardados"
+                )
+        if hasattr(self.camera_tab, '_pending_capture'):
+            self.camera_tab._pending_capture = False
+        orchestrator = getattr(self.camera_tab, "orchestrator", None)
+        if orchestrator is not None:
+            orchestrator.clear_pending_capture()
+
         if self.cfocus_enabled and self.cfocus_controller:
             current_z = self.cfocus_controller.read_z()
             if current_z is not None:
                 self.camera_tab.log_message(
-                    f"📍 Posición Z actual: {current_z:.1f}µm (BPoF)"
+                    f"📍 Posición Z actual: {current_z:.1f}µm "
+                    "(origen calibrado)"
                 )
-        
-        self.camera_tab.log_message(f"✅ Autofoco completado: {n_results} objetos enfocados")
-        
-        # Limpiar estado de autofoco en visualización
-        if hasattr(self.camera_tab, 'saliency_widget') and self.camera_tab.saliency_widget:
-            self.camera_tab.saliency_widget.clear_autofocus_state()
-        
-        # Si hay captura pendiente (desde botón "Capturar Imagen"), ejecutarla
-        if hasattr(self.camera_tab, '_pending_capture') and self.camera_tab._pending_capture:
-            self.camera_tab._pending_capture = False
-            self.camera_tab.log_message("📸 Capturando imagen con mejor foco...")
-            self.camera_tab._do_capture_image()
-            return
+        if results:
+            self.camera_tab.log_message(
+                f"🎯 BPoF calculado: {results[0].z_optimal:.1f}µm"
+            )
 
-        # Si estamos en microscopia, delegar captura y avance al servicio
-        # Pasar los resultados del autofoco que incluyen el frame ya capturado en BPoF
-        if hasattr(self, 'microscopy_service') and self.microscopy_service.is_running():
-            self.microscopy_service.handle_autofocus_complete(results)
+        self.camera_tab.log_message(
+            f"✅ Autofoco completado: {n_results} objetos enfocados"
+        )
     
     def _on_show_autofocus_masks(self, masks_data):
         """Muestra máscaras de autofoco en la ventana de cámara."""
@@ -975,7 +1070,14 @@ class CTRL_GUI(QMainWindow):
         """Handler cuando termina la microscopía."""
         logger.info("Microscopía finalizada")
         self.camera_tab.log_message("✅ Microscopía completada")
-        self.camera_tab.set_trajectory_status(ready=True)
+        n = int(getattr(self.camera_tab, "_trajectory_n_points", 0) or 0)
+        if n > 0:
+            self.camera_tab.set_trajectory_status(True, n)
+            if self.camera_tab.resume_point_spin is not None:
+                self.camera_tab.resume_point_spin.setValue(1)
+            self.camera_tab._update_resume_button_label()
+        else:
+            self.camera_tab.set_trajectory_status(ready=True)
     
     def start_realtime_detection(self):
         """Inicia detección en tiempo real."""
@@ -997,6 +1099,15 @@ class CTRL_GUI(QMainWindow):
         
         if self.cfocus_controller is None:
             self.cfocus_controller = CFocusController()
+        elif self.cfocus_controller.is_connected:
+            self.camera_tab.log_message("✅ C-Focus: ya conectado")
+            return True
+        else:
+            # Reintento limpio tras fallo previo (handle sticky / USB en uso)
+            try:
+                self.cfocus_controller.disconnect()
+            except Exception:
+                pass
         
         success, message = self.cfocus_controller.connect()
         
@@ -1061,8 +1172,9 @@ class CTRL_GUI(QMainWindow):
                     self.camera_tab.log_message(warn_msg)
                     logger.warning(f"[Main] {warn_msg}")
                 
-                # CRÍTICO: Configurar AutofocusService después de calibrar
-                self.initialize_autofocus()
+                # Cablear hardware y reaplicar params desde UI/JSON (única vía)
+                if self.initialize_autofocus():
+                    self.camera_tab.sync_runtime_params_from_ui()
             else:
                 self.camera_tab.log_message("❌ Error en calibración")
                 
@@ -1087,10 +1199,23 @@ class CTRL_GUI(QMainWindow):
             self.camera_tab.log_message("⚠️ Cámara no conectada")
             return False
 
-        # Configurar AutofocusService con hardware
+        # Configurar AutofocusService: única vía CMOS = acquire_scientific_frame
         self.autofocus_service.configure(
             cfocus_controller=self.cfocus_controller,
-            get_frame_callback=lambda: worker.current_frame
+            get_exposure_s_callback=lambda: float(
+                getattr(worker, "exposure", 0.1) or 0.1
+            ),
+            # CRÍTICO: contador de grabs LIVE (frame_count). NO usar
+            # current_raw_frame_count: solo avanza al acquire científico y el
+            # flush OPTICAL se queda en timeout eterno → S=0 en todo el COARSE.
+            get_frame_count_callback=lambda: int(
+                getattr(worker, "frame_count", 0) or 0
+            ),
+            acquire_scientific_frame_callback=(
+                lambda timeout_s=2.0: self.camera_service.acquire_scientific_frame(
+                    timeout_s=timeout_s
+                )
+            ),
         )
         
         self.camera_tab.log_message("✅ Autofoco configurado (U2-Net + C-Focus)")
@@ -1105,6 +1230,10 @@ class CTRL_GUI(QMainWindow):
             self._save_session_state()
         except Exception as e:
             logger.error(f"No se pudo guardar sesión al cerrar: {e}")
+        try:
+            self.camera_tab.save_camera_tab_settings()
+        except Exception as e:
+            logger.error(f"No se pudieron guardar opciones de cámara al cerrar: {e}")
         logger.debug("Enviando comando de apagado de motores (A,0,0)")
         self.send_command('A,0,0')
         

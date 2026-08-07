@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox)
 from PyQt5.QtCore import pyqtSignal
 
-from config.constants import BAUD_RATE, FACTORY_UI
+from config.constants import BAUD_RATE, FACTORY_UI, MCU_TYPE
+from config.mcu_profiles import MCU_PROFILES, list_mcu_ids
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -29,6 +30,7 @@ class ControlTab(QWidget):
     auto_mode_requested = pyqtSignal()
     power_command_requested = pyqtSignal(int, int)  # power_a, power_b
     serial_reconnect_requested = pyqtSignal(str, int)  # puerto, baudrate
+    mcu_profile_changed = pyqtSignal(str)  # STM32 | ARDUINO
     
     # --- NUEVAS SEÑALES PARA POSITION HOLD ---
     position_hold_requested = pyqtSignal(int, int)  # sensor1_target, sensor2_target
@@ -80,43 +82,61 @@ class ControlTab(QWidget):
         """Crea el panel de configuración serial."""
         group_box = QGroupBox("⚙️ Configuración Serial")
         layout = QGridLayout()
+
+        layout.addWidget(QLabel("MCU:"), 0, 0)
+        self.mcu_combo = QComboBox()
+        for mcu_id in list_mcu_ids():
+            prof = MCU_PROFILES[mcu_id]
+            self.mcu_combo.addItem(prof["label"], mcu_id)
+        idx = self.mcu_combo.findData(MCU_TYPE)
+        if idx < 0:
+            idx = self.mcu_combo.findData("ARDUINO")
+        self.mcu_combo.setCurrentIndex(max(0, idx))
+        self.mcu_combo.setToolTip(
+            "STM32F767ZI = MycoViT (C(z) F/I/P). "
+            "Arduino UNO = emergencia DRV8871 (host-only; PWM≥110)."
+        )
+        self.mcu_combo.currentIndexChanged.connect(self._on_mcu_changed)
+        layout.addWidget(self.mcu_combo, 0, 1, 1, 2)
         
         # Puerto COM con detección automática
-        layout.addWidget(QLabel("Puerto:"), 0, 0)
+        layout.addWidget(QLabel("Puerto:"), 1, 0)
         self.port_combo = QComboBox()
-        self.port_combo.setToolTip("Selecciona el puerto serial del controlador XY (STM32 ST-Link VCP)")
-        layout.addWidget(self.port_combo, 0, 1)
+        self.port_combo.setToolTip("Puerto serial: ST-Link VCP (STM32) o Arduino UNO")
+        layout.addWidget(self.port_combo, 1, 1)
         
         # Botón escanear puertos
         scan_btn = QPushButton("🔄")
         scan_btn.setFixedWidth(40)
         scan_btn.setToolTip("Escanear puertos disponibles")
         scan_btn.clicked.connect(self._scan_ports)
-        layout.addWidget(scan_btn, 0, 2)
+        layout.addWidget(scan_btn, 1, 2)
         
         # Escanear puertos al inicializar
         self._scan_ports()
         
-        # Baudrate: fábrica fija 1 Mbps (Fase 5.3); lab puede cambiar.
+        # Baudrate seleccionable; default de diseño = BAUD_RATE (1 Mbps).
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '1000000'])
         self.baudrate_combo.setCurrentText(str(BAUD_RATE))
-        self.baudrate_combo.setToolTip("Velocidad de comunicación serial")
+        self.baudrate_combo.setToolTip(
+            "Velocidad serial. Firmware STM32/Arduino emergencia: 1000000 bps."
+        )
         if FACTORY_UI:
             self.baudrate_combo.setVisible(False)
             self.baudrate_combo.setCurrentText(str(BAUD_RATE))
             baud_lbl = QLabel(f"Enlace: {BAUD_RATE // 1000} kbps (fijo)")
             baud_lbl.setStyleSheet("color: #7F8C8D;")
-            layout.addWidget(baud_lbl, 1, 0, 1, 3)
+            layout.addWidget(baud_lbl, 2, 0, 1, 3)
         else:
-            layout.addWidget(QLabel("Baudrate:"), 1, 0)
-            layout.addWidget(self.baudrate_combo, 1, 1, 1, 2)
+            layout.addWidget(QLabel("Baudrate:"), 2, 0)
+            layout.addWidget(self.baudrate_combo, 2, 1, 1, 2)
 
         # Estado de conexión
-        layout.addWidget(QLabel("Estado:"), 2, 0)
+        layout.addWidget(QLabel("Estado:"), 3, 0)
         self.connection_status = QLabel("❌ Desconectado")
         self.connection_status.setStyleSheet("font-weight: bold; color: #E74C3C;")
-        layout.addWidget(self.connection_status, 2, 1, 1, 2)
+        layout.addWidget(self.connection_status, 3, 1, 1, 2)
         
         # Botón reconectar
         reconnect_btn = QPushButton("🔌 Conectar / Reconectar")
@@ -125,10 +145,20 @@ class ControlTab(QWidget):
             QPushButton:hover { background-color: #5DADE2; }
         """)
         reconnect_btn.clicked.connect(self._request_reconnect)
-        layout.addWidget(reconnect_btn, 3, 0, 1, 3)
+        layout.addWidget(reconnect_btn, 4, 0, 1, 3)
         
         group_box.setLayout(layout)
         return group_box
+
+    def _on_mcu_changed(self, _index: int = 0):
+        mcu_id = self.mcu_combo.currentData()
+        if not mcu_id:
+            return
+        logger.info("ControlTab: perfil MCU -> %s", mcu_id)
+        self.mcu_profile_changed.emit(str(mcu_id))
+
+    def get_selected_mcu(self) -> str:
+        return str(self.mcu_combo.currentData() or MCU_TYPE)
     
     def _create_control_group(self):
         """Crea el panel de control de modos."""
@@ -161,9 +191,11 @@ class ControlTab(QWidget):
         
         # Entrada de potencia
         layout.addWidget(QLabel("Potencia (A, B):"), 3, 0)
-        self.power_input = QLineEdit("100,-100")
-        self.power_input.setPlaceholderText("Ej: 100,-100")
-        self.power_input.setToolTip("Valores de potencia para Motor A y Motor B (-255 a 255)")
+        self.power_input = QLineEdit("128,0")
+        self.power_input.setPlaceholderText("Ej: 128,-128 (Arduino ≥110)")
+        self.power_input.setToolTip(
+            "Potencia Motor A y B (-255..255). Arranque útil: |pwm|≥110 (Arduino) / ≥95 (STM32)."
+        )
         layout.addWidget(self.power_input, 3, 1)
         
         # Botón enviar potencia
@@ -393,24 +425,24 @@ class ControlTab(QWidget):
     
     def _create_position_hold_group(self):
         """Panel de estado MCU + freno. Hold/S deshabilitados (STM32 no implementa H/S)."""
-        group_box = QGroupBox("Estado MCU STM32 / Freno")
+        group_box = QGroupBox("Estado MCU / Freno")
         layout = QGridLayout()
         
         layout.addWidget(QLabel("Target Sensor 1 (ADC):"), 0, 0)
         self.sensor1_target_input = QLineEdit("2048")
         self.sensor1_target_input.setEnabled(False)
-        self.sensor1_target_input.setToolTip("Hold no disponible en firmware STM32")
+        self.sensor1_target_input.setToolTip("Hold no disponible (usar control PC vía A,<pwm>)")
         layout.addWidget(self.sensor1_target_input, 0, 1)
         
         layout.addWidget(QLabel("Target Sensor 2 (ADC):"), 0, 2)
         self.sensor2_target_input = QLineEdit("2048")
         self.sensor2_target_input.setEnabled(False)
-        self.sensor2_target_input.setToolTip("Hold no disponible en firmware STM32")
+        self.sensor2_target_input.setToolTip("Hold no disponible (usar control PC vía A,<pwm>)")
         layout.addWidget(self.sensor2_target_input, 0, 3)
         
         hold_btn = QPushButton("Position Hold (N/A)")
         hold_btn.setEnabled(False)
-        hold_btn.setToolTip("Firmware STM32 no soporta H,<s1>,<s2>. Usar control PC vía A,<pwm>.")
+        hold_btn.setToolTip("Ni STM32 ni Arduino implementan H,<s1>,<s2>.")
         hold_btn.setStyleSheet("""
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #555555; color: #AAAAAA; }
         """)
@@ -432,7 +464,7 @@ class ControlTab(QWidget):
         
         config_btn = QPushButton("Configurar (N/A)")
         config_btn.setEnabled(False)
-        config_btn.setToolTip("Firmware STM32 no soporta S,<threshold>")
+        config_btn.setToolTip("Comando S no soportado en STM32/Arduino")
         config_btn.setStyleSheet("""
             QPushButton { font-size: 11px; padding: 6px; background-color: #555555; color: #AAAAAA; }
         """)
@@ -448,11 +480,14 @@ class ControlTab(QWidget):
         self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
         layout.addWidget(self.settled_status_label, 2, 3)
         
-        info_label = QLabel("Comandos MCU: M | A,<pwm_a>,<pwm_b> | B. Hold/S deshabilitados.")
+        info_label = QLabel(
+            "Comandos: M | A,<pwm_a>,<pwm_b> | B | N. "
+            "STM32: +F/I/P. Arduino: PWM≥110; F/I/P ignorados."
+        )
         info_label.setStyleSheet("color: #7F8C8D; font-size: 10px;")
         layout.addWidget(info_label, 3, 0, 1, 5)
         
-        self.firmware_status_label = QLabel("Firmware: Esperando telemetría STM32...")
+        self.firmware_status_label = QLabel("Firmware: Esperando telemetría...")
         self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")
         layout.addWidget(self.firmware_status_label, 4, 0, 1, 5)
         

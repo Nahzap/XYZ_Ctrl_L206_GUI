@@ -186,6 +186,10 @@ class CameraWorker(QThread):
                     frame = self.cam.read_oldest_image()
                     
                     if frame is not None:
+                        # Contrato AF: publicar la imagen antes de anunciar
+                        # el serial/contador correspondiente.
+                        raw_frame = frame.copy()
+                        self.current_frame = raw_frame
                         self.frame_count += 1
                         
                         # GESTION DE MEMORIA: Limpiar buffer cada 30 frames
@@ -202,10 +206,6 @@ class CameraWorker(QThread):
                                 gc.collect()
                             except Exception as e:
                                 pass  # Ignorar errores de limpieza
-                        
-                        # GUARDAR frame para captura (una sola copia)
-                        raw_frame = frame.copy()
-                        self.current_frame = raw_frame
                         
                         # Normalizar a uint8 para visualizacion
                         if frame.dtype != np.uint8:

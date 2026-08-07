@@ -45,7 +45,9 @@ class AutofocusResult:
     - z_positions: Posiciones Z correspondientes a cada frame
     - focus_scores: Scores de enfoque para cada frame
     
-    El BPoF siempre está en el centro de la lista (índice n//2).
+    El BPoF va al centro cuando ambos lados alcanzan ΔS. Si un límite físico
+    impide variar S en un lado, ``bpof_index`` identifica el extremo BPoF y el
+    resto del stack se distribuye por niveles ópticos sobre el lado útil.
     """
     object_index: int
     z_optimal: float
@@ -54,8 +56,15 @@ class AutofocusResult:
     frame: Optional[np.ndarray] = None  # Frame principal (BPoF) - para compatibilidad
     # Capturas multi-focales
     frames: List[np.ndarray] = field(default_factory=list)  # Lista de N frames
-    z_positions: List[float] = field(default_factory=list)  # Posiciones Z de cada frame
+    z_positions: List[float] = field(default_factory=list)  # Z comandadas
     focus_scores: List[float] = field(default_factory=list)  # Scores de cada frame
+    z_reads: List[Optional[float]] = field(default_factory=list)  # Z leídas del piezo
+    capture_step_um: float = 0.0  # Distancia media efectiva desde BPoF (µm)
+    capture_mode: str = "fixed_z_step"
+    target_s_drop_rel: float = 0.0
+    optical_plan: List[Dict] = field(default_factory=list)
+    bpof_index: int = -1
+    stack_layout: str = "centered"
     # Campos legacy para compatibilidad
     frame_alt: Optional[np.ndarray] = None
     z_alt: float = 0.0

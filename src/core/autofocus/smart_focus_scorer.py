@@ -124,7 +124,9 @@ class SmartFocusScorer:
             h, w = image.shape[:2]
             roi = (0, 0, w, h)
 
-        return calculate_focus_score(image, roi, roi_margin=getattr(self, 'roi_margin', 20))
+        return calculate_focus_score(
+            image, roi, roi_margin=int(getattr(self, 'roi_margin', 0) or 0)
+        )
     
     def evaluate_focus(self, 
                       image: np.ndarray, 

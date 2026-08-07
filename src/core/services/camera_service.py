@@ -26,10 +26,18 @@ import numpy as np
 import cv2
 
 from utils.microscopy_filename import build_single_capture_filename
+from core.utils.image_io import safe_imwrite
 
-from PyQt5.QtCore import QObject, pyqtSignal, Qt
+import time
+
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer
 
 from hardware.camera import CameraWorkerFactory, BaseCameraWorker
+from hardware.camera.scientific_config import (
+    ACA2500_14UC,
+    read_camera_roi_wh,
+    resolve_camera_resolution,
+)
 from config.hardware_availability import THORLABS_AVAILABLE, BASLER_AVAILABLE
 import traceback
 
@@ -83,8 +91,13 @@ class CameraService(QObject):
         self._pending_capture = False  # Flag para captura después de autofoco
         self._frames_received = 0
         self._frames_emitted = 0
+        self._frames_dropped = 0
         self._last_frame_log_time = 0.0
         self._resolution_logged = False
+        # Coalesce: solo el último frame llega a la UI (sin cola de latencia)
+        self._pending_q_image = None
+        self._pending_raw_frame = None
+        self._flush_scheduled = False
         
         logger.info(f"[CameraService] Inicializado con camera_type='{camera_type}'")
 
@@ -190,6 +203,10 @@ class CameraService(QObject):
         self.worker.buffer_size = buffer_size
         self._frames_received = 0
         self._frames_emitted = 0
+        self._frames_dropped = 0
+        self._pending_q_image = None
+        self._pending_raw_frame = None
+        self._flush_scheduled = False
 
         logger.info(
             "[CameraService] Iniciando live view: exp=%ss fps=%d buffer=%d worker=%s",
@@ -224,30 +241,96 @@ class CameraService(QObject):
         self.connected.emit(success, info)
 
     def _on_new_frame(self, q_image, raw_frame) -> None:
-        """Reemite el frame nuevo para que la UI lo consuma."""
-        import time
+        """Guarda solo el frame más reciente; evita cola Qt de frames grandes."""
         self._frames_received += 1
-        now = time.perf_counter()
+        if self._pending_q_image is not None:
+            self._frames_dropped += 1
+        self._pending_q_image = q_image
+        self._pending_raw_frame = raw_frame
 
         if self._frames_received == 1:
             shape = getattr(raw_frame, "shape", None)
+            qw = q_image.width() if q_image is not None else 0
+            qh = q_image.height() if q_image is not None else 0
             logger.info(
                 "[CameraService] Primer frame del worker: qimage=%dx%d raw_shape=%s",
-                q_image.width() if q_image else 0,
-                q_image.height() if q_image else 0,
+                qw,
+                qh,
                 shape,
             )
 
+        if not self._flush_scheduled:
+            self._flush_scheduled = True
+            QTimer.singleShot(0, self._flush_pending_frame)
+
+    def _flush_pending_frame(self) -> None:
+        """Emite el último frame pendiente hacia la UI."""
+        self._flush_scheduled = False
+        q_image = self._pending_q_image
+        raw_frame = self._pending_raw_frame
+        self._pending_q_image = None
+        self._pending_raw_frame = None
+        if q_image is None:
+            return
+
+        now = time.perf_counter()
         if now - self._last_frame_log_time >= 5.0:
             logger.info(
-                "[CameraService] Frames worker->UI: recibidos=%d emitidos=%d",
+                "[CameraService] Frames worker->UI: recibidos=%d emitidos=%d dropped=%d",
                 self._frames_received,
                 self._frames_emitted,
+                self._frames_dropped,
             )
             self._last_frame_log_time = now
 
         self._frames_emitted += 1
+        # Sync drop count into worker metrics si existe
+        metrics = getattr(self.worker, "live_metrics", None) if self.worker else None
+        if metrics is not None:
+            metrics.frames_dropped_coalesce = int(self._frames_dropped)
+            metrics.frames_emitted_ui = int(self._frames_emitted)
         self.frame_ready.emit(q_image, raw_frame)
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        """Activa/desactiva construcción de QImage preview en el worker."""
+        if self.worker is None:
+            return
+        setter = getattr(self.worker, "set_preview_enabled", None)
+        if callable(setter):
+            setter(bool(enabled))
+            logger.info("[CameraService] preview_enabled=%s", bool(enabled))
+
+    def get_live_metrics(self) -> Optional[dict]:
+        """Snapshot de métricas live (latencia/memoria) o None."""
+        if self.worker is None:
+            return None
+        metrics = getattr(self.worker, "live_metrics", None)
+        if metrics is None or not hasattr(metrics, "snapshot"):
+            return {
+                "frames_received": self._frames_received,
+                "frames_emitted": self._frames_emitted,
+                "frames_dropped": self._frames_dropped,
+            }
+        snap = metrics.snapshot()
+        snap["frames_received_service"] = self._frames_received
+        snap["frames_dropped_coalesce"] = self._frames_dropped
+        snap["frames_emitted_ui"] = self._frames_emitted
+        return snap
+
+    def acquire_scientific_frame(self, timeout_s: float = 2.0):
+        """
+        ÚNICA vía de adquisición de imagen del CMOS para ciencia/guardado.
+
+        Delega a ``worker.acquire_scientific_frame`` (ScientificFrame).
+        """
+        if self.worker is None:
+            raise RuntimeError("[CameraService] Sin worker de cámara")
+        acquire = getattr(self.worker, "acquire_scientific_frame", None)
+        if not callable(acquire):
+            raise RuntimeError(
+                "[CameraService] El worker no implementa acquire_scientific_frame"
+            )
+        return acquire(timeout_s=float(timeout_s))
 
     # ==================================================================
     # DETECCIÓN DE CÁMARAS
@@ -430,38 +513,42 @@ class CameraService(QObject):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(folder, f"captura_{timestamp}.{img_format}")
             
-            frame = self.worker.current_frame.copy()
-            frame_info = f"Original: {frame.shape}, dtype={frame.dtype}"
-            
-            # Normalizar frame uint16 para visualización correcta
-            if frame.dtype == np.uint16:
-                frame_min, frame_max = frame.min(), frame.max()
-                
-                if img_format == 'tiff':
-                    # TIFF: mantener 16 bits original
-                    cv2.imwrite(filename, frame)
-                    self.status_changed.emit(f"   16-bit TIFF: rango [{frame_min}, {frame_max}]")
-                else:
-                    # PNG/JPG: normalizar a 8 bits
-                    if frame_max > 0:
-                        frame_norm = (frame / frame_max * 255).astype(np.uint8)
-                    else:
-                        frame_norm = np.zeros_like(frame, dtype=np.uint8)
+            from hardware.camera.scientific_image import (
+                image16_to_u8_preview,
+                save_scientific_image,
+            )
 
-                    if img_format == 'jpg':
-                        cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    else:  # png
-                        cv2.imwrite(filename, frame_norm, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+            sci = self.acquire_scientific_frame(timeout_s=2.0)
+            use_16bit = bool(img_format.lower() in ("tiff", "tif", "png"))
+            if img_format.lower() in ("jpg", "jpeg"):
+                use_16bit = False
 
-                    self.status_changed.emit(f"   Normalizado: [{frame_min}, {frame_max}] → 8-bit")
+            if use_16bit:
+                ok = save_scientific_image(
+                    filename,
+                    sci.image16,
+                    already_prepared=True,
+                )
+                frame_info = (
+                    f"shape={sci.image16.shape}, dtype={sci.image16.dtype}, "
+                    f"source={sci.pipeline_id}, packed_as=16"
+                )
             else:
-                # Frame ya es uint8
-                if img_format == 'jpg':
-                    cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                elif img_format == 'png':
-                    cv2.imwrite(filename, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+                frame8 = image16_to_u8_preview(sci.image16)
+                if img_format.lower() in ("jpg", "jpeg"):
+                    ok = safe_imwrite(
+                        filename, frame8, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                    )
                 else:
-                    cv2.imwrite(filename, frame)
+                    ok = safe_imwrite(filename, frame8)
+                frame_info = (
+                    f"shape={frame8.shape}, dtype={frame8.dtype}, "
+                    f"source={sci.pipeline_id}_u8, packed_as=8"
+                )
+
+            if not ok:
+                self.status_changed.emit(f"❌ Error guardando: {filename}")
+                return
             
             self.status_changed.emit(f"📸 Imagen guardada: {filename}")
             self.status_changed.emit(f"   {frame_info}")
@@ -489,68 +576,55 @@ class CameraService(QObject):
         Returns:
             True si la captura fue exitosa.
         """
-        if self.worker is None or self.worker.current_frame is None:
-            self.status_changed.emit(f"❌ Error: No hay frame disponible para imagen {image_index}")
+        if self.worker is None:
+            self.status_changed.emit(
+                f"❌ Error: No hay cámara para imagen {image_index}"
+            )
             return False
-        
+
         try:
-            # Obtener frame actual
-            frame = self.worker.current_frame.copy()
+            from hardware.camera.scientific_image import (
+                image16_to_u8_preview,
+                save_scientific_image,
+            )
+
+            # Única adquisición CMOS (nunca preview current_frame)
+            sci = self.acquire_scientific_frame(timeout_s=2.0)
+            frame = np.asarray(sci.image16)
             h_orig, w_orig = frame.shape[:2]
-            original_dtype = frame.dtype
-            
-            # Redimensionar SOLO si el usuario especificó dimensiones diferentes a las del frame original
-            target_width = config.get('img_width', w_orig)
-            target_height = config.get('img_height', h_orig)
-            
-            if w_orig != target_width or h_orig != target_height:
-                logger.info(f"[CameraService] Redimensionando frame: {w_orig}x{h_orig} → {target_width}x{target_height}")
-                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            else:
-                logger.debug(f"[CameraService] Sin redimensionamiento (frame ya es {w_orig}x{h_orig})")
-            
-            # Procesar canales según selección del usuario
+            logger.debug(
+                "[CameraService] Captura nativa 1:1: %dx%d via %s",
+                w_orig,
+                h_orig,
+                sci.pipeline_id,
+            )
+
             channels = config.get('channels', {'R': False, 'G': True, 'B': False})
             selected_channels = [c for c in ['R', 'G', 'B'] if channels.get(c, False)]
             n_selected = len(selected_channels)
-            
-            # Lógica de canales
-            if len(frame.shape) == 2:  # Frame grayscale original
-                if n_selected == 1:
-                    pass  # frame ya está en grayscale
-                elif n_selected >= 2:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                    if n_selected < 3:
-                        new_frame = np.zeros_like(frame)
-                        if channels.get('B', False):
-                            new_frame[:, :, 0] = frame[:, :, 0]
-                        if channels.get('G', False):
-                            new_frame[:, :, 1] = frame[:, :, 1]
-                        if channels.get('R', False):
-                            new_frame[:, :, 2] = frame[:, :, 2]
-                        frame = new_frame
-            
-            elif len(frame.shape) == 3:  # Frame ya es color (BGR)
-                if n_selected == 1:
-                    channel_map = {'B': 0, 'G': 1, 'R': 2}
-                    channel_idx = channel_map[selected_channels[0]]
-                    frame = frame[:, :, channel_idx]
-                else:
-                    if n_selected < 3:
-                        new_frame = np.zeros_like(frame)
-                        if channels.get('B', False):
-                            new_frame[:, :, 0] = frame[:, :, 0]
-                        if channels.get('G', False):
-                            new_frame[:, :, 1] = frame[:, :, 1]
-                        if channels.get('R', False):
-                            new_frame[:, :, 2] = frame[:, :, 2]
-                        frame = new_frame
-            
-            # Generar nombre de archivo
+
+            if frame.ndim == 3 and n_selected == 1:
+                channel_map = {'B': 0, 'G': 1, 'R': 2}
+                frame = frame[:, :, channel_map[selected_channels[0]]]
+            elif frame.ndim == 3 and 0 < n_selected < 3:
+                new_frame = np.zeros_like(frame)
+                if channels.get('B', False):
+                    new_frame[:, :, 0] = frame[:, :, 0]
+                if channels.get('G', False):
+                    new_frame[:, :, 1] = frame[:, :, 1]
+                if channels.get('R', False):
+                    new_frame[:, :, 2] = frame[:, :, 2]
+                frame = new_frame
+            elif frame.ndim == 2 and n_selected >= 2:
+                frame = cv2.cvtColor(
+                    image16_to_u8_preview(frame), cv2.COLOR_GRAY2BGR
+                )
+                frame = (frame.astype(np.uint16) << 8)
+
             class_name = config.get('class_name', 'Imagen')
             save_folder = config.get('save_folder', '.')
             img_format = config.get('img_format', 'png').lower()
-            use_16bit = config.get('use_16bit', True)  # Por defecto 16-bit
+            use_16bit = bool(config.get('use_16bit', True))
             x_um = config.get('x_um')
             y_um = config.get('y_um')
             has_xy = x_um is not None and y_um is not None
@@ -561,60 +635,40 @@ class CameraService(QObject):
                         class_name, image_index, float(x_um), float(y_um), ext
                     )
                 return f"{class_name}_{image_index:05d}.{ext}"
-            
-            # Determinar extensión y guardar según formato y profundidad de bits
+
+            if img_format == 'jpg':
+                use_16bit = False
+
             if img_format == 'tiff':
                 filename = _microscopy_filename('tiff')
-                filepath = os.path.join(save_folder, filename)
-                
-                if use_16bit:
-                    # TIFF 16-bit: mantener uint16
-                    success = cv2.imwrite(filepath, frame)
-                    bits_str = "16-bit"
-                else:
-                    # TIFF 8-bit: convertir a uint8
-                    if original_dtype == np.uint16:
-                        if frame.max() > 0:
-                            frame = (frame / frame.max() * 255).astype(np.uint8)
-                        else:
-                            frame = frame.astype(np.uint8)
-                    success = cv2.imwrite(filepath, frame)
-                    bits_str = "8-bit"
-                    
             elif img_format == 'png':
                 filename = _microscopy_filename('png')
-                filepath = os.path.join(save_folder, filename)
-                
-                if use_16bit:
-                    # PNG 16-bit: OpenCV soporta PNG 16-bit nativamente con uint16
-                    # El frame ya está en uint16, cv2.imwrite lo guarda correctamente
-                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-                    bits_str = "16-bit"
-                else:
-                    # PNG 8-bit: convertir a uint8
-                    if original_dtype == np.uint16:
-                        if frame.max() > 0:
-                            frame = (frame / frame.max() * 255).astype(np.uint8)
-                        else:
-                            frame = frame.astype(np.uint8)
-                    success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-                    bits_str = "8-bit"
-                    
-            else:  # jpg
-                # JPG solo soporta 8-bit
+            else:
                 filename = _microscopy_filename('jpg')
-                filepath = os.path.join(save_folder, filename)
-                
-                if original_dtype == np.uint16:
-                    if frame.max() > 0:
-                        frame = (frame / frame.max() * 255).astype(np.uint8)
-                    else:
-                        frame = frame.astype(np.uint8)
-                success = cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                bits_str = "8-bit (JPG)"
-            
+            filepath = os.path.join(save_folder, filename)
+
+            if use_16bit and img_format in ('tiff', 'png'):
+                success = save_scientific_image(
+                    filepath, frame, already_prepared=True
+                )
+                bits_str = "16-bit"
+            else:
+                frame8 = image16_to_u8_preview(frame)
+                if img_format == 'jpg':
+                    success = safe_imwrite(
+                        filepath, frame8, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                    )
+                    bits_str = "8-bit (JPG)"
+                else:
+                    success = safe_imwrite(
+                        filepath, frame8, [cv2.IMWRITE_PNG_COMPRESSION, 6]
+                    )
+                    bits_str = "8-bit"
+
             if not success:
-                self.status_changed.emit(f"❌ Error: cv2.imwrite falló para {filename}")
+                self.status_changed.emit(
+                    f"❌ Error: guardado científico falló para {filename}"
+                )
                 return False
 
             capture_position = config.get("capture_position")
@@ -689,20 +743,49 @@ class CameraService(QObject):
             'max': int(frame.max())
         }
     
-    def get_resolution(self) -> Tuple[int, int]:
-        """Retorna la resolución real de la cámara (width, height) del frame actual.
-        
-        Returns:
-            Tupla (width, height) en píxeles, o (1920, 1080) por defecto si no hay frame.
+    def get_resolution(self) -> Optional[Tuple[int, int]]:
+        """Resolución real (width, height). Nunca inventa 1920×1080.
+
+        Prioridad: frame actual → ROI del worker → nodos GenICam → datasheet Basler.
         """
-        if self.worker is None or self.worker.current_frame is None:
-            logger.warning("[CameraService] No hay frame disponible, retornando resolución por defecto")
-            return (1920, 1080)
-        
+        if self.worker is None:
+            logger.warning("[CameraService] Sin worker; resolución desconocida")
+            return None
+
         frame = self.worker.current_frame
-        h, w = frame.shape[:2]
+        frame_hw = frame.shape[:2] if frame is not None else None
+
+        configured_wh = None
+        cw = getattr(self.worker, "configured_width", None)
+        ch = getattr(self.worker, "configured_height", None)
+        if cw is not None and ch is not None:
+            configured_wh = (int(cw), int(ch))
+
+        camera = getattr(self.worker, "camera", None)
+        node_wh = read_camera_roi_wh(camera) if camera is not None else None
+
+        datasheet_wh = None
+        worker_type = ""
+        try:
+            worker_type = str(self.worker.get_camera_type()).lower()
+        except Exception:
+            worker_type = type(self.worker).__name__.lower()
+        if "basler" in worker_type:
+            datasheet_wh = (ACA2500_14UC.width, ACA2500_14UC.height)
+
+        resolved = resolve_camera_resolution(
+            frame_hw=frame_hw,
+            configured_wh=configured_wh,
+            node_wh=node_wh,
+            datasheet_wh=datasheet_wh,
+        )
+        if resolved is None:
+            logger.warning("[CameraService] No se pudo resolver resolución de cámara")
+            return None
+
+        w, h = resolved
         if not self._resolution_logged:
-            logger.info("[CameraService] Resolución real de cámara: %dx%d", w, h)
+            logger.info("[CameraService] Resolución de cámara: %dx%d", w, h)
             self._resolution_logged = True
         else:
             logger.debug("[CameraService] Resolución de cámara: %dx%d", w, h)

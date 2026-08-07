@@ -180,8 +180,8 @@ class CalibrationAnalysisService:
         intercept = cal['intercept']
         slope = cal['slope']
         
-        # Aplicar calibración (relación inversa para estos sensores)
-        sensor_um = intercept - slope * sensor_adc
+        # Aplicar calibración: um = intercept + slope*adc (slope con signo)
+        sensor_um = intercept + slope * sensor_adc
         
         logger.info(f"{motor_name}: intercept={intercept:.2f}µm, slope={slope:.4f}µm/ADC")
         

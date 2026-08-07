@@ -28,12 +28,12 @@ from config.constants import (
     POSITION_TOLERANCE_UM, SETTLING_CYCLES,
     DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
 )
-from core.control.step_config import load_step_control_config
 from core.control.controller_config import ControllerConfig
 from core.services.test_service import TestService
 from gui.utils.trajectory_preview import show_trajectory_preview
 from gui.utils.csv_utils import export_trajectory_csv, import_trajectory_csv
 from gui.utils.test_tab_ui_builder import (
+    create_antecedent_probe_section,
     create_calibration_analysis_section,
     create_controllers_section,
     create_motor_sensor_section,
@@ -108,6 +108,7 @@ class TestTab(QWidget):
         self.trajectory_active = False
         self.trajectory_tolerance = POSITION_TOLERANCE_UM
         self.trajectory_pause = 2.0
+        self.trajectory_point_timeout_s = 6.0
         
         # Calibración
         self.calibration_data = None
@@ -115,7 +116,60 @@ class TestTab(QWidget):
         self._setup_ui()
         self._map_widgets()
         self._load_default_parameters()
+        # Tras cargar defaults, sincronizar tolerancia/pausa desde los campos UI
+        self.sync_trajectory_params_from_ui()
         logger.debug("TestTab inicializado con TestService")
+    
+    def sync_trajectory_params_from_ui(self) -> dict:
+        """Lee tolerancia/pausa/timeout desde los campos UI (fuente de verdad)."""
+        tol = float(POSITION_TOLERANCE_UM)
+        pause = 2.0
+        point_timeout_s = 6.0
+        try:
+            if self.tolerance_input is not None:
+                tol = float(str(self.tolerance_input.text()).strip().replace(",", "."))
+        except (ValueError, TypeError, AttributeError):
+            logger.warning(
+                "[TestTab] Tolerancia UI inválida; usando %.1f µm", POSITION_TOLERANCE_UM
+            )
+            tol = float(POSITION_TOLERANCE_UM)
+        try:
+            if getattr(self, "pause_input", None) is not None:
+                pause = float(str(self.pause_input.text()).strip().replace(",", "."))
+        except (ValueError, TypeError, AttributeError):
+            pause = float(getattr(self, "trajectory_pause", 2.0) or 2.0)
+        try:
+            tmo_w = getattr(self, "point_timeout_input", None)
+            if tmo_w is not None:
+                point_timeout_s = float(str(tmo_w.text()).strip().replace(",", "."))
+        except (ValueError, TypeError, AttributeError):
+            point_timeout_s = float(getattr(self, "trajectory_point_timeout_s", 6.0) or 6.0)
+
+        tol = max(1.0, tol)
+        pause = max(0.0, pause)
+        point_timeout_s = max(0.5, min(120.0, point_timeout_s))
+        self.trajectory_tolerance = tol
+        self.trajectory_pause = pause
+        self.trajectory_point_timeout_s = point_timeout_s
+        fov_x, fov_y = 0.0, 0.0
+        try:
+            if self.fov_x_input is not None:
+                fov_x = float(str(self.fov_x_input.text()).strip().replace(",", "."))
+            if self.fov_y_input is not None:
+                fov_y = float(str(self.fov_y_input.text()).strip().replace(",", "."))
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return {
+            "tolerance_um": tol,
+            "pause_s": pause,
+            "point_timeout_s": point_timeout_s,
+            "fov_x_um": max(0.0, fov_x),
+            "fov_y_um": max(0.0, fov_y),
+        }
+
+    def get_trajectory_execution_params(self) -> dict:
+        """Parámetros de cierre para TestService / MicroscopyService."""
+        return self.sync_trajectory_params_from_ui()
     
     def _connect_service_signals(self):
         """Conecta las señales del TestService con los métodos de actualización de UI."""
@@ -126,16 +180,24 @@ class TestTab(QWidget):
         self.test_service.dual_position_reached.connect(self._on_dual_position_reached)
         self.test_service.dual_position_lost.connect(self._on_dual_position_lost)
         
+        self.test_service.antecedent_probe_finished.connect(self._on_antecedent_probe_finished)
+
         # Trayectoria
         self.test_service.trajectory_started.connect(self._on_trajectory_started)
         self.test_service.trajectory_stopped.connect(self._on_trajectory_stopped)
         self.test_service.trajectory_completed.connect(self._on_trajectory_completed)
         self.test_service.trajectory_point_reached.connect(self._on_trajectory_point_reached)
-        self.test_service.trajectory_feedback.connect(self._on_trajectory_feedback)
+        self.test_service.trajectory_feedback.connect(
+            self._on_trajectory_feedback, Qt.QueuedConnection
+        )
         
         # General
-        self.test_service.log_message.connect(self._on_log_message)
-        self.test_service.error_occurred.connect(self._on_error_occurred)
+        self.test_service.log_message.connect(
+            self._on_log_message, Qt.QueuedConnection
+        )
+        self.test_service.error_occurred.connect(
+            self._on_error_occurred, Qt.QueuedConnection
+        )
     
     def set_hardware_callbacks(self, send_command, get_sensor_value, get_mode_label):
         """
@@ -187,6 +249,15 @@ class TestTab(QWidget):
         # Sección 2: Asignación Motor-Sensor
         motor_sensor_group = create_motor_sensor_section(self._widgets)
         layout.addWidget(motor_sensor_group)
+
+        # Sección 3: Antecedente de banco (~2000 µm)
+        antecedent_group = create_antecedent_probe_section(
+            self._widgets,
+            lambda: self._run_antecedent_probe("A"),
+            lambda: self._run_antecedent_probe("B"),
+            self._stop_antecedent_probe,
+        )
+        layout.addWidget(antecedent_group)
         
         # Sección 4: Control por Posición
         position_group = create_position_control_section(
@@ -279,7 +350,7 @@ class TestTab(QWidget):
         self.trajectory_status = self._widgets.get('trajectory_status')
         self.tolerance_input = self._widgets.get('tolerance_input')
         self.pause_input = self._widgets.get('pause_input')
-        self.homogeneous_steps_cb = self._widgets.get('homogeneous_steps_cb')
+        self.point_timeout_input = self._widgets.get('point_timeout_input')
         self.trajectory_progress_label = self._widgets.get('trajectory_progress_label')
         self.current_point_label = self._widgets.get('current_point_label')
         self.error_x_label = self._widgets.get('error_x_label')
@@ -314,10 +385,6 @@ class TestTab(QWidget):
                 self.y_end_input.setText(str(defaults.get('y_range', {}).get('max', 19500.0)))
             if self.delay_input:
                 self.delay_input.setText(str(defaults.get('delay_between_points', 0.5)))
-            if self.homogeneous_steps_cb:
-                step_cfg = load_step_control_config()
-                self.homogeneous_steps_cb.setChecked(step_cfg.enabled)
-            
             logger.info("✅ Parámetros de trayectoria cargados desde configuración")
         except Exception as e:
             logger.warning(f"No se pudieron cargar parámetros por defecto: {e}")
@@ -350,6 +417,68 @@ class TestTab(QWidget):
         """Inicia control dual - llama directamente al método de control."""
         logger.info("Botón 'Iniciar Control Dual' presionado")
         self.start_dual_control()
+
+    def _antecedent_sensor_invert(self, motor: str):
+        """Lee mapa sensor/invert de la UI para la sonda."""
+        motor_u = motor.upper()
+        if motor_u == "A":
+            sensor = (
+                "sensor_2"
+                if getattr(self, "motor_a_sensor2", None) is not None
+                and self.motor_a_sensor2.isChecked()
+                else "sensor_1"
+            )
+            invert = bool(
+                getattr(self, "motor_a_invert", None) is not None
+                and self.motor_a_invert.isChecked()
+            )
+        else:
+            sensor = (
+                "sensor_1"
+                if getattr(self, "motor_b_sensor1", None) is not None
+                and self.motor_b_sensor1.isChecked()
+                else "sensor_2"
+            )
+            invert = bool(
+                getattr(self, "motor_b_invert", None) is not None
+                and self.motor_b_invert.isChecked()
+            )
+        return sensor, invert
+
+    def _run_antecedent_probe(self, motor: str) -> None:
+        """Lanza sonda open-loop ~2000 µm para un motor."""
+        try:
+            delta = float(self._widgets["antecedent_delta_input"].text())
+            pwm = int(float(self._widgets["antecedent_pwm_input"].text()))
+        except (KeyError, ValueError):
+            self.results_text.append("❌ Δµm/PWM inválidos")
+            return
+        direction = 1 if self._widgets["antecedent_dir_plus"].isChecked() else -1
+        sensor, invert = self._antecedent_sensor_invert(motor)
+        # Sync mapa al servicio si hay controlador
+        if motor.upper() == "A":
+            self.test_service.update_controller_a_sensor(sensor, invert)
+        else:
+            self.test_service.update_controller_b_sensor(sensor, invert)
+        ok = self.test_service.start_antecedent_probe(
+            motor,
+            delta_um=delta,
+            pwm=pwm,
+            direction=direction,
+            sensor_key=sensor,
+            invert=invert,
+        )
+        if not ok:
+            self.results_text.append(f"❌ No se pudo iniciar sonda Motor {motor}")
+
+    def _stop_antecedent_probe(self) -> None:
+        self.test_service.stop_antecedent_probe("ui_stop")
+
+    def _on_antecedent_probe_finished(self, result) -> None:
+        for line in result.summary_lines():
+            self.results_text.append(line)
+        mark = "✅" if result.ok else "⚠️"
+        self.results_text.append(f"{mark} Antecedente Motor {result.motor} guardado")
     
     def _generate_trajectory(self):
         """Genera trayectoria con parámetros actuales usando TrajectoryGenerator."""
@@ -755,6 +884,16 @@ class TestTab(QWidget):
             # Asegurar preferencias de sensor sin tocar invert
             self.apply_controller_preferences({'A': want_a, 'B': want_b}, None)
 
+        # Sync visual de radios (screenshot 14:30 podía mentir vs servicio).
+        if self.motor_a_sensor2 is not None:
+            self.motor_a_sensor2.setChecked(True)
+        if self.motor_a_sensor1 is not None:
+            self.motor_a_sensor1.setChecked(False)
+        if self.motor_b_sensor1 is not None:
+            self.motor_b_sensor1.setChecked(True)
+        if self.motor_b_sensor2 is not None:
+            self.motor_b_sensor2.setChecked(False)
+
         if self.controller_a:
             self.test_service.update_controller_a_sensor(want_a, inv_a)
             if isinstance(self.controller_a, dict):
@@ -768,6 +907,7 @@ class TestTab(QWidget):
             for n in notes:
                 self.results_text.append(f"⚠️ {n}")
                 logger.warning(n)
+                self.test_service.log_message.emit(f"⚠️ {n}")
         logger.info(
             f"Ejes listos: A→{want_a} invert={inv_a}, B→{want_b} invert={inv_b}"
         )
@@ -860,22 +1000,17 @@ class TestTab(QWidget):
             self.results_text.append("❌ Error: Genera una trayectoria primero")
             return
         
-        # Obtener parámetros
-        try:
-            tolerance = float(self.tolerance_input.text())
-            pause = float(self.pause_input.text())
-        except ValueError:
-            tolerance = POSITION_TOLERANCE_UM
-            pause = 2.0
+        # Sincronizar UI → atributos (misma fuente que microscopía)
+        params = self.sync_trajectory_params_from_ui()
+        tolerance = float(params["tolerance_um"])
+        pause = float(params["pause_s"])
+        point_timeout_s = float(params["point_timeout_s"])
         
         # Guardrail: la tolerancia de cierre no debe acercarse al tamaño del FOV.
         if not self._confirm_tolerance_vs_fov(tolerance):
             self.results_text.append("⏹️ Ejecución cancelada: ajusta la tolerancia de cierre")
             return
 
-        # Guardar para compatibilidad
-        self.trajectory_tolerance = tolerance
-        self.trajectory_pause = pause
         self.trajectory_index = 0
         
         # CRÍTICO: sin el mapa canónico el error µm no coincide con Synthesis
@@ -885,13 +1020,19 @@ class TestTab(QWidget):
         # Convertir trayectoria a lista de tuplas
         trajectory_list = [(p[0], p[1]) for p in self.current_trajectory]
         
-        # Delegar al servicio con auto_advance=True para TestTab standalone
-        if self.homogeneous_steps_cb is not None:
-            self.test_service.set_step_control_enabled(self.homogeneous_steps_cb.isChecked())
-        self.test_service.start_trajectory(trajectory_list, tolerance, pause, auto_advance=True)
+        # Trayectoria siempre: host approach + MCU C(z). Sin micropasos legacy.
+        self.test_service.set_step_control_enabled(True)
+        self.test_service.start_trajectory(
+            trajectory_list,
+            tolerance,
+            pause,
+            auto_advance=True,
+            point_timeout_s=point_timeout_s,
+        )
     
     def _update_trajectory_feedback(self, target_x: float, target_y: float, error_x: float, error_y: float, 
-                                      lock_x: bool = False, lock_y: bool = False):
+                                      lock_x: bool = False, lock_y: bool = False,
+                                      settling: int = 0):
         """Actualiza los labels de feedback visual durante ejecución de trayectoria."""
         try:
             # Progreso
@@ -940,8 +1081,6 @@ class TestTab(QWidget):
                 self.error_y_label.setStyleSheet("font-family: monospace; color: #E74C3C;")
                 self.error_y_label.setText(f"Y: {error_y:+.1f} µm")
             
-            # Settling
-            settling = getattr(self, '_traj_settling_counter', 0)
             if settling > 0:
                 self.settling_label.setStyleSheet("font-family: monospace; color: #27AE60;")
             else:
@@ -949,7 +1088,7 @@ class TestTab(QWidget):
             self.settling_label.setText(f"Settling: {settling}/{SETTLING_CYCLES}")
             
         except Exception as e:
-            logger.debug(f"Error actualizando feedback: {e}")
+            logger.warning(f"Error actualizando feedback: {e}")
     
     def _reset_trajectory_feedback(self):
         """Resetea los labels de feedback a estado inicial."""
@@ -1030,11 +1169,16 @@ class TestTab(QWidget):
                                  error_x: float, error_y: float,
                                  lock_x: bool, lock_y: bool, settling: int):
         """Handler: Actualización de feedback visual de trayectoria."""
-        self._update_trajectory_feedback(target_x, target_y, error_x, error_y, lock_x, lock_y)
+        self._update_trajectory_feedback(
+            target_x, target_y, error_x, error_y, lock_x, lock_y, settling
+        )
     
     def _on_log_message(self, message: str):
-        """Handler: Mensaje de log del servicio."""
+        """Handler: Mensaje de log del servicio → terminal Prueba."""
         self.results_text.append(message)
+        # Mantener visible la última línea (cola Qt desde ControlWorker).
+        sb = self.results_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
     
     def _on_error_occurred(self, error: str):
         """Handler: Error del servicio."""

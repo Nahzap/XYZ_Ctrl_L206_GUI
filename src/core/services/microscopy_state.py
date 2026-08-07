@@ -165,8 +165,13 @@ class MicroscopyStateManager:
     # MÉTODOS DE CONTROL
     # ==================================================================
     
-    def start(self, trajectory: List[Tuple[float, float]], 
-              learning_mode: bool = False, learning_target: int = 50):
+    def start(
+        self,
+        trajectory: List[Tuple[float, float]],
+        learning_mode: bool = False,
+        learning_target: int = 50,
+        start_index: int = 0,
+    ):
         """
         Inicia una nueva sesión de microscopía.
         
@@ -174,22 +179,40 @@ class MicroscopyStateManager:
             trajectory: Lista de puntos (x, y)
             learning_mode: Si modo aprendizaje está activo
             learning_target: Objetivo de imágenes para aprendizaje
+            start_index: Índice 0-based desde el que continuar (reanudación)
         """
         self._state = MicroscopyState.RUNNING
         self._trajectory = list(trajectory)
         self._total_points = len(trajectory)
-        self._current_point = 0
+        if self._total_points <= 0:
+            self._current_point = 0
+        else:
+            self._current_point = max(0, min(int(start_index), self._total_points - 1))
         self._position_checks = 0
-        self._image_counter = 0
+        # Progreso aproximado: puntos anteriores ya capturados en disco
+        self._image_counter = int(self._current_point)
         self._learning_count = 0
         self._learning_mode = learning_mode
         self._learning_target = learning_target
         
         logger.info(
-            "[MicroscopyState] Iniciado: %d puntos, aprendizaje=%s (target=%d)",
+            "[MicroscopyState] Iniciado: %d puntos, desde P%d, aprendizaje=%s (target=%d)",
             self._total_points,
+            self._current_point + 1,
             "ON" if learning_mode else "OFF",
             learning_target
+        )
+
+    def set_current_point(self, index_0based: int) -> None:
+        """Fija el índice actual (0-based), p.ej. tras fallo FOV para reanudar."""
+        if self._total_points <= 0:
+            self._current_point = 0
+            return
+        self._current_point = max(0, min(int(index_0based), self._total_points - 1))
+        logger.info(
+            "[MicroscopyState] current_point → %d/%d",
+            self._current_point + 1,
+            self._total_points,
         )
     
     def pause(self):

@@ -1,0 +1,5 @@
+{
+  "mcu": "ARDUINO",
+  "label": "Arduino UNO (DRV8871)",
+  "_comment": "Perfil activo del controlador XY. STM32 o ARDUINO."
+}

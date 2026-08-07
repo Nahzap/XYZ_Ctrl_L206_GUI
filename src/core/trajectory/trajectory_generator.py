@@ -53,10 +53,10 @@ class TrajectoryGenerator:
                     'message': "Número de puntos debe estar entre 1 y 10000"
                 }
             
-            if step_delay < 0.1:
+            if step_delay < 0.0:
                 return {
                     'success': False,
-                    'message': "Tiempo entre pasos debe ser al menos 0.1s"
+                    'message': "Tiempo entre pasos no puede ser negativo"
                 }
             
             # Calcular número de filas para zig-zag
@@ -146,10 +146,10 @@ class TrajectoryGenerator:
                     'message': "FOV X e Y deben ser positivos"
                 }
 
-            if step_delay < 0.1:
+            if step_delay < 0.0:
                 return {
                     'success': False,
-                    'message': "Tiempo entre pasos debe ser al menos 0.1s"
+                    'message': "Tiempo entre pasos no puede ser negativo"
                 }
 
             delta_x = x_max - x_min

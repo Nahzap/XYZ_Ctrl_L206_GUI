@@ -11,7 +11,7 @@ import numpy as np
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox
 from PyQt5.QtCore import Qt
 import pyqtgraph as pg
-from config.constants import PLOT_LENGTH, ADC_MAX
+import config.constants as constants
 from gui.styles.dark_theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ class SignalWindow(QWidget):
         legend = self.plot_widget.addLegend()
         legend.setLabelTextColor('#F0F0F0')
         
-        self.plot_widget.setYRange(0, float(ADC_MAX), padding=0)
+        self.refresh_adc_range()
         
         layout.addWidget(self.plot_widget)
         
@@ -79,15 +79,15 @@ class SignalWindow(QWidget):
         layout.addLayout(checkbox_layout)
         
         # Buffer circular MÍNIMO con NumPy
-        self.buffer_size = PLOT_LENGTH
+        self.buffer_size = constants.PLOT_LENGTH
         self.index = 0
         
         # Arrays pre-asignados contiguos en memoria (MÁXIMA velocidad)
         self.data = {
-            'power_a': np.zeros(PLOT_LENGTH, dtype=np.int16),  # int16 más rápido que float32
-            'power_b': np.zeros(PLOT_LENGTH, dtype=np.int16),
-            'sensor_1': np.zeros(PLOT_LENGTH, dtype=np.int16),
-            'sensor_2': np.zeros(PLOT_LENGTH, dtype=np.int16),
+            'power_a': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),  # int16 más rápido que float32
+            'power_b': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
+            'sensor_1': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
+            'sensor_2': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
         }
         
         # LÍNEAS ULTRA-RÁPIDAS - configuración mínima
@@ -105,6 +105,12 @@ class SignalWindow(QWidget):
         }
         
         logger.debug("SignalWindow creada exitosamente")
+
+    def refresh_adc_range(self):
+        """Ajusta el eje Y al ADC_MAX del perfil MCU activo (10-bit / 12-bit)."""
+        adc_hi = float(constants.ADC_MAX)
+        self.plot_widget.setYRange(0, adc_hi, padding=0)
+        logger.debug("SignalWindow YRange -> 0..%s (MCU=%s)", adc_hi, getattr(constants, "MCU_TYPE", "?"))
     
     def update_plot_visibility(self):
         """Muestra u oculta las líneas del gráfico según los checkboxes."""

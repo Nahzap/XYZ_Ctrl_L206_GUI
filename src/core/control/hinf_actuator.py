@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
-from config.constants import CALIBRATION_X, CALIBRATION_Y, um_to_adc
+from config.constants import position_error_um
 from core.control.controller_config import ControllerConfig
 from core.control.sensor_buffer import SensorBuffer
 
@@ -55,13 +55,11 @@ class HinfActuator:
         state: HinfAxisState,
         Ts: float,
     ) -> Tuple[int, float, HinfAxisState]:
-        slope = CALIBRATION_X["slope"] if axis == "x" else CALIBRATION_Y["slope"]
-        ref_adc = um_to_adc(ref_um, axis=axis)
         adc = sensor_buffer.get_adc(ctrl.sensor_key)
         if adc is None:
             return 0, 0.0, state
 
-        error_um = (ref_adc - adc) * slope
+        error_um = position_error_um(ref_um, adc, axis)
 
         if state.last_err_um * error_um < 0:
             state = HinfAxisState(integral=0.0, last_err_um=error_um)

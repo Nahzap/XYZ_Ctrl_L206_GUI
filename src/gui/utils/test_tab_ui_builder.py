@@ -226,7 +226,7 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     # Nota informativa
     info = QLabel(
         "⚠️ Sensores: A→S2, B→S1 (fijos). "
-        "Invertir PWM es libre: úsalo si 20000µm va hacia el mínimo."
+        "Invertir PWM: polaridad del host en µm (PI de aproximación/cierre)."
     )
     info.setStyleSheet("padding: 5px; background: #FFF3CD; border: 1px solid #FFC107; border-radius: 3px;")
     layout.addWidget(info)
@@ -235,6 +235,70 @@ def create_motor_sensor_section(widgets: dict) -> QGroupBox:
     return group
 
 
+def create_antecedent_probe_section(
+    widgets: dict,
+    run_a_callback,
+    run_b_callback,
+    stop_callback,
+) -> QGroupBox:
+    """Sonda empírica: mover ~2000 µm y guardar antecedente real del motor."""
+    group = QGroupBox("🔬 Antecedente de banco (~2000 µm)")
+    layout = QVBoxLayout()
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("Δµm:"))
+    widgets['antecedent_delta_input'] = QLineEdit("2000")
+    widgets['antecedent_delta_input'].setFixedWidth(70)
+    widgets['antecedent_delta_input'].setStyleSheet("background: white; color: black;")
+    row.addWidget(widgets['antecedent_delta_input'])
+
+    row.addWidget(QLabel("PWM:"))
+    widgets['antecedent_pwm_input'] = QLineEdit("120")
+    widgets['antecedent_pwm_input'].setFixedWidth(50)
+    widgets['antecedent_pwm_input'].setStyleSheet("background: white; color: black;")
+    row.addWidget(widgets['antecedent_pwm_input'])
+
+    widgets['antecedent_dir_plus'] = QCheckBox("dir +")
+    widgets['antecedent_dir_plus'].setChecked(True)
+    row.addWidget(widgets['antecedent_dir_plus'])
+    row.addStretch()
+    layout.addLayout(row)
+
+    btns = QHBoxLayout()
+    widgets['antecedent_a_btn'] = QPushButton("Probar Motor A")
+    widgets['antecedent_a_btn'].setStyleSheet(
+        "font-weight: bold; padding: 8px; background: #2980B9; color: white;"
+    )
+    widgets['antecedent_a_btn'].clicked.connect(run_a_callback)
+    btns.addWidget(widgets['antecedent_a_btn'])
+
+    widgets['antecedent_b_btn'] = QPushButton("Probar Motor B")
+    widgets['antecedent_b_btn'].setStyleSheet(
+        "font-weight: bold; padding: 8px; background: #8E44AD; color: white;"
+    )
+    widgets['antecedent_b_btn'].clicked.connect(run_b_callback)
+    btns.addWidget(widgets['antecedent_b_btn'])
+
+    widgets['antecedent_stop_btn'] = QPushButton("Detener sonda")
+    widgets['antecedent_stop_btn'].setStyleSheet(
+        "font-weight: bold; padding: 8px; background: #E74C3C; color: white;"
+    )
+    widgets['antecedent_stop_btn'].clicked.connect(stop_callback)
+    btns.addWidget(widgets['antecedent_stop_btn'])
+    layout.addLayout(btns)
+
+    tip = QLabel(
+        "Open-loop en [95,150]: mueve ~Δµm, registra sensor y guarda "
+        "CSV/JSON en src/config/motor_antecedent/ (K_eff, signo, Δ real)."
+    )
+    tip.setWordWrap(True)
+    tip.setStyleSheet(
+        "padding: 5px; background: #EAF2F8; border: 1px solid #5DADE2; border-radius: 3px;"
+    )
+    layout.addWidget(tip)
+
+    group.setLayout(layout)
+    return group
 
 
 def create_position_control_section(widgets: dict, start_callback, stop_callback) -> QGroupBox:
@@ -411,14 +475,18 @@ def create_zigzag_section(widgets: dict, start_callback, stop_callback) -> QGrou
     # Parámetros de ejecución
     exec_layout = QGridLayout()
     
-    tol_label = QLabel("Tolerancia cierre (µm):")
+    tol_label = QLabel("Holgura / tolerancia cierre (µm):")
     tol_label.setToolTip(
-        "Banda de aceptación por punto (NO es el tamaño del FOV). "
-        "Debe mantenerse ≤ FOV/10 para conservar el solape del mosaico."
+        "Banda de aceptación por punto (NO es el tamaño del FOV).\n"
+        "Ej.: 500 µm acepta el punto al residual ≤500 µm.\n"
+        "Para mosaico preciso: ≤ FOV/10. Para barrido rápido: valores mayores."
     )
     exec_layout.addWidget(tol_label, 0, 0)
-    widgets['tolerance_input'] = QLineEdit("8")
+    widgets['tolerance_input'] = QLineEdit("25")
     widgets['tolerance_input'].setStyleSheet("background: white; color: black;")
+    widgets['tolerance_input'].setToolTip(
+        "Escribe aquí la holgura deseada (µm). Se aplica a Test y a Microscopía."
+    )
     exec_layout.addWidget(widgets['tolerance_input'], 0, 1)
     
     exec_layout.addWidget(QLabel("Pausa (s):"), 0, 2)
@@ -426,12 +494,24 @@ def create_zigzag_section(widgets: dict, start_callback, stop_callback) -> QGrou
     widgets['pause_input'].setStyleSheet("background: white; color: black;")
     exec_layout.addWidget(widgets['pause_input'], 0, 3)
 
-    widgets['homogeneous_steps_cb'] = QCheckBox("Pasos homogéneos (step control)")
-    widgets['homogeneous_steps_cb'].setChecked(True)
-    widgets['homogeneous_steps_cb'].setToolTip(
-        "Descompone cada transición FOV en micro-pasos mono-eje Y→X con verify + dwell"
+    tmo_label = QLabel("Timeout punto (s):")
+    tmo_label.setToolTip(
+        "Tiempo máximo cazando un punto XY.\n"
+        "Si no entra en tolerancia, acepta con error y avanza.\n"
+        "Aplica a approach, cobertura FOV y cierre."
     )
-    exec_layout.addWidget(widgets['homogeneous_steps_cb'], 1, 0, 1, 4)
+    exec_layout.addWidget(tmo_label, 1, 0)
+    widgets['point_timeout_input'] = QLineEdit("6.0")
+    widgets['point_timeout_input'].setStyleSheet("background: white; color: black;")
+    widgets['point_timeout_input'].setToolTip(
+        "Default 6 s. No dejar el algoritmo cazando sin avanzar."
+    )
+    exec_layout.addWidget(widgets['point_timeout_input'], 1, 1)
+
+    # Trayectoria: PI host hasta ±tol + settle (sin C(z) MCU).
+    hint = QLabel("Cierre: PI host ±tol + settle; timeout → avanza con error")
+    hint.setStyleSheet("color: #555; font-style: italic;")
+    exec_layout.addWidget(hint, 2, 0, 1, 4)
     
     layout.addLayout(exec_layout)
     

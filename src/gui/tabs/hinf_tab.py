@@ -285,7 +285,7 @@ class HInfTab(QWidget):
         w2_layout.addWidget(self.w2_umax)
         w2_layout.addWidget(QLabel("PWM"))
         self.invert_pwm = QCheckBox("⇄ Invertir PWM")
-        self.invert_pwm.setChecked(True)
+        self.invert_pwm.setChecked(False)
         w2_layout.addWidget(self.invert_pwm)
         w2_layout.addStretch()
         layout.addLayout(w2_layout, 1, 1)

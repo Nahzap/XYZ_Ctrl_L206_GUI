@@ -11,7 +11,7 @@ Fecha: 2025-12-12
 
 import logging
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Callable
 from queue import Queue, Empty, Full
 
 from PyQt5.QtCore import QThread, pyqtSignal, QMutex
@@ -50,18 +50,26 @@ class DetectionService(QThread):
         self.running = False
         self.paused = False
         self._mutex = QMutex()
+        # True = XY actuando → no encolar (GIL no debe pelear con FOV/approach)
+        self._motion_busy_gate: Optional[Callable[[], bool]] = None
         
         # Estadísticas
         self.frames_processed = 0
         self.last_detection_time_ms = 0
+        self.frames_skipped_motion = 0
         
         logger.info("[DetectionService] Inicializado")
+
+    def set_motion_busy_gate(self, gate: Optional[Callable[[], bool]]) -> None:
+        """gate()→True mientras el lazo XY actúa; submit_frame no encola entonces."""
+        self._motion_busy_gate = gate
     
     def submit_frame(self, frame: np.ndarray) -> bool:
         """
         Envía un frame para detección (no bloqueante).
         
         Si hay un frame pendiente, se descarta el anterior.
+        Si el lazo XY está activo, no encola (autodetección espera hueco seguro).
         
         Args:
             frame: Imagen BGR o grayscale
@@ -71,6 +79,13 @@ class DetectionService(QThread):
         """
         if not self.running or self.paused:
             return False
+        if self._motion_busy_gate is not None:
+            try:
+                if bool(self._motion_busy_gate()):
+                    self.frames_skipped_motion += 1
+                    return False
+            except Exception:
+                pass
         
         try:
             # Limpiar cola si está llena

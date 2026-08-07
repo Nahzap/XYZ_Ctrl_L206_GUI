@@ -526,13 +526,18 @@ class TransferFunctionAnalyzer:
             
             # Actualizar el eje correspondiente
             if is_x_axis:
-                cal_x = {'intercept': intercepto, 'slope': abs(pendiente)}
-                logger.info(f"📐 Actualizando calibración EJE X: intercept={intercepto:.2f}µm, slope={abs(pendiente):.4f}µm/ADC")
+                cal_x = {'intercept': intercepto, 'slope': pendiente}
+                logger.info(
+                    f"📐 Actualizando calibración EJE X: intercept={intercepto:.2f}µm, "
+                    f"slope={pendiente:.4f}µm/ADC (signo=relación)"
+                )
             
             if is_y_axis:
-                cal_y = {'intercept': intercepto, 'slope': abs(pendiente)}
-                logger.info(f"📐 Actualizando calibración EJE Y: intercept={intercepto:.2f}µm, slope={abs(pendiente):.4f}µm/ADC")
-            
+                cal_y = {'intercept': intercepto, 'slope': pendiente}
+                logger.info(
+                    f"📐 Actualizando calibración EJE Y: intercept={intercepto:.2f}µm, "
+                    f"slope={pendiente:.4f}µm/ADC (signo=relación)"
+                )            
             # Guardar en JSON
             if save_calibration(cal_x, cal_y):
                 logger.info(f"✅ Calibración guardada automáticamente en calibration.json")

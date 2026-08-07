@@ -156,14 +156,23 @@ class CameraOrchestrator(QObject):
                 self.autofocus_complete.emit([])
             return
         
-        # Objetos detectados
-        self.status_message.emit(f"✅ {len(objects)} objeto(s) en rango (de {len(all_objects)} detectados)")
+        # Objetos detectados → un solo barrido Z (superficie multi-ROI)
+        self.status_message.emit(
+            f"✅ {len(objects)} objeto(s) en rango (de {len(all_objects)} detectados)"
+        )
         for i, obj in enumerate(objects):
-            self.status_message.emit(f"   #{i+1}: área={obj.area:.0f}px, score={obj.focus_score:.1f}")
-        
+            self.status_message.emit(
+                f"   #{i+1}: área={obj.area:.0f}px, score={obj.focus_score:.1f}"
+            )
+
         self.detection_complete.emit(objects)
-        
-        # Iniciar autofoco asíncrono
+
+        if len(objects) > 1:
+            self.status_message.emit(
+                f"🎯 Autofoco superficie: {len(objects)} ROI en 1 solo barrido Z "
+                f"(S = Σ S_i por plano)"
+            )
+
         if self.autofocus is not None:
             self.status_message.emit("🎯 Iniciando Z-scan autofoco...")
             self._pending_capture = capture_after
@@ -217,28 +226,50 @@ class CameraOrchestrator(QObject):
             self.validation_error.emit("AutofocusService no disponible")
             return False
         
-        # Validar configuración
+        # Validar y aplicar exactamente lo que viene del JSON/UI (sin clamps ni reescritura)
         is_valid, error = config.validate()
         if not is_valid:
             self.validation_error.emit(f"Configuración inválida: {error}")
             return False
-        
-        # Actualizar parámetros en servicio
-        self.autofocus.use_full_range = config.use_full_range
-        self.autofocus.z_scan_range = config.z_scan_range
-        self.autofocus.z_step_coarse = config.z_step_coarse
-        self.autofocus.z_step_fine = config.z_step_fine
-        self.autofocus.settle_time = config.settle_time
-        self.autofocus.capture_settle_time = config.capture_settle_time
-        self.autofocus.roi_margin = config.roi_margin
-        self.autofocus.max_coarse_iterations = config.max_coarse_iterations
-        self.autofocus.max_fine_iterations = config.max_fine_iterations
-        self.autofocus.n_captures = config.n_captures
-        self.autofocus.z_step_capture = config.z_step_capture
-        self.autofocus.capture_step = config.z_step_capture
-        self.autofocus.z_range_capture = config.z_range_capture
-        
-        self.status_message.emit("✅ Parámetros de autofoco actualizados")
+
+        coarse = float(config.z_step_coarse)
+        fine = float(config.z_step_fine)
+        roi_margin = int(config.roi_margin)
+        capture_s_drop_percent = float(config.z_step_capture)
+        n_captures = int(config.n_captures)
+        n_fine = int(getattr(config, "n_fine_planes", 15))
+        z_tol = float(getattr(config, "z_arrive_tol_um", 0.5))
+
+        self.autofocus.use_full_range = bool(config.use_full_range)
+        self.autofocus.z_scan_range = float(config.z_scan_range)
+        self.autofocus.z_step_coarse = coarse
+        self.autofocus.z_step_fine = fine
+        self.autofocus.n_fine_planes = n_fine
+        self.autofocus.z_arrive_tol_um = z_tol
+        self.autofocus.z_arrive_timeout_s = float(
+            getattr(config, "z_arrive_timeout_s", 3.0)
+        )
+        # Ya no hay sleep de settle; valores a 0 por compat
+        self.autofocus.settle_time = 0.0
+        self.autofocus.capture_settle_time = 0.0
+        self.autofocus.roi_margin = roi_margin
+        self.autofocus.max_coarse_iterations = int(config.max_coarse_iterations)
+        self.autofocus.max_fine_iterations = int(config.max_fine_iterations)
+        self.autofocus.n_captures = n_captures
+        # ``z_step_capture`` conserva el nombre por compatibilidad JSON/UI,
+        # pero desde v3 representa porcentaje óptico, no micrómetros.
+        self.autofocus.z_step_capture = capture_s_drop_percent
+        self.autofocus.capture_step = capture_s_drop_percent
+        self.autofocus.capture_s_drop_rel = capture_s_drop_percent / 100.0
+        self.autofocus.z_range_capture = float(config.z_range_capture)
+
+        self.status_message.emit(
+            f"✅ Autofoco encadenado: coarse={coarse:.2f}µm → "
+            f"fine paso={fine:.3f}µm, N={n_fine}, "
+            f"Δmáx=±{float(config.z_scan_range):.1f}µm → BPoF → "
+            f"{n_captures} capturas por ΔS={capture_s_drop_percent:.1f}% | "
+            f"tolZ=±{z_tol:.2f}µm margin={roi_margin}px"
+        )
         return True
     
     def get_autofocus_search_info(self) -> Optional[dict]:

@@ -104,6 +104,8 @@ class CameraViewWindow(QWidget):
     # Señales para comunicación con MicroscopyService
     skip_roi_requested = pyqtSignal()
     pause_toggled = pyqtSignal(bool)
+    # Live bridge: dejar de construir QImage preview al cerrar
+    window_closed = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
@@ -437,13 +439,24 @@ class CameraViewWindow(QWidget):
             display_image = self._draw_overlay_on_qimage(q_image) if need_overlay else q_image
 
             t_paint_start = time.perf_counter()
+            # Escalar QImage al label ANTES de QPixmap: menos memoria/CPU
+            # que crear pixmap full-res 2590×1942 y escalarlo después
+            label_size = self.video_label.size()
+            if (
+                label_size.width() > 1
+                and label_size.height() > 1
+                and (
+                    display_image.width() > label_size.width()
+                    or display_image.height() > label_size.height()
+                )
+            ):
+                display_image = display_image.scaled(
+                    label_size,
+                    Qt.KeepAspectRatio,
+                    Qt.FastTransformation,
+                )
             pixmap = QPixmap.fromImage(display_image)
-            scaled = pixmap.scaled(
-                self.video_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation,
-            )
-            self.video_label.setPixmap(scaled)
+            self.video_label.setPixmap(pixmap)
             t_paint_ms = (time.perf_counter() - t_paint_start) * 1000.0
 
             mode = "AF" if self.autofocus_active else "LIVE"
@@ -881,4 +894,8 @@ class CameraViewWindow(QWidget):
             self.frame_count,
             self._skipped_display_frames,
         )
+        try:
+            self.window_closed.emit()
+        except Exception:
+            pass
         super().closeEvent(event)

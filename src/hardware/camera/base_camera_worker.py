@@ -165,3 +165,20 @@ class BaseCameraWorker(QThread, metaclass=QThreadABCMeta):
             Tipo de cámara ("thorlabs", "basler", etc.)
         """
         return self.__class__.__name__.lower().replace("worker", "")
+
+    def acquire_scientific_frame(self, timeout_s: float = 2.0):
+        """
+        ÚNICA vía pública para adquirir imagen del sensor CMOS.
+
+        Toda ciencia (AF, guardado, análisis) debe llamar esto — nunca
+        ``current_frame`` (preview) ni buffers crudos por fuera.
+
+        Returns:
+            ScientificFrame (image16 ya pasado por prepare_scientific_bgr16)
+
+        Raises:
+            NotImplementedError / TimeoutError / RuntimeError
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.acquire_scientific_frame es obligatorio"
+        )

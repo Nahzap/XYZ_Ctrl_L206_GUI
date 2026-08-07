@@ -142,17 +142,29 @@ class CFocusController:
             (success, message): Tupla con estado y mensaje
         """
         try:
-            logger.info(f"Cargando C-Focus DLL: {self.dll_path}")
-            self.mcl_dll = ctypes.WinDLL(self.dll_path)
-            
-            self._setup_function_signatures()
-            
+            if self.is_connected and self.handle != 0 and self.mcl_dll is not None:
+                return True, f"C-Focus ya conectado (Rango: 0-{self.z_range:.1f} µm)"
+
+            # Liberar handles huérfanos de intentos previos en este proceso
+            self._ensure_dll_loaded()
+            self._release_all_handles_safe()
+
             logger.info("Inicializando C-Focus handle...")
-            self.handle = self.mcl_dll.MCL_InitHandle()
-            
+            self.handle = self._acquire_handle()
+
             if self.handle == 0:
-                return False, "Error: No se pudo inicializar handle (dispositivo no conectado o en uso)"
-            
+                # Reintento corto: USB a veces queda sticky tras kill del proceso
+                time.sleep(0.35)
+                self._release_all_handles_safe()
+                self.handle = self._acquire_handle()
+
+            if self.handle == 0:
+                return False, (
+                    "Error: No se pudo inicializar handle "
+                    "(dispositivo no conectado, USB sticky o en uso por otra app). "
+                    "Cierra otras apps Mad City Labs / reinicia USB C-Focus."
+                )
+
             self.z_range = self.mcl_dll.MCL_GetCalibration(3, self.handle)
             self.z_range_hw = self.z_range
             
@@ -174,10 +186,12 @@ class CFocusController:
     
     def disconnect(self):
         """Desconecta y libera el handle del dispositivo."""
-        if self.handle != 0 and self.mcl_dll is not None:
+        if self.mcl_dll is not None:
             try:
                 logger.info("Liberando C-Focus handle...")
-                self.mcl_dll.MCL_ReleaseHandle(self.handle)
+                if self.handle != 0:
+                    self.mcl_dll.MCL_ReleaseHandle(self.handle)
+                self._release_all_handles_safe()
                 logger.info("C-Focus desconectado correctamente")
             except Exception as e:
                 logger.error(f"Error liberando handle: {e}")
@@ -190,6 +204,46 @@ class CFocusController:
                 self.z_max_calibrated = 0.0
                 self.z_center_calibrated = None
                 self.z_range_calibrated = 0.0
+
+    def _ensure_dll_loaded(self):
+        """Carga Madlib.dll y configura firmas si aún no está lista."""
+        if self.mcl_dll is None:
+            logger.info(f"Cargando C-Focus DLL: {self.dll_path}")
+            self.mcl_dll = ctypes.WinDLL(self.dll_path)
+            self._setup_function_signatures()
+
+    def _release_all_handles_safe(self):
+        """Libera todos los handles Madlib del proceso actual."""
+        if self.mcl_dll is None:
+            return
+        try:
+            self.mcl_dll.MCL_ReleaseAllHandles()
+        except Exception as e:
+            logger.warning(f"MCL_ReleaseAllHandles falló: {e}")
+        self.handle = 0
+        self.is_connected = False
+
+    def _acquire_handle(self) -> int:
+        """Obtiene un handle válido: Init → OrGetExisting → GrabAll+OrGetExisting."""
+        handle = int(self.mcl_dll.MCL_InitHandle() or 0)
+        if handle != 0:
+            return handle
+
+        handle = int(self.mcl_dll.MCL_InitHandleOrGetExisting() or 0)
+        if handle != 0:
+            logger.info("C-Focus: handle recuperado con InitHandleOrGetExisting")
+            return handle
+
+        try:
+            grabbed = int(self.mcl_dll.MCL_GrabAllHandles() or 0)
+            logger.info(f"C-Focus: GrabAllHandles={grabbed}")
+        except Exception as e:
+            logger.warning(f"MCL_GrabAllHandles falló: {e}")
+
+        handle = int(self.mcl_dll.MCL_InitHandleOrGetExisting() or 0)
+        if handle != 0:
+            logger.info("C-Focus: handle recuperado tras GrabAllHandles")
+        return handle
     
     def move_z(self, position_um: float) -> bool:
         """
@@ -271,7 +325,9 @@ class CFocusController:
         }
     
     def get_center_position(self) -> float:
-        """Retorna la posición central del recorrido (z_range / 2)."""
+        """Centro de referencia: calibrado si existe, si no z_range/2."""
+        if self.z_center_calibrated is not None:
+            return float(self.z_center_calibrated)
         return self.z_range / 2 if self.z_range > 0 else 0.0
     
     def setup_bpof_mode(self, travel_distance: float = None) -> bool:
@@ -467,6 +523,15 @@ class CFocusController:
         """Configura los tipos de argumentos y retorno para funciones MCL."""
         self.mcl_dll.MCL_InitHandle.argtypes = []
         self.mcl_dll.MCL_InitHandle.restype = ctypes.c_int
+
+        self.mcl_dll.MCL_InitHandleOrGetExisting.argtypes = []
+        self.mcl_dll.MCL_InitHandleOrGetExisting.restype = ctypes.c_int
+
+        self.mcl_dll.MCL_GrabAllHandles.argtypes = []
+        self.mcl_dll.MCL_GrabAllHandles.restype = ctypes.c_int
+
+        self.mcl_dll.MCL_NumberOfCurrentHandles.argtypes = []
+        self.mcl_dll.MCL_NumberOfCurrentHandles.restype = ctypes.c_int
         
         self.mcl_dll.MCL_SingleReadZ.argtypes = [ctypes.c_int]
         self.mcl_dll.MCL_SingleReadZ.restype = ctypes.c_double
@@ -476,6 +541,9 @@ class CFocusController:
         
         self.mcl_dll.MCL_ReleaseHandle.argtypes = [ctypes.c_int]
         self.mcl_dll.MCL_ReleaseHandle.restype = None
+
+        self.mcl_dll.MCL_ReleaseAllHandles.argtypes = []
+        self.mcl_dll.MCL_ReleaseAllHandles.restype = None
         
         self.mcl_dll.MCL_GetCalibration.argtypes = [ctypes.c_int, ctypes.c_int]
         self.mcl_dll.MCL_GetCalibration.restype = ctypes.c_double
