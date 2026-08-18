@@ -9,7 +9,7 @@ Algoritmo:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,54 @@ def min_candidates_for_planes(n_planes: int) -> int:
 
 def unique_z_key(z_um: float, decimals: int = 3) -> float:
     return round(float(z_um), int(decimals))
+
+
+def find_isolated_dips(
+    rows: Sequence[Tuple[float, float]],
+    *,
+    factor: float = 0.85,
+) -> List[float]:
+    """Planos cuya S se hunde respecto a sus dos vecinos inmediatos.
+
+    La respuesta de un objetivo de microscopio es continua: no abre un pozo y
+    lo cierra en el plano siguiente. En el log de referencia, Z=51.04 µm midió
+    S=277.6 entre vecinos de 353.5 y 362.4 (−23% en 1 µm). Eso no es óptica,
+    es un frame que no representa el plano: la primera toma FINE llegaba justo
+    después de un salto de 19 µm del piezo.
+
+    Un hundimiento aislado no se puede descartar sin más, porque también podría
+    ser el pico invertido de una muestra rara; por eso el llamador lo vuelve a
+    medir antes de decidir. Lo que no es admisible es que vote en el argmax sin
+    revisión: el plano contiguo a un agujero queda inflado por comparación.
+
+    Parameters
+    ----------
+    rows : list[(z_um, s)]
+        Mediciones ordenadas por Z (una por plano).
+    factor : float
+        Se marca el plano cuando ``s < factor · min(vecinos)``.
+
+    Returns
+    -------
+    list[float]
+        Z de los planos sospechosos, en orden creciente.
+    """
+    data = [(float(z), float(s)) for z, s in rows]
+    if len(data) < 3:
+        return []
+
+    data.sort(key=lambda item: item[0])
+    limit = max(0.0, min(1.0, float(factor)))
+    dips: List[float] = []
+    for i in range(1, len(data) - 1):
+        z, s = data[i]
+        s_prev = data[i - 1][1]
+        s_next = data[i + 1][1]
+        if s <= 0.0 or s_prev <= 0.0 or s_next <= 0.0:
+            continue
+        if s < limit * min(s_prev, s_next):
+            dips.append(z)
+    return dips
 
 
 def symmetric_fine_window(
@@ -155,6 +203,32 @@ class BpofCandidateTable:
         for r in src:
             by_z[unique_z_key(r.z_um)] = r
         return list(by_z.values())
+
+    def count_at_z(self, z_um: float) -> int:
+        """Mediciones válidas acumuladas en ese plano (para exigir mediana)."""
+        key = unique_z_key(z_um)
+        return sum(
+            1 for r in self.valid_rows() if unique_z_key(r.z_um) == key
+        )
+
+    def invalidate_z(self, z_um: float) -> int:
+        """Borra las mediciones de un plano para que no vote en el argmax.
+
+        Re-medir no basta: si el plano vuelve a hundirse, dejarlo en la tabla
+        con su valor bajo mantiene inflado al vecino por comparación y puede
+        entregarle el BPoF.
+        """
+        key = unique_z_key(z_um)
+        before = len(self._rows)
+        self._rows = [r for r in self._rows if unique_z_key(r.z_um) != key]
+        return before - len(self._rows)
+
+    def isolated_dip_planes(self, *, factor: float = 0.85) -> List[float]:
+        """Z de los planos con S hundida respecto a sus vecinos inmediatos."""
+        rows = sorted(self.latest_per_z(), key=lambda r: r.z_um)
+        return find_isolated_dips(
+            [(r.z_um, r.s) for r in rows], factor=factor
+        )
 
     def select_argmax(self) -> Tuple[float, float, Dict]:
         """Plano con MAYOR S en ESTA tabla."""

@@ -35,6 +35,7 @@ from gui.utils.camera_tab_ui_builder import (
 )
 from core.services import CameraOrchestrator
 from core.models import AutofocusConfig
+from core.autofocus.persisted_params import sanitize_autofocus_form
 from core.utils.folder_reveal import reveal_folder
 from hardware.camera.scientific_image import save_scientific_image
 from utils.parameter_manager import get_parameter_manager
@@ -363,7 +364,9 @@ class CameraTab(QWidget):
             camera = saved.get('camera', {})
             capture = saved.get('capture', {})
             microscopy = saved.get('microscopy', {})
-            autofocus = saved.get('autofocus', {})
+            autofocus, af_notes = sanitize_autofocus_form(
+                saved.get('autofocus', {})
+            )
             u2net = saved.get('u2net', {})
 
             self._set_text(self.exposure_input, camera.get('exposure'))
@@ -447,8 +450,16 @@ class CameraTab(QWidget):
             self._set_value(self.clahe_clip_spin, u2net.get('clahe_clip'))
             self._set_combo(self.clahe_tile_combo, u2net.get('clahe_tile'))
 
+            for note in af_notes:
+                logger.warning("[CameraTab] Autofoco corregido: %s", note)
+                self.log_message(f"⚠️ Autofoco corregido al cargar: {note}")
+
             # Propagar formulario → scorer / U2-Net / autofoco
             self.sync_runtime_params_from_ui()
+            if af_notes:
+                # El JSON dejó de ser válido: se reescribe ya para que el
+                # próximo arranque no vuelva a restaurar la combinación mala.
+                self.save_camera_tab_settings()
 
             logger.info("✅ CameraTab cargado desde JSON camera_tab")
         except Exception as e:

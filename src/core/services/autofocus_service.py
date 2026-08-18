@@ -25,10 +25,23 @@ from core.autofocus.focus_metric import (
     bbox_to_contour,
     calculate_focus_score_detailed,
 )
+from core.autofocus.af_kpi import AfCycleKpi, AfSessionKpi
 from core.autofocus.bpof_candidates import (
     BpofCandidateTable,
     build_fine_z_planes,
 )
+from core.autofocus.fine_scan_plan import (
+    RingDeclineStop,
+    center_out_sequence,
+    fine_span_um,
+    ring_counts,
+)
+from core.autofocus.roi_tracker import RoiTracker
+from core.autofocus.stack_plan import (
+    rebalance_symmetric,
+    stack_asymmetry_ratio,
+)
+from core.autofocus.z_prior import BpofPrior, bootstrap_window
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -58,6 +71,8 @@ class AutofocusService(QThread):
     scan_complete = pyqtSignal(list)  # List[FocusResult]
     error_occurred = pyqtSignal(str)
     masks_detected = pyqtSignal(list)  # Máscaras/ROIs detectados para visualización
+    # ROIs vigentes del tracker durante el Z-scan: (lista de dicts, (w, h) frame)
+    roi_tracked = pyqtSignal(list, tuple)
     status_message = pyqtSignal(str)  # Mensajes de estado para UI y terminal
     score_updated = pyqtSignal(float, float)  # (z_position, score) para overlay en cámara
     progress_updated = pyqtSignal(int, int, str)  # (current_step, total_steps, phase_name)
@@ -85,14 +100,22 @@ class AutofocusService(QThread):
         
         # Parámetros de búsqueda (configurables desde UI)
         # NOTA: Estos parámetros son para BÚSQUEDA de BPoF, NO para captura de volumen
-        self.z_scan_range = 70.0       # µm - límite ±Δ fine alrededor del max S coarse
+        #
+        # FINE es un refinamiento del plano que ya eligió el COARSE, no un
+        # segundo barrido. Con Δ=6µm, paso 0.5µm y 9 capas la ventana real es
+        # ±2µm: suficiente para decidir entre planos contiguos del COARSE.
+        # (39 capas × 1µm daban ±19µm, casi el recorrido completo del piezo, y
+        # 26 de esos planos medían fondo plano.)
+        self.z_scan_range = 6.0        # µm - límite ±Δ fine alrededor del max S coarse
         self.use_full_range = True     # Si True, escanea todo el rango calibrado; si False, usa z_scan_range
-        self.z_step_coarse = 1.0       # µm - paso grueso OPTIMIZADO para velocidad (reducir pasos totales)
-        self.z_step_fine = 0.05        # µm - paso real FINE entre candidatos
-        self.n_fine_planes = 15        # capas FINE impares, centradas en Z_c*
+        self.z_step_coarse = 3.0       # µm - paso grueso; localiza el pico sin saltárselo
+        self.z_step_fine = 0.5         # µm - paso real FINE entre candidatos
+        self.n_fine_planes = 9         # capas FINE impares, centradas en Z_c*
         self.refine_window = 2.0       # legacy; la zona fine usa z_scan_range
-        # Condición de llegada a Z (NO sleep fijo de settle)
-        self.z_arrive_tol_um = 0.5     # µm - |Z_read−Z_cmd| ≤ tol
+        # Condición de llegada a Z (NO sleep fijo de settle). Debe quedar por
+        # debajo de la mitad del paso fino: con tol ≥ paso, dos candidatos FINE
+        # distintos pueden medirse en la misma Z real y la curva miente.
+        self.z_arrive_tol_um = 0.25    # µm - |Z_read−Z_cmd| ≤ tol
         self.z_arrive_stable_reads = 3 # lecturas consecutivas en banda
         self.z_arrive_timeout_s = 3.0  # s - timeout de seguridad (no es settle)
         # Compat: UI antigua / config; ya no se usa como sleep de asentamiento
@@ -109,11 +132,42 @@ class AutofocusService(QThread):
         self.score_stable_max_tries = 2   # segundo intento solo si frame inválido
         # Si al revalidar BPoF la S cae más que esto vs FINE, no fiarse del pico
         self.bpof_confirm_max_drop_rel = 0.08
+        # Ventaja mínima que debe sacar un vecino ±paso fino para desbancar al
+        # pico FINE en la confirmación (una toma suelta no vence a N mediciones)
+        self.bpof_confirm_neighbor_margin_rel = 0.03
         self.coarse_near_max_rel = 0.005
         self.coarse_early_stop_patience = 4
         self.coarse_early_stop_drop_rel = 0.03
         self.bpof_min_relative_span = 0.005
         self.bpof_min_prominence_rel = 0.003
+        # Corte temprano FINE, simétrico al del COARSE. Se decide por anillos
+        # (pares de planos equidistantes) para que no dependa de qué lado se
+        # visitó primero.
+        self.fine_early_stop_patience_rings = 3
+        self.fine_early_stop_drop_rel = 0.05
+        # Un plano cuya S se hunde respecto a sus dos vecinos no es óptica: se
+        # re-mide, y si insiste no vota (ver find_isolated_dips).
+        self.fine_dip_reject_factor = 0.85
+        # Mediana de N tomas SOLO en los planos que deciden Z (ancla FINE y
+        # BPoF candidato). Pagar 2 tomas en los 9 planos no compra nada.
+        self.score_samples_at_decision = 2
+        # Sondear vecinos del BPoF en la confirmación sólo si el pico FINE es
+        # sospechoso. Con un pico interior y prominente, 3 mediciones extra no
+        # pueden desmentir a las N del barrido (ver bpof_confirm_neighbor_margin_rel).
+        self.bpof_confirm_probe_neighbors_when_healthy = False
+        # COARSE acotado por el historial de BPoF de la sesión. El primer punto
+        # de una muestra barre lo que pida la interfaz; a partir de
+        # coarse_prior_min_samples la ventana se centra en la mediana medida.
+        self.coarse_prior_enabled = True
+        self.coarse_prior_min_samples = 5
+        self.coarse_prior_min_half_span_um = 4.0
+        self.coarse_prior_mad_k = 2.0
+        # Ventana de arranque cuando no hay historial y el usuario NO pidió
+        # escaneo completo: asimétrica porque el pico aparece pasado el origen.
+        self.coarse_bootstrap_below_um = 20.0
+        self.coarse_bootstrap_above_um = 25.0
+        # Asimetría tolerada del stack antes de reflejar la distancia menor.
+        self.stack_asymmetry_max = 3.0
         
         # Límites de iteraciones para evitar bucles infinitos
         self.max_coarse_iterations = 50  # Máximo de iteraciones en fase gruesa
@@ -126,9 +180,42 @@ class AutofocusService(QThread):
         self.capture_s_drop_rel = 0.10
         self.optical_search_refine_iterations = 4
         self._last_focus_curve: list = []
+
+        # Historial de BPoF de la sesión: convierte cada ciclo en información
+        # para el siguiente en vez de re-descubrir el plano focal 5292 veces.
+        self._bpof_prior = BpofPrior(
+            min_samples=self.coarse_prior_min_samples,
+            min_half_span_um=self.coarse_prior_min_half_span_um,
+            mad_k=self.coarse_prior_mad_k,
+        )
+        # KPI: una línea por ciclo + medianas de sesión para el ETA.
+        self.session_kpi = AfSessionKpi()
+        self._cycle_kpi: Optional[AfCycleKpi] = None
+        self.kpi_session_log_every = 25
+
+        # Al terminar el ciclo, dejar el piezo en el BPoF en vez de volver al
+        # punto medio calibrado.
+        self.park_at_bpof = True
         
-        # Registro del máximo Z encontrado (para optimizar futuros escaneos)
-        self.z_max_recorded = None  # Se actualiza tras primer escaneo completo
+        # ROI Tracking adaptativo durante Z-scan
+        self.roi_tracking_enabled = True       # habilitar/deshabilitar tracking
+        self.roi_max_drift_px = 30             # drift máximo acumulado (px)
+        self.roi_update_threshold_px = 2.0     # drift mínimo para actualizar
+        # Inferencias U2-Net por barrido con ventana estática: la máscara de
+        # medida no se mueve, así que detectar en cada plano sólo repetía el
+        # chequeo de contención a coste de una inferencia de 5 Mpx.
+        self.roi_detect_interval = 8
+        # S se mide sobre un único ROI cuadrado estático por objeto, holgado
+        # (roi_margin por lado) para que la segmentación quepa dentro en todos
+        # los planos. La segmentación es la variable del problema: si la
+        # ventana la persigue o la copia, cada plano mide píxeles distintos y
+        # las S dejan de ser comparables. El contorno vivo se sigue viendo en
+        # el overlay vía tracker.display_rois.
+        self.roi_static_window = True
+        self.roi_track_adopt_contour = False
+        self._roi_tracker: Optional[RoiTracker] = None  # instancia activa
+        self._last_roi_emit_t = 0.0
+        self._roi_emit_interval_s = 0.2        # overlay de ROI a ~5 Hz
         
         # Control
         self.running = False
@@ -210,7 +297,16 @@ class AutofocusService(QThread):
             'z_step_coarse': self.z_step_coarse,
             'z_step_fine': self.z_step_fine,
             'search_distance_um': 2 * self.z_scan_range,
-            'algorithm': 'hill_climbing'
+            'algorithm': 'coarse_fine_bpof',
+            # Coste real por medición S (MOVE + Z_STATIC + flush óptico + RAW
+            # 2590×1942 + métrica). Medido, no estimado: el ciclo de referencia
+            # hizo 68 mediciones en 62.4 s.
+            's_per_plane_s': self.__dict__.get(
+                'measured_s_per_plane_s',
+                self.session_kpi.median_of('s_per_plane')
+                if 'session_kpi' in self.__dict__
+                else None,
+            ),
         }
     
     def validate_scan_range(self) -> Tuple[bool, str]:
@@ -301,9 +397,21 @@ class AutofocusService(QThread):
         logger.info("[AutofocusService] Cancelación solicitada (hard)")
 
     def prepare_new_session(self) -> None:
-        """Limpia el latch de cancelación dejado por un hard-stop anterior."""
+        """Limpia el latch de cancelación dejado por un hard-stop anterior.
+
+        También descarta el prior de Z y las medianas: una sesión nueva es otra
+        muestra, con otro plano focal y otra altura de portaobjetos. Arrastrar
+        el historial anterior acotaría el COARSE alrededor de un plano que ya
+        no existe.
+        """
         self.cancel_requested = False
         self.running = False
+        prior = self.__dict__.get("_bpof_prior")
+        if prior is not None:
+            prior.clear()
+        session = self.__dict__.get("session_kpi")
+        if session is not None:
+            session.clear()
 
     def _sleep_interruptible(self, seconds: float) -> bool:
         """Sleep que respeta cancel_requested. True=completó, False=cancelado."""
@@ -442,11 +550,56 @@ class AutofocusService(QThread):
         frame: np.ndarray,
         rois: List[Tuple[Tuple[int, int, int, int], np.ndarray]],
     ) -> float:
-        """S superficie = Σ S_i (un frame estático, varios ROI)."""
+        """S superficie = Σ S_i (un frame estático, varios ROI).
+
+        Con RoiTracker activo, los ROI que devuelve el tracker son la fuente de
+        verdad: mantiene su propio estado entre planos y ``rois`` sólo actúa
+        como semilla en la primera medición. Antes se reasignaba una variable
+        local y el seguimiento se perdía en cada plano.
+
+        S se mide sobre la máscara de área constante y el overlay recibe la
+        silueta detectada: son dos vistas del mismo ROI y confundirlas hacía
+        que S dependiera del tamaño que el detector le diera al objeto.
+        """
+        tracker = self._roi_tracker
+        if tracker is not None and tracker.enabled:
+            rois = tracker.update(frame, rois)
+            self._emit_tracked_rois(frame, tracker.display_rois or rois)
+
         total = 0.0
         for bbox, contour in rois:
             total += float(self._calculate_sharpness(frame, bbox, contour))
         return total
+
+    def _emit_tracked_rois(
+        self,
+        frame: np.ndarray,
+        rois: List[Tuple[Tuple[int, int, int, int], np.ndarray]],
+    ) -> None:
+        """Publica los ROI vigentes para el overlay de cámara (throttled)."""
+        if not rois or frame is None:
+            return
+        now = time.perf_counter()
+        if now - self._last_roi_emit_t < self._roi_emit_interval_s:
+            return
+        self._last_roi_emit_t = now
+
+        payload = [
+            {
+                "bbox": tuple(int(v) for v in bbox),
+                "contour": (
+                    None if contour is None
+                    else np.asarray(contour, dtype=np.int32).copy()
+                ),
+            }
+            for bbox, contour in rois
+        ]
+        try:
+            self.roi_tracked.emit(
+                payload, (int(frame.shape[1]), int(frame.shape[0]))
+            )
+        except (AttributeError, RuntimeError):
+            pass
 
     def evaluate_s_at_z(
         self,
@@ -465,6 +618,11 @@ class AutofocusService(QThread):
         ``settle_s`` se ignora (compat API).
         """
         del settle_s
+        # Embudo único de medición: contar aquí es lo que hace comparable el
+        # coste de dos algoritmos distintos (N_S del KPI).
+        kpi = self.__dict__.get("_cycle_kpi")
+        if kpi is not None:
+            kpi.n_s_total += 1
         rois_n = self._normalize_rois(bbox, contour, rois)
         return self._measure_s_static_at_z(
             float(z), rois_n, return_frame=return_frame
@@ -547,6 +705,12 @@ class AutofocusService(QThread):
                     "[AutofocusService] Error en retorno de seguridad: %s",
                     home_exc,
                 )
+
+        # El tracker no debe sobrevivir al barrido: un scan abortado dejaría
+        # ROIs de la sesión anterior en la siguiente medición de S.
+        if self._roi_tracker is not None:
+            self._roi_tracker.reset()
+            self._roi_tracker = None
 
         self.running = False
         self.scan_complete.emit(results)
@@ -795,6 +959,14 @@ class AutofocusService(QThread):
         """
         focus_scan_t0 = time.perf_counter()
         self._last_focus_curve = []
+        kpi = self.__dict__.get("_cycle_kpi")
+        if kpi is None:
+            kpi = AfCycleKpi()
+            self._cycle_kpi = kpi
+        kpi.coarse_window_source = str(
+            self.__dict__.get("_coarse_window_source", "full")
+        )
+        kpi.coarse_span_um = float(z_max) - float(z_min)
         coarse_label = "SCAN" if microscopy_format else "COARSE"
         tol = float(self.z_arrive_tol_um)
         n_roi = len(rois)
@@ -826,6 +998,8 @@ class AutofocusService(QThread):
         min_req = tabla_coarse.min_required
         coarse_best_s = -float("inf")
         coarse_best_i = -1
+        kpi.n_coarse_planned = n_steps
+        coarse_t0 = time.perf_counter()
 
         # --- 1) TABLA COARSE ---
         for i in range(n_steps):
@@ -891,9 +1065,12 @@ class AutofocusService(QThread):
                 )
                 logger.info(stop_msg)
                 self.status_message.emit(stop_msg)
+                kpi.coarse_early_stop = True
                 break
 
         print()
+        kpi.n_coarse_measured = len(tabla_coarse)
+        kpi.t_coarse = time.perf_counter() - coarse_t0
         z_coarse_star, s_coarse_star, info_c = tabla_coarse.select_near_max(
             float(z_center),
             relative_tie=float(
@@ -1002,19 +1179,29 @@ class AutofocusService(QThread):
                 f"Z_coarse*={z_coarse_star:.2f}µm"
             )
 
-        # El primer candidato FINE es exactamente la salida COARSE; después se
-        # recorren los demás planos del vecindario. Esto hace explícito el
-        # encadenamiento y permite comparar S_coarse vs S_fine en el mismo Z.
-        center_i = min(
-            range(len(fine_planes)),
-            key=lambda i: abs(float(fine_planes[i]) - float(z_coarse_star)),
+        # El primer candidato FINE es exactamente la salida COARSE y desde ahí
+        # se avanza por anillos simétricos. Recorrer la ventana en orden
+        # creciente de Z obligaba a saltar del extremo del COARSE al extremo
+        # inferior del FINE y a medir todo el fondo antes de llegar al pico.
+        fine_order = center_out_sequence(fine_planes, z_coarse_star)
+        early_stop = RingDeclineStop(
+            ring_counts(fine_order),
+            patience_rings=int(
+                self.__dict__.get("fine_early_stop_patience_rings", 3)
+            ),
+            drop_rel=float(
+                self.__dict__.get("fine_early_stop_drop_rel", 0.05)
+            ),
         )
-        fine_sequence = [fine_planes[center_i]] + [
-            z for i, z in enumerate(fine_planes) if i != center_i
-        ]
+        n_decision_samples = max(
+            1, int(self.__dict__.get("score_samples_at_decision", 2))
+        )
+        fine_t0 = time.perf_counter()
 
         # --- 3) TABLA FINE → BPoF = argmax ---
-        for refine_iteration, z_refine in enumerate(fine_sequence, start=1):
+        for refine_iteration, (z_refine, ring) in enumerate(
+            fine_order, start=1
+        ):
             if self.cancel_requested:
                 break
 
@@ -1022,36 +1209,46 @@ class AutofocusService(QThread):
                 refine_iteration, total_refine_steps, "Refinamiento fino"
             )
 
-            score = self.evaluate_s_at_z(z_refine, rois=rois)
+            is_anchor = (
+                refine_iteration == 1
+                and abs(float(z_refine) - float(z_coarse_star)) <= 1e-6
+            )
+            if is_anchor:
+                # El ancla decide dónde se centra todo el refinamiento: es el
+                # único plano donde vale la pena pagar la mediana de N tomas.
+                score = self._measure_s_decision(
+                    z_refine,
+                    rois=rois,
+                    n_samples=n_decision_samples,
+                    log_prefix=log_prefix,
+                    role="ancla FINE",
+                )
+            else:
+                score = self.evaluate_s_at_z(z_refine, rois=rois)
             if self.cancel_requested:
                 break
 
-            # El primer FINE repite exactamente Z_coarse*. Una discrepancia
-            # grande delata frame transitorio del barrido grueso; una segunda
-            # toma nueva tiene autoridad y evita centrar FINE en un falso pico.
-            if (
-                refine_iteration == 1
-                and abs(float(z_refine) - float(z_coarse_star)) <= 1e-6
-                and float(s_coarse_star) > 1e-9
-                and abs(float(score) - float(s_coarse_star))
-                / float(s_coarse_star) > 0.12
-            ):
-                first_score = float(score)
-                retry_score = float(
-                    self.evaluate_s_at_z(z_refine, rois=rois)
-                )
-                if retry_score > 0.0 and np.isfinite(retry_score):
-                    score = retry_score
+            # El ancla repite exactamente Z_coarse*: si S discrepa mucho de la
+            # medida en COARSE, la escala no es comparable entre fases y el
+            # dato queda registrado como ε_ancla (KPI de repetibilidad).
+            if is_anchor and float(s_coarse_star) > 1e-9:
+                eps_anchor = abs(
+                    float(score) - float(s_coarse_star)
+                ) / float(s_coarse_star)
+                kpi.eps_anchor = float(eps_anchor)
+                if eps_anchor > 0.12:
                     retry_msg = (
-                        f"{log_prefix} FINE ancla revalidada: "
-                        f"Z={z_refine:.2f}µm S1={first_score:.2f} "
-                        f"S2={retry_score:.2f}; S2 tiene autoridad"
+                        f"{log_prefix} FINE ancla discrepante: "
+                        f"Z={z_refine:.2f}µm S_coarse={s_coarse_star:.2f} "
+                        f"S_fine={float(score):.2f} "
+                        f"(ε_ancla={eps_anchor:.1%}); manda la mediana FINE"
                     )
                     logger.warning(retry_msg)
                     self.status_message.emit(retry_msg)
 
             tabla_fine.add(z_refine, score)
             self.score_updated.emit(z_refine, score)
+            early_stop.observe(ring, float(score))
 
             run_best = tabla_fine.summary_top(1)
             best_s_run = run_best[0].s if run_best else 0.0
@@ -1072,7 +1269,21 @@ class AutofocusService(QThread):
                 f"S={float(score):.2f}"
             )
 
+            if early_stop.should_stop():
+                kpi.fine_early_stop = True
+                stop_msg = (
+                    f"{log_prefix} FINE optimizado: {early_stop.reason} "
+                    f"→ fin temprano en {refine_iteration}/"
+                    f"{total_refine_steps}"
+                )
+                logger.info(stop_msg)
+                self.status_message.emit(stop_msg)
+                break
+
         print()
+        kpi.t_fine = time.perf_counter() - fine_t0
+        kpi.n_fine_measured = len(tabla_fine)
+        self._reject_isolated_dips(tabla_fine, rois=rois, log_prefix=log_prefix)
 
         best_z, best_score, info_f = tabla_fine.select_argmax()
         self._emit_candidate_table(
@@ -1095,6 +1306,17 @@ class AutofocusService(QThread):
                 self.__dict__.get("bpof_min_prominence_rel", 0.003)
             ),
         )
+        # La confirmación posterior necesita saber si el pico es creíble para
+        # decidir si vale la pena sondear vecinos (3 mediciones extra).
+        self._last_peak_quality = peak_quality
+        kpi.z_coarse_star = float(z_coarse_star)
+        kpi.fine_span_um = fine_span_um(
+            [row.z_um for row in tabla_fine.latest_per_z()]
+        )
+        kpi.peak_at_edge = bool(peak_quality.get("at_edge", False))
+        kpi.span_rel = float(peak_quality.get("relative_span", 0.0))
+        kpi.prominence_rel = float(peak_quality.get("prominence_rel", 0.0))
+
         quality_warning = not peak_quality["valid"]
         if quality_warning:
             warning = (
@@ -1123,6 +1345,42 @@ class AutofocusService(QThread):
             f"{log_prefix} COARSE+FINE completado en {scan_elapsed_s:.2f}s "
             f"({len(tabla_coarse)}+{len(tabla_fine)} mediciones S)"
         )
+
+        # --- ROI Tracking: estado de la ventana de medida ---
+        tracker = self.__dict__.get("_roi_tracker")
+        if tracker is not None and tracker.is_active:
+            logger.info(tracker.get_summary())
+            kpi.n_detections = int(tracker.n_detections)
+            if tracker.static_window:
+                # Un desborde significa que ese plano midió el grano recortado
+                # y su S no es comparable con la del resto del barrido.
+                overflows, worst = tracker.get_overflow_stats()
+                if overflows:
+                    roi_msg = (
+                        f"{log_prefix} ROI estático: la segmentación se salió "
+                        f"en {overflows}/{tracker.n_updates} planos "
+                        f"(máx {worst}px) — subir 'margin' a "
+                        f"≥{tracker.static_pad_px + worst}px"
+                    )
+                else:
+                    roi_msg = (
+                        f"{log_prefix} ROI estático: segmentación contenida en "
+                        f"los {tracker.n_detections} planos verificados de "
+                        f"{tracker.n_updates}; S comparable"
+                    )
+                logger.info(roi_msg)
+                self.status_message.emit(roi_msg)
+            else:
+                drift_total = tracker.get_total_drift()
+                if drift_total > 0.5:
+                    drift_msg = (
+                        f"{log_prefix} ROI Tracking: drift "
+                        f"máximo={drift_total:.1f}px en "
+                        f"{tracker.n_updates} pasos Z"
+                    )
+                    logger.info(drift_msg)
+                    self.status_message.emit(drift_msg)
+
         tabla_coarse.clear()
         tabla_fine.clear()
 
@@ -1141,6 +1399,106 @@ class AutofocusService(QThread):
         self.score_updated.emit(float(best_z), float(best_score))
 
         return best_z, best_score
+
+    def _measure_s_decision(
+        self,
+        z: float,
+        *,
+        rois,
+        n_samples: int = 2,
+        log_prefix: str = "[Autofocus]",
+        role: str = "decisión",
+    ) -> float:
+        """Mediana de N mediciones S en un plano que decide Z.
+
+        Una sola toma por plano es suficiente para dibujar la curva, pero no
+        para elegir el plano que se va a fotografiar: en el log de referencia el
+        mismo Z dio 362.4 y 280.0. El coste de la segunda toma sólo se paga en
+        el ancla y en el BPoF candidato, no en los N planos del barrido.
+        """
+        n = max(1, int(n_samples))
+        samples = []
+        for _ in range(n):
+            if self.cancel_requested:
+                break
+            value = float(self.evaluate_s_at_z(float(z), rois=rois))
+            if value > 0.0 and np.isfinite(value):
+                samples.append(value)
+
+        extra = max(0, len(samples) - 1)
+        if extra:
+            kpi = self.__dict__.get("_cycle_kpi")
+            if kpi is not None:
+                kpi.n_extra_measurements += extra
+
+        if not samples:
+            return 0.0
+        median_s = float(np.median(samples))
+        if len(samples) > 1:
+            spread = (max(samples) - min(samples)) / median_s
+            logger.info(
+                "%s S mediana (%s) Z=%.2fµm: %s → %.2f (dispersión=%.1f%%)",
+                log_prefix,
+                role,
+                float(z),
+                ", ".join(f"{value:.2f}" for value in samples),
+                median_s,
+                100.0 * spread,
+            )
+        return median_s
+
+    def _reject_isolated_dips(
+        self,
+        table: BpofCandidateTable,
+        *,
+        rois,
+        log_prefix: str,
+    ) -> None:
+        """Re-mide los planos hundidos y descarta los que insisten.
+
+        Un pozo de S que se abre y se cierra en un paso fino no es óptica: es un
+        frame que no representa el plano. Dejarlo en la tabla no sólo pierde ese
+        plano, también infla a sus vecinos por comparación y puede entregarles
+        el BPoF.
+        """
+        factor = float(self.__dict__.get("fine_dip_reject_factor", 0.85))
+        if factor <= 0.0 or self.cancel_requested:
+            return
+
+        dips = table.isolated_dip_planes(factor=factor)
+        if not dips:
+            return
+
+        kpi = self.__dict__.get("_cycle_kpi")
+        if kpi is not None:
+            kpi.n_holes += len(dips)
+
+        for z_dip in dips:
+            if self.cancel_requested:
+                return
+            s_new = float(self.evaluate_s_at_z(float(z_dip), rois=rois))
+            if kpi is not None:
+                kpi.n_extra_measurements += 1
+            if s_new > 0.0 and np.isfinite(s_new):
+                table.add(float(z_dip), s_new)
+            msg = (
+                f"{log_prefix} Plano hundido Z={float(z_dip):.2f}µm re-medido: "
+                f"S={s_new:.2f}"
+            )
+            logger.info(msg)
+            self.status_message.emit(msg)
+
+        for z_dip in table.isolated_dip_planes(factor=factor):
+            removed = table.invalidate_z(z_dip)
+            if kpi is not None:
+                kpi.n_holes_invalidated += 1
+            msg = (
+                f"{log_prefix} Plano Z={float(z_dip):.2f}µm descartado: S se "
+                f"hunde bajo {factor:.0%} de sus vecinos en dos mediciones "
+                f"({removed} fila(s) fuera del argmax)"
+            )
+            logger.warning(msg)
+            self.status_message.emit(msg)
 
     def _confirm_bpof_before_stack(
         self,
@@ -1162,6 +1520,11 @@ class AutofocusService(QThread):
             return z0, s_fine
 
         s_confirm = float(self.evaluate_s_at_z(z0, rois=rois))
+        kpi = self.__dict__.get("_cycle_kpi")
+        if kpi is not None:
+            kpi.n_extra_measurements += 1
+            if s_fine > 0.0:
+                kpi.eps_confirm = abs(s_confirm - s_fine) / s_fine
         max_drop = float(getattr(self, "bpof_confirm_max_drop_rel", 0.08))
         if s_confirm > 0.0 and s_confirm + 1e-9 >= s_fine * (1.0 - max_drop):
             if abs(s_confirm - s_fine) > 1e-3:
@@ -1174,22 +1537,73 @@ class AutofocusService(QThread):
                 )
             return z0, float(s_confirm)
 
+        # Una toma baja no basta para sondear vecinos. Si la curva FINE dejó un
+        # pico interior y prominente, esas 3 mediciones extra no pueden desmentir
+        # a las N del barrido: sólo añaden ruido y ~3s por semilla. Se registra
+        # ε_confirm igualmente, que es el indicador de que S no se repite.
+        peak = self.__dict__.get("_last_peak_quality") or {}
+        peak_healthy = bool(peak.get("valid")) and not bool(
+            peak.get("at_edge", True)
+        )
+        probe_neighbors = bool(
+            self.__dict__.get(
+                "bpof_confirm_probe_neighbors_when_healthy", False
+            )
+        )
+        if peak_healthy and not probe_neighbors:
+            drop = (s_fine - s_confirm) / s_fine if s_fine > 0 else 0.0
+            msg = (
+                f"{log_prefix} BPoF mantenido sin sondear vecinos: "
+                f"Z={z0:.2f}µm S_fine={s_fine:.1f} S_conf={s_confirm:.1f} "
+                f"(ε_confirm={drop:.1%}; pico FINE interior y prominente, "
+                f"span_rel={float(peak.get('relative_span', 0.0)):.4f})"
+            )
+            logger.info(msg)
+            try:
+                self.status_message.emit(msg)
+            except (AttributeError, RuntimeError):
+                pass
+            return z0, s_fine
+
         step = max(0.5, float(getattr(self, "z_step_fine", 1.0) or 1.0))
-        candidates = [z0, z0 - step, z0 + step]
-        best_zc, best_sc = z0, max(0.0, s_confirm)
-        for z_try in candidates:
+        s_at_z0 = max(0.0, s_confirm)
+        neighbors = []
+        for z_try in (z0, z0 - step, z0 + step):
             if self.cancel_requested:
                 break
             s_try = float(self.evaluate_s_at_z(float(z_try), rois=rois))
-            if s_try > best_sc:
-                best_zc, best_sc = float(z_try), s_try
+            if abs(float(z_try) - z0) <= 1e-9:
+                s_at_z0 = max(s_at_z0, s_try)
+            else:
+                neighbors.append((float(z_try), s_try))
 
-        msg = (
-            f"{log_prefix} BPoF reanclado tras confirmación: "
-            f"Z_fine={z0:.2f}µm S={s_fine:.1f} → "
-            f"Z={best_zc:.2f}µm S={best_sc:.1f} "
-            f"(caída confirm={(s_fine - s_confirm) / s_fine if s_fine > 0 else 0:.1%})"
+        # El barrido FINE ya votó por z0 con N mediciones; un vecino sólo lo
+        # desbanca si gana por encima del ruido de una toma suelta. Sin este
+        # margen, cualquier confirmación baja desplazaba el BPoF un paso fino.
+        margin = max(
+            0.0, float(getattr(self, "bpof_confirm_neighbor_margin_rel", 0.03))
         )
+        best_zc, best_sc = z0, s_at_z0
+        if neighbors:
+            cand_z, cand_s = max(neighbors, key=lambda item: item[1])
+            if cand_s > s_at_z0 * (1.0 + margin):
+                best_zc, best_sc = cand_z, cand_s
+
+        drop = (s_fine - s_confirm) / s_fine if s_fine > 0 else 0.0
+        if abs(best_zc - z0) <= 1e-9:
+            msg = (
+                f"{log_prefix} BPoF mantenido tras confirmación: "
+                f"Z={z0:.2f}µm S_fine={s_fine:.1f} S_conf={best_sc:.1f} "
+                f"(caída confirm={drop:.1%}; ningún vecino supera "
+                f"+{margin:.0%})"
+            )
+        else:
+            msg = (
+                f"{log_prefix} BPoF reanclado tras confirmación: "
+                f"Z_fine={z0:.2f}µm S={s_fine:.1f} → "
+                f"Z={best_zc:.2f}µm S={best_sc:.1f} "
+                f"(caída confirm={drop:.1%})"
+            )
         logger.info(msg)
         try:
             self.status_message.emit(msg)
@@ -1340,7 +1754,15 @@ class AutofocusService(QThread):
         if not rows:
             return None
 
-        # En Z repetido, FINE tiene autoridad sobre COARSE.
+        # Sólo FINE. COARSE es otra pasada: entre ambas el ROI se recoloca y la
+        # misma Z puede medir muy distinto (visto en log: Z=3.04µm dio S=325.8
+        # en COARSE y S=505.6 al fotografiar). Mezclar las dos escalas hacía
+        # que un plano COARSE lejano "cumpliera" el ΔS y se fotografiara a 9µm
+        # del BPoF. Dentro de FINE todas las medidas comparten estado y paso.
+        fine_rows = [row for row in rows if str(row.get("phase")) == "fine"]
+        if len(fine_rows) >= int(n_captures):
+            rows = fine_rows
+
         by_z = {}
         for row in rows:
             z = float(row["z_um"])
@@ -1356,7 +1778,15 @@ class AutofocusService(QThread):
                     "phase": str(row.get("phase", "measured")),
                 }
 
-        baseline = float(best_score)
+        # El baseline tiene que salir de la MISMA curva contra la que se miden
+        # las caídas. Si se usa la S re-medida en la confirmación, basta con
+        # que esa toma salga baja para que todo un lado de la curva aparente
+        # ΔS≤0, el stack se vuelva unilateral y el BPoF quede en el borde en
+        # vez de en el centro.
+        anchor_row = by_z.get(round(float(best_z), 6))
+        baseline = (
+            float(anchor_row["score"]) if anchor_row else float(best_score)
+        )
         if baseline <= 0.0 or len(by_z) < int(n_captures):
             return None
 
@@ -1503,6 +1933,59 @@ class AutofocusService(QThread):
             {round(z, 6) for z in z_positions}
         ) != int(n_captures):
             return None
+
+        # Si un lado exigió mucho más recorrido que el otro para la misma caída
+        # de S, la curva no es una escala fiable: se refleja la distancia menor
+        # (la del lado que sí responde) sobre planos ya medidos. Cero sondeos
+        # nuevos y las tres tomas quedan a la misma distancia del foco.
+        balanced = rebalance_symmetric(
+            lower_selected,
+            upper_selected,
+            pool=candidates,
+            z_bpof=float(best_z),
+            baseline=baseline,
+            max_ratio=float(self.__dict__.get("stack_asymmetry_max", 3.0)),
+            tol_um=max(
+                0.05, 0.25 * float(self.__dict__.get("z_step_fine", 0.5) or 0.5)
+            ),
+        )
+        if balanced is not None:
+            z_balanced, items_balanced = balanced
+            ratio_before = stack_asymmetry_ratio(
+                [float(z) - float(best_z) for z in z_positions]
+            )
+            ratio_after = stack_asymmetry_ratio(
+                [float(z) - float(best_z) for z in z_balanced]
+            )
+            planes_before = ", ".join(f"{z:.2f}" for z in z_positions)
+            planes_after = ", ".join(f"{z:.2f}" for z in z_balanced)
+            drops_after = ", ".join(
+                f"{100.0 * float(item['drop_rel']):.1f}%"
+                for item in items_balanced
+            )
+            msg = (
+                f"{log_prefix} STACK SIMETRIZADO: asimetría "
+                f"{ratio_before:.1f}× → "
+                f"{ratio_after if ratio_after is not None else 1.0:.1f}× | "
+                f"planos {planes_before} → {planes_after}µm "
+                f"(ΔS por lado: {drops_after})"
+            )
+            logger.warning(msg)
+            try:
+                self.status_message.emit(msg)
+            except (AttributeError, RuntimeError):
+                pass
+            z_positions = z_balanced
+            lower_selected = [
+                item
+                for item in items_balanced
+                if float(item["z_um"]) < float(best_z)
+            ]
+            upper_selected = [
+                item
+                for item in items_balanced
+                if float(item["z_um"]) > float(best_z)
+            ]
 
         logger.info(
             "%s STACK DESDE CURVA MEDIDA: se reutilizan %d candidatos "
@@ -1743,20 +2226,64 @@ class AutofocusService(QThread):
         z_max_hw = calib_info['z_max']
         z_center_hw = calib_info['z_center']
 
-        if self.use_full_range:
+        # El historial de BPoF de la sesión manda sobre el modo de la interfaz:
+        # una vez que la muestra reveló dónde está su plano focal, barrer los
+        # 86µm calibrados sólo añade planos de meseta. Los primeros ciclos sí
+        # respetan lo pedido en la GUI, porque ahí todavía no hay información.
+        prior = self.__dict__.get("_bpof_prior")
+        prior_window = None
+        if (
+            prior is not None
+            and bool(self.__dict__.get("coarse_prior_enabled", True))
+            and prior.ready
+        ):
+            prior_window = prior.window(z_min_hw, z_max_hw)
+
+        if prior_window is not None:
+            z_min, z_max = prior_window
+            z_range_total = z_max - z_min
+            self._coarse_window_source = "prior"
+            logger.info(
+                "[Autofocus] COARSE acotado por prior de sesión: "
+                "%.2f→%.2fµm (%.2fµm) | mediana BPoF=%.2fµm "
+                "semiancho=%.2fµm (MAD=%.2fµm, n=%d)",
+                z_min,
+                z_max,
+                z_range_total,
+                float(prior.center),
+                float(prior.half_span_um),
+                float(prior.mad_um or 0.0),
+                len(prior),
+            )
+        elif self.use_full_range:
             z_min = z_min_hw
             z_max = z_max_hw
             z_range_total = z_max_hw - z_min_hw
+            self._coarse_window_source = "full"
             logger.info(
                 f"[Autofocus] ESCANEO COMPLETO: {z_min:.2f} -> {z_max:.2f}um "
                 f"(rango total: {z_range_total:.2f}µm)"
             )
         else:
-            z_min = max(z_min_hw, z_current - self.z_scan_range)
-            z_max = min(z_max_hw, z_current + self.z_scan_range)
+            # Sin historial y sin escaneo completo: ventana asimétrica alrededor
+            # del origen calibrado. El pico aparece pasado el origen (43µm en el
+            # log de referencia), así que abrir más hacia arriba cuesta lo mismo
+            # y falla menos que centrar en la Z actual.
+            z_min, z_max = bootstrap_window(
+                z_current,
+                below_um=float(
+                    self.__dict__.get("coarse_bootstrap_below_um", 20.0)
+                ),
+                above_um=float(
+                    self.__dict__.get("coarse_bootstrap_above_um", 25.0)
+                ),
+                z_min_hw=z_min_hw,
+                z_max_hw=z_max_hw,
+            )
             z_range_total = z_max - z_min
+            self._coarse_window_source = "bootstrap"
             logger.info(
-                f"[Autofocus] Escaneo local: {z_min:.2f}-{z_max:.2f}µm "
+                f"[Autofocus] Escaneo local (arranque): {z_min:.2f}-{z_max:.2f}µm "
                 f"({z_range_total:.2f}µm desde Z={z_current:.2f}µm)"
             )
 
@@ -1778,11 +2305,42 @@ class AutofocusService(QThread):
         if not objects:
             raise ValueError("Sin objetos para autofoco superficie")
         focus_cycle_t0 = time.perf_counter()
+        kpi = AfCycleKpi()
+        self._cycle_kpi = kpi
 
         rois = self._normalize_rois(rois=objects)
         is_valid, validation_msg = self.validate_scan_range()
         if not is_valid:
             raise ValueError(validation_msg)
+
+        # --- ROI Tracking: crear tracker para esta sesión ---
+        self._last_roi_emit_t = 0.0
+        if self.roi_tracking_enabled:
+            self._roi_tracker = RoiTracker(
+                max_drift_px=self.roi_max_drift_px,
+                update_threshold_px=self.roi_update_threshold_px,
+                enabled=True,
+                adopt_contour=bool(self.roi_track_adopt_contour),
+                static_window=bool(self.roi_static_window),
+                static_pad_px=int(self.roi_margin),
+                detect_interval=int(
+                    self.__dict__.get("roi_detect_interval", 1)
+                ),
+            )
+            logger.info(
+                "%s ROI Tracking HABILITADO: medida=%s, overlay=silueta "
+                "detectada en vivo",
+                log_prefix,
+                (
+                    f"1 ROI cuadrado estático por objeto, holgura "
+                    f"{int(self.roi_margin)}px/lado"
+                    if self.roi_static_window
+                    else f"máscara trasladable (max_drift="
+                         f"{self.roi_max_drift_px}px)"
+                ),
+            )
+        else:
+            self._roi_tracker = None
 
         z_center_hw = self.cfocus_controller.get_calibration_info()["z_center"]
 
@@ -1811,12 +2369,16 @@ class AutofocusService(QThread):
 
         # Revalidar BPoF con flush completo antes del plan fotográfico.
         # Evita stacks anclados a un pico FINE contaminado por frame mid-move.
+        confirm_t0 = time.perf_counter()
+        s_fine_bpof = float(best_score)
         best_z, best_score = self._confirm_bpof_before_stack(
             float(best_z),
             float(best_score),
             rois=rois,
             log_prefix=log_prefix,
         )
+        kpi.t_confirm = time.perf_counter() - confirm_t0
+        kpi.z_bpof = float(best_z)
 
         n_captures = max(1, int(self.n_captures))
         target_s_drop_rel = max(
@@ -1903,6 +2465,7 @@ class AutofocusService(QThread):
                 f"(ΔS objetivo {100.0 * target_s_drop_rel:.1f}%; "
                 f"distancia Z resultante media {capture_step:.3f}µm)"
             )
+            photos_t0 = time.perf_counter()
             for i, z_capture in enumerate(z_positions):
                 if self.cancel_requested:
                     break
@@ -1943,32 +2506,52 @@ class AutofocusService(QThread):
                     f"{log_prefix} S_ROI FOTO {i + 1}/{n_captures}: "
                     f"Z={float(z_read_i):.2f}µm S={float(score_i):.2f}"
                 )
+            kpi.t_photos = time.perf_counter() - photos_t0
             if len(frames) != n_captures:
                 raise RuntimeError(
                     f"{log_prefix} Stack incompleto: {len(frames)}/"
                     f"{n_captures} fotografías; no se guarda ninguna serie"
                 )
+            self._record_stack_kpi(
+                kpi,
+                best_z=float(best_z),
+                s_reference=s_fine_bpof,
+                z_positions=z_positions,
+                scores=scores,
+                center_idx=center_idx,
+                log_prefix=log_prefix,
+            )
         else:
             frame_i, score_i = self._capture_at_z(best_z, rois=rois)
             frames = [frame_i]
             scores = [float(score_i) if score_i else float(best_score)]
             z_reads = [self._read_z_um()]
 
-        # Las imágenes ya están en memoria. El ciclo óptico termina siempre en
-        # el punto medio calibrado; guardar archivos no requiere permanecer en Z.
-        ok_return, z_final_read, z_origin_cmd = self.goto_calibration_origin(
-            log_prefix=log_prefix, emit_status=True
-        )
+        # Las imágenes ya están en memoria; guardar archivos no requiere
+        # permanecer en Z. El ciclo termina aparcado en el BPoF para dejar la
+        # vista en el plano enfocado; park_at_bpof=False vuelve al punto medio
+        # calibrado. El siguiente barrido reancla en el origen de todos modos.
+        if self.park_at_bpof:
+            z_park_cmd = float(best_z)
+            ok_return, z_final_read = self._goto_z_static(z_park_cmd)
+            destino = "BPoF"
+            if ok_return:
+                self.score_updated.emit(z_park_cmd, float(best_score))
+        else:
+            ok_return, z_final_read, z_park_cmd = self.goto_calibration_origin(
+                log_prefix=log_prefix, emit_status=True
+            )
+            destino = "origen calibrado"
         if not ok_return:
             raise RuntimeError(
-                f"{log_prefix} Fotografías tomadas, pero falló retorno al "
-                f"origen calibrado Z={z_origin_cmd:.3f}µm "
+                f"{log_prefix} Fotografías tomadas, pero falló el aparcado en "
+                f"{destino} Z={z_park_cmd:.3f}µm "
                 f"(read={f'{z_final_read:.3f}' if z_final_read is not None else '?'})"
             )
         msg_final = (
             f"{log_prefix} ✓ Ciclo completo: BPoF={best_z:.2f}µm "
             f"(SΣ={best_score:.1f}, n_ROI={len(rois)}) → "
-            f"origen calibrado Z={z_final_read:.2f}µm | "
+            f"aparcado en {destino} Z={z_final_read:.2f}µm | "
             f"tiempo={time.perf_counter() - focus_cycle_t0:.2f}s"
         )
         logger.info(msg_final)
@@ -1993,9 +2576,22 @@ class AutofocusService(QThread):
         z_alt = z_positions[alt_idx] if z_positions else best_z
         score_alt = scores[alt_idx] if len(scores) > alt_idx else 0.0
 
+        # El bbox reportado debe ser el que se midió en el último plano, no el
+        # de la detección inicial: si el objeto se desplazó, el ROI original ya
+        # no lo contiene.
+        final_rois = rois
+        tracker = self.__dict__.get("_roi_tracker")
+        if tracker is not None and tracker.is_active:
+            tracked = tracker.current_rois
+            if len(tracked) == len(rois):
+                final_rois = tracked
+
+        kpi.t_total = time.perf_counter() - focus_cycle_t0
+        self._publish_cycle_kpi(kpi, best_z=float(best_z))
+
         results: List[FocusResult] = []
         for i, obj in enumerate(objects):
-            bbox_i, contour_i = rois[i]
+            bbox_i, contour_i = final_rois[i]
             s_i = best_score
             if final_frame is not None:
                 s_i = float(
@@ -2027,7 +2623,102 @@ class AutofocusService(QThread):
                     score_alt=score_alt,
                 )
             )
+        
+        # --- Limpiar ROI Tracker ---
+        if tracker is not None:
+            tracker.reset()
+        self._roi_tracker = None
+
         return results
+
+    def _record_stack_kpi(
+        self,
+        kpi: AfCycleKpi,
+        *,
+        best_z: float,
+        s_reference: float,
+        z_positions: list,
+        scores: list,
+        center_idx: int,
+        log_prefix: str,
+    ) -> None:
+        """Mide el stack contra lo que se pidió, no contra lo que se planificó.
+
+        Las tres cifras que importan salen de las fotografías, no de la curva:
+        ε_foto (¿la S del BPoF se repite al fotografiarlo?), ΔS_stack real
+        (¿los planos laterales son distinguibles?) y la asimetría (¿el bracket
+        rodea el foco o cuelga de un lado?). En el log de referencia el plan
+        pedía 7.5% y las fotos salieron con 5.3%, 0% y 0.4%: indistinguibles.
+        """
+        if not scores or not z_positions:
+            return
+
+        s_center = (
+            float(scores[center_idx]) if center_idx < len(scores) else 0.0
+        )
+        if s_reference > 0.0 and s_center > 0.0:
+            kpi.eps_photo = abs(s_center - float(s_reference)) / float(
+                s_reference
+            )
+        if s_center > 0.0:
+            laterals = [
+                float(score)
+                for idx, score in enumerate(scores)
+                if idx != center_idx
+            ]
+            if laterals:
+                kpi.delta_s_stack = max(
+                    0.0, (s_center - max(laterals)) / s_center
+                )
+        kpi.stack_asymmetry = stack_asymmetry_ratio(
+            [float(z) - float(best_z) for z in z_positions]
+        )
+
+        logger.info(
+            "%s STACK MEDIDO: S_fotos=%s | ε_foto=%s ΔS_real=%s asimetría=%s",
+            log_prefix,
+            ", ".join(f"{float(score):.1f}" for score in scores),
+            f"{kpi.eps_photo:.1%}" if kpi.eps_photo is not None else "na",
+            (
+                f"{kpi.delta_s_stack:.1%}"
+                if kpi.delta_s_stack is not None
+                else "na"
+            ),
+            (
+                f"{kpi.stack_asymmetry:.1f}×"
+                if kpi.stack_asymmetry is not None
+                else "na"
+            ),
+        )
+
+    def _publish_cycle_kpi(self, kpi: AfCycleKpi, *, best_z: float) -> None:
+        """Publica la línea AF_KPI y alimenta el prior y las medianas."""
+        kpi.z_bpof = float(best_z)
+        prior = self.__dict__.get("_bpof_prior")
+        if prior is not None:
+            prior.add(float(best_z))
+
+        line = kpi.format_line()
+        logger.info("[Autofocus] %s", line)
+        print(line, flush=True)
+        try:
+            self.status_message.emit(line)
+        except (AttributeError, RuntimeError):
+            pass
+
+        session = self.__dict__.get("session_kpi")
+        if session is None:
+            return
+        session.add_cycle(kpi)
+        every = max(1, int(self.__dict__.get("kpi_session_log_every", 25)))
+        if session.n_cycles % every == 0:
+            summary = session.summary_line()
+            logger.info("[Autofocus] %s", summary)
+            print(summary, flush=True)
+            try:
+                self.status_message.emit(summary)
+            except (AttributeError, RuntimeError):
+                pass
 
     def focus_object_sync(
         self,

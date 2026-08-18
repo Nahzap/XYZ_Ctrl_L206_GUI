@@ -18,6 +18,29 @@ import numpy as np
 
 MAX_FOCUS_CONTEXT_MARGIN_PX = 16
 
+# Erosión del contorno antes de medir S. Se expresa como fracción del radio
+# inscrito del objeto para que escale con su grosor real.
+_INTERIOR_EROSION_FRAC = 0.30
+_INTERIOR_EROSION_MIN_PX = 3.0
+_INTERIOR_EROSION_MAX_PX = 32.0
+
+# Parámetros de la fusión RAW/CLAHE. Se exponen porque son los que gobiernan la
+# repetibilidad de S: el 90% del índice sale del promedio del 0.5% de gradientes
+# más fuertes, así que unos pocos píxeles (polvo, un borde residual, flicker de
+# iluminación) mueven S decenas de puntos entre dos tomas del mismo plano. En el
+# log de referencia eso produjo 362.4 y 280.0 en el mismo Z (−29.7%).
+#
+# Bajar el percentil o repartir peso hacia la rama CLAHE reduce esa fragilidad,
+# pero cambia la escala de S y con ella el umbral ΔS del stack. No se puede
+# ajustar a ciegas: exige el banco de repeticiones sobre la misma semilla
+# (5 barridos, CV de S en el mismo Z ≤ 5%). Hasta entonces los valores por
+# defecto reproducen exactamente CLAHE-HF-v4.
+STRONG_EDGE_PERCENTILE = 99.5
+RAW_BRANCH_WEIGHT = 0.90
+CLAHE_BRANCH_WEIGHT = 0.10
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID = (8, 8)
+
 
 def bbox_to_contour(bbox: Tuple[int, int, int, int]) -> np.ndarray:
     """Contorno rectangular cuando no hay máscara U2-Net."""
@@ -85,20 +108,38 @@ def _to_gray_native(roi: np.ndarray) -> np.ndarray:
 
 
 def _interior_mask(mask: np.ndarray) -> np.ndarray:
-    """Excluye el borde del contorno sin borrar objetos pequeños."""
+    """Deja solo el interior del objeto, sin su silueta ni la orla de desenfoque.
+
+    El salto de intensidad objeto/fondo es de lejos el gradiente más fuerte del
+    recorte y apenas cambia con Z, así que si entra en la medida S deja de
+    responder al detalle interno: pasa a puntuar lo bien que el contorno abraza
+    la silueta. Por eso el radio se toma proporcional al grosor del propio
+    objeto (vía transformada de distancia) y no al tamaño de la ventana ROI.
+
+    El radio se reduce si la erosión dejara demasiadas pocas muestras, de modo
+    que los objetos pequeños siguen midiéndose.
+    """
     n = int(np.count_nonzero(mask))
     if n < 25:
         return mask
-    h, w = mask.shape[:2]
-    radius = max(1, min(5, int(round(min(h, w) * 0.005))))
-    k = 2 * radius + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    eroded = cv2.erode(mask, kernel, iterations=1)
-    # Mantener al menos 60% del objeto y suficientes muestras.
-    n_eroded = int(np.count_nonzero(eroded))
-    if n_eroded >= max(25, int(0.60 * n)):
-        return eroded
-    return mask
+
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    reach = float(dist.max())  # radio del mayor círculo inscrito
+    if reach <= 1.0:
+        return mask
+
+    radius = float(np.clip(_INTERIOR_EROSION_FRAC * reach,
+                           _INTERIOR_EROSION_MIN_PX,
+                           _INTERIOR_EROSION_MAX_PX))
+    min_keep = max(150, int(0.25 * n))
+    inner = (dist >= radius).astype(np.uint8) * 255
+    while int(np.count_nonzero(inner)) < min_keep and radius > 1.0:
+        radius = max(1.0, radius - 1.0)
+        inner = (dist >= radius).astype(np.uint8) * 255
+
+    if int(np.count_nonzero(inner)) < 25:
+        return mask
+    return inner
 
 
 def _masked_brenner(gray_f: np.ndarray, mask_bool: np.ndarray) -> float:
@@ -124,9 +165,12 @@ def calculate_focus_score(
     bbox: Tuple[int, int, int, int],
     contour: Optional[np.ndarray] = None,
     roi_margin: int = 0,
+    **metric_kwargs,
 ) -> float:
     """Índice S sobre la máscara del objeto dentro del ROI expandido."""
-    score, _ = calculate_focus_score_detailed(frame, bbox, contour, roi_margin)
+    score, _ = calculate_focus_score_detailed(
+        frame, bbox, contour, roi_margin, **metric_kwargs
+    )
     return score
 
 
@@ -135,8 +179,33 @@ def calculate_focus_score_detailed(
     bbox: Tuple[int, int, int, int],
     contour: Optional[np.ndarray] = None,
     roi_margin: int = 0,
+    *,
+    strong_edge_percentile: Optional[float] = None,
+    raw_weight: Optional[float] = None,
+    clahe_clip_limit: Optional[float] = None,
 ) -> Tuple[float, dict]:
-    """Índice S + metadatos (ROI, cobertura de máscara)."""
+    """Índice S + metadatos (ROI, cobertura de máscara).
+
+    Los tres parámetros ópticos quedan expuestos para el banco de repetibilidad
+    (ver constantes del módulo); con ``None`` se usa CLAHE-HF-v4 tal cual.
+    """
+    percentile = (
+        STRONG_EDGE_PERCENTILE
+        if strong_edge_percentile is None
+        else float(np.clip(float(strong_edge_percentile), 50.0, 100.0))
+    )
+    w_raw = (
+        RAW_BRANCH_WEIGHT
+        if raw_weight is None
+        else float(np.clip(float(raw_weight), 0.0, 1.0))
+    )
+    w_clahe = 1.0 - w_raw
+    clip_limit = (
+        CLAHE_CLIP_LIMIT
+        if clahe_clip_limit is None
+        else max(0.1, float(clahe_clip_limit))
+    )
+
     if frame is None or getattr(frame, "size", 0) == 0:
         return 0.0, {"score": 0.0, "mask_pixels": 0, "roi_w": 0, "roi_h": 0}
 
@@ -211,7 +280,7 @@ def calculate_focus_score_detailed(
     clahe_input[mask == 0] = fill
 
     # CLAHE sí forma parte de S: normaliza iluminación local sin saturar contraste.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=CLAHE_TILE_GRID)
     enhanced = clahe.apply(clahe_input)
     enhanced_f = enhanced.astype(np.float64) / working_scale
 
@@ -225,10 +294,9 @@ def calculate_focus_score_detailed(
     raw_gy = cv2.Sobel(raw_smooth, cv2.CV_64F, 0, 1, ksize=3)
     raw_grad = np.hypot(raw_gx, raw_gy)
     raw_grad_values = raw_grad[inner_bool]
-    strong_edge_percentile = 99.5
     if raw_grad_values.size:
         edge_threshold = float(
-            np.percentile(raw_grad_values, strong_edge_percentile)
+            np.percentile(raw_grad_values, percentile)
         )
         strong_values = raw_grad_values[raw_grad_values >= edge_threshold]
         strong_edge_score = (
@@ -274,13 +342,13 @@ def calculate_focus_score_detailed(
         + 0.20 * brenner_s
         + 0.10 * highpass_s
     )
-    score = float(0.90 * strong_edge_normalized + 0.10 * clahe_score)
+    score = float(w_raw * strong_edge_normalized + w_clahe * clahe_score)
 
     details["score"] = score
     details["metric_version"] = (
         "clahe_hf_v4_raw16" if storage_bits >= 16 else "clahe_hf_v4_u8"
     )
-    details["clahe_clip_limit"] = 2.0
+    details["clahe_clip_limit"] = clip_limit
     details["lap_var"] = lap_var
     details["tenengrad"] = tenengrad
     details["brenner"] = brenner
@@ -289,14 +357,14 @@ def calculate_focus_score_detailed(
     details["lap_sqrt"] = lap_s
     details["brenner_sqrt"] = brenner_s
     details["highpass_sqrt"] = highpass_s
-    details["strong_edge_percentile"] = strong_edge_percentile
+    details["strong_edge_percentile"] = percentile
     details["strong_edge_threshold"] = edge_threshold
     details["strong_edge_score"] = strong_edge_score
     details["strong_edge_normalized"] = strong_edge_normalized
     details["intensity_reference"] = intensity_reference
     details["clahe_composite_score"] = clahe_score
-    details["raw_weight"] = 0.90
-    details["clahe_weight"] = 0.10
+    details["raw_weight"] = w_raw
+    details["clahe_weight"] = w_clahe
     return score, details
 
 

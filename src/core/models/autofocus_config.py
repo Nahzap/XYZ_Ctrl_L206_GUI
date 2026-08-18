@@ -11,6 +11,11 @@ Fecha: 2025-12-29
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+# Coste real por plano medido en el ciclo de referencia (68 mediciones en
+# 62.4 s). Se replica aquí en vez de importarlo del paquete de autofoco para no
+# arrastrar el detector U2-Net al cargar la configuración.
+S_PER_PLANE_S = 0.9
+
 
 @dataclass
 class AutofocusConfig:
@@ -34,12 +39,18 @@ class AutofocusConfig:
     """
     
     # Parámetros de búsqueda de BPoF
+    #
+    # Δ=6µm con paso 0.5 y 9 capas dan una ventana FINE real de ±2µm: un
+    # refinamiento del plano COARSE ganador. Con Δ mayor que 2–3 pasos gruesos,
+    # FINE deja de refinar y repite el barrido a mayor resolución.
     use_full_range: bool = True             # escaneo completo del rango calibrado
-    z_scan_range: float = 20.0              # µm - límite ±Δ máximo zona fine
-    z_step_coarse: float = 0.5              # µm - paso grueso
-    z_step_fine: float = 0.1                # µm - paso real entre planos FINE
-    n_fine_planes: int = 15                 # capas fine (impar)
-    z_arrive_tol_um: float = 0.5            # µm - condición |err|≤tol
+    z_scan_range: float = 6.0               # µm - límite ±Δ máximo zona fine
+    z_step_coarse: float = 3.0              # µm - paso grueso
+    z_step_fine: float = 0.5                # µm - paso real entre planos FINE
+    n_fine_planes: int = 9                  # capas fine (impar)
+    # La tolerancia debe ser < paso_fino/2: con tol ≥ paso, dos candidatos FINE
+    # distintos pueden acabar medidos en la misma Z real.
+    z_arrive_tol_um: float = 0.25           # µm - condición |err|≤tol
     z_arrive_timeout_s: float = 3.0         # s - timeout seguridad (no settle)
     # Compat legacy (ignorados como sleep; orquestador puede seguir seteándolos)
     settle_time: float = 0.0
@@ -52,6 +63,11 @@ class AutofocusConfig:
     n_captures: int = 3                     # número de capturas (impar)
     z_step_capture: float = 10.0            # % - caída S objetivo (nombre legacy)
     z_range_capture: float = 10.0           # µm - rango total
+
+    # ROI Tracking
+    roi_tracking_enabled: bool = True       # tracking adaptativo durante AF
+    roi_max_drift_px: int = 30              # límite de drift (px)
+    roi_update_threshold_px: float = 2.0    # umbral mínimo (px) para update
     
     def validate(self) -> Tuple[bool, Optional[str]]:
         """
@@ -127,7 +143,11 @@ class AutofocusConfig:
             'coarse_steps': coarse_steps,
             'fine_steps': fine_steps,
             'total_steps': total_steps,
-            'estimated_time_s': total_steps * 0.15,
+            # 0.9 s por plano medidos en el ciclo de referencia (68 mediciones
+            # en 62.4 s), no los 0.15 s teóricos de un sleep de asentamiento:
+            # cada plano mueve el piezo, espera quietud por lectura, descarta
+            # frames del movimiento, adquiere un RAW de 5 Mpx y calcula S.
+            'estimated_time_s': total_steps * S_PER_PLANE_S,
             'z_range_um': 2 * self.z_scan_range,
             'search_distance_um': 2 * self.z_scan_range,
             'z_arrive_tol_um': self.z_arrive_tol_um,

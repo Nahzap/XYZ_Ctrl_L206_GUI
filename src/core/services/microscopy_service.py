@@ -583,6 +583,8 @@ class MicroscopyService(QObject):
         if not self._microscopy_config:
             return
 
+        self._note_point_for_af_kpi()
+
         use_autofocus = bool(self._microscopy_config.get('autofocus_enabled', False))
         cfocus_enabled = bool(self._cfocus_enabled_getter()) if self._cfocus_enabled_getter else False
 
@@ -1663,6 +1665,39 @@ class MicroscopyService(QObject):
         except Exception as e:
             logger.error(f"[MicroscopyService] Error guardando frame alternativo: {e}")
             return False
+
+    def _note_point_for_af_kpi(self) -> None:
+        """Cuenta el punto visitado y publica el ETA de la sesión.
+
+        El ETA no se puede derivar del número de puntos: sólo los que tienen
+        objeto pagan autofoco. El hit-rate observado (p_hat) es lo que convierte
+        el T_AF mediano en horas restantes, y sale de comparar puntos visitados
+        contra ciclos ejecutados.
+        """
+        af = self._autofocus_service
+        session = getattr(af, "session_kpi", None) if af is not None else None
+        if session is None:
+            return
+
+        session.note_point_visited()
+        every = max(1, int(getattr(af, "kpi_session_log_every", 25)))
+        if session.n_points % every != 0:
+            return
+
+        remaining = max(
+            0,
+            int(self._state_manager.total_points)
+            - int(self._state_manager.current_point)
+            - 1,
+        )
+        summary = session.summary_line(
+            remaining,
+            t_point_overhead_s=(
+                (self._delay_before_ms + self._delay_after_ms) / 1000.0
+            ),
+        )
+        logger.info("[MicroscopyService] %s", summary)
+        self.status_changed.emit(summary)
 
     def _advance_point(self) -> None:
         """OBSOLETO: Avanza al siguiente punto (legacy).

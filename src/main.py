@@ -1,4 +1,4 @@
-# CRITICAL: Set OpenMP environment variable BEFORE any imports
+        # CRITICAL: Set OpenMP environment variable BEFORE any imports
 # This fixes the conflict between PyTorch (libiomp5md.dll) and SciPy (libomp.dll)
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -950,6 +950,7 @@ class CTRL_GUI(QMainWindow):
         
         # Conectar señales para overlay de score en ventana de cámara
         self.autofocus_service.score_updated.connect(self._on_autofocus_score_updated)
+        self.autofocus_service.roi_tracked.connect(self._on_autofocus_roi_tracked)
         self.autofocus_service.status_message.connect(self._on_autofocus_status_message)
         
         # Conectar señal de progreso
@@ -968,6 +969,11 @@ class CTRL_GUI(QMainWindow):
         if self.camera_tab.camera_view_window:
             self.camera_tab.camera_view_window.update_autofocus_score(z_position, score)
     
+    def _on_autofocus_roi_tracked(self, rois: list, frame_size: tuple):
+        """Callback para refrescar el ROI seguido durante el Z-scan."""
+        if self.camera_tab.camera_view_window:
+            self.camera_tab.camera_view_window.update_tracked_rois(rois, frame_size)
+
     def _on_autofocus_status_message(self, message: str):
         """Callback para mensajes de estado del autofoco."""
         # Overlay: solo 1ª línea (dumps de tabla BPoF son multilínea)

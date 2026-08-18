@@ -3,7 +3,7 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-08-07T09:47:58.089152",
+  "last_updated": "2026-08-18T12:20:14.220343",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
     "points": 1344,
@@ -42,13 +42,13 @@
   },
   "microscopy": {
     "description": "Parámetros de microscopía automatizada",
-    "class_name": "APICOLA_QUINCHAO",
+    "class_name": "ERIKA-POBLETE",
     "total_points": 1344,
     "autofocus": {
       "enabled": true,
       "area_range": {
-        "min": 12000,
-        "max": 2000000,
+        "min": 35000,
+        "max": 800000,
         "unit": "px"
       }
     },
@@ -72,8 +72,8 @@
       16
     ],
     "delays": {
-      "before_capture": 1000,
-      "after_capture": 1000,
+      "before_capture": 2000,
+      "after_capture": 500,
       "unit": "ms"
     },
     "learning_mode": {
@@ -88,8 +88,8 @@
     "min_area": 500,
     "min_probability": 0.3,
     "morphological_filters": {
-      "min_circularity": 0.4,
-      "min_aspect_ratio": 0.4,
+      "min_circularity": 0.55,
+      "min_aspect_ratio": 0.5,
       "description": "Filtros morfológicos para rechazar manchas irregulares"
     }
   },
@@ -127,8 +127,8 @@
     "version": 1,
     "description": "Últimas opciones editables de la pestaña Cámara",
     "camera": {
-      "exposure": 0.05,
-      "fps": 14,
+      "exposure": 0.1,
+      "fps": 10,
       "buffer_frames": 1
     },
     "capture": {
@@ -147,13 +147,13 @@
       }
     },
     "microscopy": {
-      "class_name": "APICOLA_QUINCHAO",
+      "class_name": "ERIKA-POBLETE",
       "xy_only": false,
       "img_width": 2590,
       "img_height": 1942,
-      "save_folder": "F:\\MICROSCOPIA\\MIELES\\APICOLA QUINCHAO\\SAMPLE 001",
-      "delay_before_s": 1.0,
-      "delay_after_s": 1.0,
+      "save_folder": "F:\\MICROSCOPIA\\MIELES\\Miel_006_ERIKA-POBLETE\\SAMPLE_002",
+      "delay_before_s": 2.0,
+      "delay_after_s": 0.5,
       "channels": {
         "R": true,
         "G": true,
@@ -163,18 +163,18 @@
     "autofocus": {
       "enabled": true,
       "full_scan": true,
-      "min_pixels": 12000,
-      "max_pixels": 2000000,
-      "min_circularity": 0.4,
-      "min_aspect_ratio": 0.4,
-      "z_scan_range_um": 7.0,
-      "z_step_coarse_um": 4.0,
+      "min_pixels": 35000,
+      "max_pixels": 800000,
+      "min_circularity": 0.55,
+      "min_aspect_ratio": 0.5,
+      "z_scan_range_um": 22.0,
+      "z_step_coarse_um": 3.0,
       "z_step_fine_um": 1.0,
       "n_captures": 3,
-      "capture_s_drop_percent": 5.0,
-      "n_fine_planes": 23,
-      "z_arrive_tol_um": 1.0,
-      "roi_margin_px": 15
+      "capture_s_drop_percent": 8.5,
+      "n_fine_planes": 7,
+      "z_arrive_tol_um": 0.5,
+      "roi_margin_px": 5
     },
     "u2net": {
       "detection_mode": "Sensible (Polen)",

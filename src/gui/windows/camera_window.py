@@ -827,6 +827,61 @@ class CameraViewWindow(QWidget):
         # Forzar actualización visual
         logger.info(f"[CameraWindow] Mostrando {len(boxes)} máscaras de autofoco")
     
+    def update_tracked_rois(self, rois, frame_size=None):
+        """Refresca el overlay con los ROI que el autofoco está siguiendo.
+
+        A diferencia de ``_on_detection_done``, esta vía sí actualiza mientras
+        el autofoco está activo: el contorno de la semilla debe seguir al
+        objeto plano a plano para poder ver sobre qué se mide S.
+
+        Args:
+            rois: lista de dicts con 'bbox' (x, y, w, h) y 'contour' opcional,
+                  en coordenadas del frame científico.
+            frame_size: (w, h) del frame sobre el que se midió.
+        """
+        if not rois:
+            return
+
+        boxes = []
+        contours = []
+        for roi in rois:
+            bbox = roi.get('bbox') if isinstance(roi, dict) else None
+            if bbox is None or len(bbox) != 4:
+                continue
+            x, y, w, h = (int(v) for v in bbox)
+            boxes.append({
+                'bbox': (x, y, w, h),
+                'area': w * h,
+                'score': 0,
+                'is_focused': False,
+                'in_filter_range': True
+            })
+            contour = roi.get('contour')
+            if contour is not None and len(contour) > 1:
+                contours.append(contour)
+
+        if not boxes:
+            return
+
+        orig_w, orig_h = 0, 0
+        if frame_size and len(frame_size) == 2:
+            orig_w, orig_h = int(frame_size[0]), int(frame_size[1])
+        if (orig_w <= 0 or orig_h <= 0) and self.last_frame is not None:
+            orig_h, orig_w = self.last_frame.shape[:2]
+
+        self.detection_result = {
+            'contours': contours,
+            'boxes': boxes,
+            'frame_size': (orig_w, orig_h),
+            'n_objects': len(boxes),
+            'n_in_range': len(boxes),
+            'filter_range': (0, 999999)
+        }
+        logger.debug(
+            "[CameraWindow] ROI seguido: %s (frame %dx%d, %d contornos)",
+            boxes[0]['bbox'], orig_w, orig_h, len(contours)
+        )
+
     def clear_autofocus_masks(self):
         """Limpia las máscaras de autofoco después de completar el proceso."""
         self.detection_result = None

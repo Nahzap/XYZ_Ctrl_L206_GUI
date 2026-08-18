@@ -569,9 +569,14 @@ def create_microscopy_section(widgets: dict, refresh_traj_cb, start_cb, stop_cb,
     # Fila 4: Demoras
     row3_layout = QHBoxLayout()
     row3_layout.addWidget(QLabel("Demora antes (s):"))
-    widgets['delay_before_input'] = QLineEdit("2.0")
+    widgets['delay_before_input'] = QLineEdit("0.3")
     widgets['delay_before_input'].setFixedWidth(60)
-    widgets['delay_before_input'].setToolTip("Tiempo de espera antes de capturar (estabilización)")
+    widgets['delay_before_input'].setToolTip(
+        "Tiempo de espera antes de capturar (estabilización XY).\n"
+        "Se paga en TODOS los puntos, con objeto o sin él: con 5292 puntos,\n"
+        "cada segundo aquí son 1.5 h de sesión. La quietud del piezo la\n"
+        "impone el autofoco por lectura de Z, no este temporizador."
+    )
     row3_layout.addWidget(widgets['delay_before_input'])
     
     row3_layout.addSpacing(30)
@@ -754,13 +759,15 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     detection_form.addWidget(QLabel("Distancia fine ±:"), 2, 0)
     widgets['z_scan_range_spin'] = QDoubleSpinBox()
     widgets['z_scan_range_spin'].setRange(0.1, 500.0)
-    widgets['z_scan_range_spin'].setValue(20.0)
+    widgets['z_scan_range_spin'].setValue(6.0)
     widgets['z_scan_range_spin'].setSuffix(" µm")
     widgets['z_scan_range_spin'].setDecimals(1)
     widgets['z_scan_range_spin'].setSingleStep(1.0)
     widgets['z_scan_range_spin'].setToolTip(
         "Límite máximo ±µm alrededor del plano COARSE con mayor S.\n"
-        "El recorrido real FINE usa Paso fino × N° capas, sin exceder este Δ."
+        "El recorrido real FINE usa Paso fino × N° capas, sin exceder este Δ.\n"
+        "FINE refina el plano que eligió el COARSE: con Δ mayor que 2–3 pasos\n"
+        "gruesos vuelve a ser un segundo barrido completo."
     )
     widgets['z_scan_range_spin'].setFixedWidth(100)
     widgets['z_scan_range_spin'].valueChanged.connect(update_params_cb)
@@ -768,7 +775,7 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     
     # Label de rango de búsqueda
     detection_form.addWidget(QLabel("Rango búsqueda:"), 2, 2)
-    widgets['estimated_images_label'] = QLabel("±20.0µm")
+    widgets['estimated_images_label'] = QLabel("±6.0µm")
     widgets['estimated_images_label'].setStyleSheet("color: #3498DB; font-weight: bold;")
     widgets['estimated_images_label'].setToolTip(
         "Distancia de búsqueda desde centro\n"
@@ -826,14 +833,16 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     detection_form.addWidget(QLabel("Tol. Z llegada:"), 4, 2)
     widgets['z_arrive_tol_spin'] = QDoubleSpinBox()
     widgets['z_arrive_tol_spin'].setRange(0.05, 5.0)
-    widgets['z_arrive_tol_spin'].setValue(0.5)
+    widgets['z_arrive_tol_spin'].setValue(0.25)
     widgets['z_arrive_tol_spin'].setSuffix(" µm")
     widgets['z_arrive_tol_spin'].setDecimals(2)
     widgets['z_arrive_tol_spin'].setSingleStep(0.05)
     widgets['z_arrive_tol_spin'].setLocale(QLocale(QLocale.C))
     widgets['z_arrive_tol_spin'].setToolTip(
         "Condición de cumplimiento: |Z_read − Z_cmd| ≤ tol en lecturas\n"
-        "consecutivas. No es un tiempo de asentamiento fijo."
+        "consecutivas. No es un tiempo de asentamiento fijo.\n"
+        "Debe ser menor que la mitad del paso fino: con tol ≥ paso, dos\n"
+        "candidatos FINE distintos pueden medirse en la misma Z real."
     )
     widgets['z_arrive_tol_spin'].setFixedWidth(100)
     widgets['z_arrive_tol_spin'].valueChanged.connect(update_params_cb)
@@ -844,11 +853,14 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
     detection_form.addWidget(QLabel("N° capas fine:"), 5, 2)
     widgets['n_fine_planes_spin'] = QSpinBox()
     widgets['n_fine_planes_spin'].setRange(3, 101)
-    widgets['n_fine_planes_spin'].setValue(15)
+    widgets['n_fine_planes_spin'].setValue(9)
     widgets['n_fine_planes_spin'].setSingleStep(2)
     widgets['n_fine_planes_spin'].setToolTip(
         "N candidatos FINE (impar), centrados exactamente en Z_coarse*.\n"
-        "Semirango solicitado = Paso fino × (N−1)/2; Δ fine es el máximo."
+        "Semirango solicitado = Paso fino × (N−1)/2; Δ fine es el máximo.\n"
+        "Cada capa cuesta ~0.9 s medidos (mover, esperar quietud, flush\n"
+        "óptico, RAW completo y métrica). El recorrido se visita del centro\n"
+        "hacia afuera y se corta cuando el pico queda atrás."
     )
     widgets['n_fine_planes_spin'].setFixedWidth(100)
     widgets['n_fine_planes_spin'].valueChanged.connect(update_params_cb)
