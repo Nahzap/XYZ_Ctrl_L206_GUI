@@ -557,9 +557,8 @@ class AutofocusService(QThread):
         como semilla en la primera medición. Antes se reasignaba una variable
         local y el seguimiento se perdía en cada plano.
 
-        S se mide sobre la máscara de área constante y el overlay recibe la
-        silueta detectada: son dos vistas del mismo ROI y confundirlas hacía
-        que S dependiera del tamaño que el detector le diera al objeto.
+        S se mide sobre la silueta U2-Net ∩ ROI cuadrado estático: el cuadrado
+        fija la ventana; la ponderación es el objeto, no el rectángulo lleno.
         """
         tracker = self._roi_tracker
         if tracker is not None and tracker.enabled:
@@ -1138,6 +1137,7 @@ class AutofocusService(QThread):
                 f"excede max_fine_iterations={max_fine}; NO CAPTURA"
             )
         total_refine_steps = len(fine_planes)
+        kpi.n_fine_planned = int(total_refine_steps)
         tabla_fine = BpofCandidateTable(
             n_planned_planes=total_refine_steps, phase="fine"
         )
@@ -1355,6 +1355,8 @@ class AutofocusService(QThread):
                 # Un desborde significa que ese plano midió el grano recortado
                 # y su S no es comparable con la del resto del barrido.
                 overflows, worst = tracker.get_overflow_stats()
+                kpi.roi_overflow_count = int(overflows)
+                kpi.roi_overflow_max_px = int(worst)
                 if overflows:
                     roi_msg = (
                         f"{log_prefix} ROI estático: la segmentación se salió "
@@ -2306,6 +2308,17 @@ class AutofocusService(QThread):
             raise ValueError("Sin objetos para autofoco superficie")
         focus_cycle_t0 = time.perf_counter()
         kpi = AfCycleKpi()
+        pending_idx = self.__dict__.get("_pending_point_index")
+        if pending_idx is not None:
+            try:
+                kpi.point_index = int(pending_idx)
+            except (TypeError, ValueError):
+                kpi.point_index = None
+        pending_center = self.__dict__.get("_pending_center_kpi")
+        if isinstance(pending_center, dict):
+            for key, value in pending_center.items():
+                if hasattr(kpi, key):
+                    setattr(kpi, key, value)
         self._cycle_kpi = kpi
 
         rois = self._normalize_rois(rois=objects)
@@ -3018,6 +3031,22 @@ class AutofocusService(QThread):
         score, details = calculate_focus_score_detailed(
             frame, bbox, contour, self.roi_margin
         )
+        kpi = self.__dict__.get("_cycle_kpi")
+        if kpi is not None:
+            inner = details.get("inner_mask_pixels")
+            if inner is not None:
+                inner_i = int(inner)
+                prev = getattr(kpi, "inner_pixels_min", None)
+                kpi.inner_pixels_min = (
+                    inner_i if prev is None else min(int(prev), inner_i)
+                )
+            roi_w = int(details.get("roi_w", 0) or 0)
+            roi_h = int(details.get("roi_h", 0) or 0)
+            side = int(details.get("side", 0) or 0)
+            margin = int(details.get("roi_margin_effective", 0) or 0)
+            need = side + 2 * margin
+            if need > 0 and (roi_w < need or roi_h < need):
+                kpi.roi_clipped = True
         x, y, w, h = details["bbox"]
         logger.debug(
             "[Autofocus] S=%.3f %s input=%dbit señal=%dbit cálculo=%s/%dbit | "

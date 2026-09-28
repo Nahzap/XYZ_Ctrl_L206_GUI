@@ -11,10 +11,13 @@ forma parte de la detección: se aplica nuevamente sobre cada plano Z medido.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("MotorControl_L206")
 
 MAX_FOCUS_CONTEXT_MARGIN_PX = 16
 
@@ -49,6 +52,36 @@ def bbox_to_contour(bbox: Tuple[int, int, int, int]) -> np.ndarray:
         [[[x, y]], [[x + w, y]], [[x + w, y + h]], [[x, y + h]]],
         dtype=np.int32,
     )
+
+
+def clip_contour_to_bbox(
+    contour: Optional[np.ndarray],
+    bbox: Tuple[int, int, int, int],
+) -> np.ndarray:
+    """Silueta ∩ cuadrado de medida. Si la intersección es vacía, el cuadrado."""
+    x, y, w, h = (int(v) for v in bbox[:4])
+    w = max(1, int(w))
+    h = max(1, int(h))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if contour is not None and len(contour) >= 3:
+        shifted = np.asarray(contour, dtype=np.int32).copy()
+        if shifted.ndim == 2:
+            shifted = shifted.reshape(-1, 1, 2)
+        shifted[:, :, 0] -= x
+        shifted[:, :, 1] -= y
+        cv2.drawContours(mask, [shifted], -1, 255, -1)
+    if int(np.count_nonzero(mask)) < 25:
+        return bbox_to_contour((x, y, w, h))
+    found, _hier = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not found:
+        return bbox_to_contour((x, y, w, h))
+    best = max(found, key=cv2.contourArea)
+    out = np.asarray(best, dtype=np.int32).copy()
+    out[:, :, 0] += x
+    out[:, :, 1] += y
+    return out
 
 
 def _roi_window(
@@ -269,8 +302,24 @@ def calculate_focus_score_detailed(
     inner_pixels = int(np.count_nonzero(inner_bool))
     details["inner_mask_pixels"] = inner_pixels
     if inner_pixels < 25:
-        details["score"] = 0.0
-        return 0.0, details
+        if mask_pixels >= 25:
+            logger.warning(
+                "[S] inner_pixels=%d < 25 tras erosión (mask=%d) — "
+                "usando silueta sin erosionar",
+                inner_pixels,
+                mask_pixels,
+            )
+            inner_bool = mask > 0
+            inner_pixels = mask_pixels
+            details["inner_mask_pixels"] = inner_pixels
+            details["inner_erosion_relaxed"] = True
+        else:
+            logger.warning(
+                "[S] silueta demasiado pequeña mask=%d — S=0",
+                mask_pixels,
+            )
+            details["score"] = 0.0
+            return 0.0, details
 
     # Aislar el histograma CLAHE del fondo: un patrón fuera del contorno no debe
     # cambiar S. El borde queda fuera gracias a ``inner_bool``.

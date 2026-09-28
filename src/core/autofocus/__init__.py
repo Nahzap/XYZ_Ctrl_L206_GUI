@@ -19,6 +19,27 @@ from .bpof_candidates import (
     symmetric_fine_window,
 )
 from .af_kpi import AfCycleKpi, AfSessionKpi
+from .center_candidate import (
+    CenterPlan,
+    CenterStepRow,
+    PostJogDecision,
+    apply_overshoot_gains,
+    can_start_zscan,
+    decide_post_jog,
+    format_center_steps_table,
+    match_locked_object,
+    plan_center_jog,
+    pixel_offset_from_center,
+    resolve_max_center_steps,
+    snapshot_identity_lock,
+    step_goto_timeout_s,
+)
+from .center_then_af import (
+    CenterContext,
+    CenterResult,
+    CenterThenAf,
+    evaluate_center_pre_af,
+)
 from .fine_scan_plan import RingDeclineStop, center_out_sequence, ring_counts
 from .persisted_params import sanitize_autofocus_form
 from .stack_plan import rebalance_symmetric, stack_asymmetry_ratio
@@ -39,6 +60,23 @@ __all__ = [
     'symmetric_fine_window',
     'AfCycleKpi',
     'AfSessionKpi',
+    'CenterPlan',
+    'CenterStepRow',
+    'PostJogDecision',
+    'apply_overshoot_gains',
+    'can_start_zscan',
+    'decide_post_jog',
+    'format_center_steps_table',
+    'match_locked_object',
+    'plan_center_jog',
+    'pixel_offset_from_center',
+    'resolve_max_center_steps',
+    'snapshot_identity_lock',
+    'step_goto_timeout_s',
+    'CenterContext',
+    'CenterResult',
+    'CenterThenAf',
+    'evaluate_center_pre_af',
     'RingDeclineStop',
     'center_out_sequence',
     'ring_counts',

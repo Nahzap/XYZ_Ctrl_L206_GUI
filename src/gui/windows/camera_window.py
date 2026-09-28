@@ -286,6 +286,10 @@ class CameraViewWindow(QWidget):
         
         # Selección de objeto para resaltar ROI
         self.selected_object_index = None
+        self._fov_x_um = 0.0
+        self._fov_y_um = 0.0
+        self._center_sign_x = 1
+        self._center_sign_y = 1
     
     def _on_detection_done(self, prob_map, objects, time_ms, frame_bgr):
         """Guarda resultado de detección - PRE-CALCULA contornos para overlay liviano.
@@ -323,7 +327,9 @@ class CameraViewWindow(QWidget):
                 'area': area,
                 'score': getattr(obj, 'focus_score', 0),
                 'is_focused': getattr(obj, 'is_focused', False),
-                'in_filter_range': in_range
+                'in_filter_range': in_range,
+                'centroid': getattr(obj, 'centroid', None),
+                'locked': bool(getattr(obj, "_center_locked", False)),
             })
         
         # Guardar datos livianos para overlay
@@ -431,10 +437,7 @@ class CameraViewWindow(QWidget):
             # Overlay costoso SOLO si hay autofoco activo o detecciones que dibujar
             need_overlay = (
                 self.autofocus_active
-                or (
-                    self.detection_result is not None
-                    and (self.show_contours_cb.isChecked() or self.show_boxes_cb.isChecked())
-                )
+                or self.detection_result is not None
             )
             display_image = self._draw_overlay_on_qimage(q_image) if need_overlay else q_image
 
@@ -528,11 +531,102 @@ class CameraViewWindow(QWidget):
                     self.current_z_position = z_pos
             except Exception:
                 pass  # Silenciar errores de lectura Z
-    
+
     def set_cfocus_controller(self, controller):
         """Configura el controlador C-Focus para lectura de Z en tiempo real."""
         self.cfocus_controller = controller
         logger.info("[CameraWindow] C-Focus controller configurado para lectura Z en tiempo real")
+
+    def set_center_geometry(
+        self,
+        fov_x_um: float,
+        fov_y_um: float,
+        sign_x: int = 1,
+        sign_y: int = 1,
+    ) -> None:
+        """FOV y signos para el overlay Δpx / Δµm del vector al centro."""
+        self._fov_x_um = float(fov_x_um or 0.0)
+        self._fov_y_um = float(fov_y_um or 0.0)
+        self._center_sign_x = 1 if int(sign_x) >= 0 else -1
+        self._center_sign_y = 1 if int(sign_y) >= 0 else -1
+
+    @staticmethod
+    def _box_centroid_px(box: dict):
+        centroid = box.get("centroid") if isinstance(box, dict) else None
+        if centroid is not None and len(centroid) >= 2:
+            return float(centroid[0]), float(centroid[1])
+        bbox = box.get("bbox") if isinstance(box, dict) else None
+        if bbox is None or len(bbox) < 4:
+            return None
+        x, y, bw, bh = bbox
+        return float(x) + float(bw) / 2.0, float(y) + float(bh) / 2.0
+
+    @staticmethod
+    def _draw_cross(painter, x: int, y: int, arm: int = 10) -> None:
+        painter.drawLine(x - arm, y, x + arm, y)
+        painter.drawLine(x, y - arm, x, y + arm)
+
+    def _draw_error_vector(self, painter, orig_w, orig_h, scale_x, scale_y) -> None:
+        """Cruz en centro de imagen, cruz en centroide, línea Δ y texto."""
+        from PyQt5.QtGui import QPen, QColor, QFont, QBrush
+
+        from core.autofocus.center_candidate import (
+            pixel_offset_from_center,
+            pixel_offset_to_stage_um,
+        )
+
+        boxes = (self.detection_result or {}).get("boxes") or []
+        if orig_w <= 0 or orig_h <= 0 or not boxes:
+            return
+        locked = [b for b in boxes if b.get("locked")]
+        primary = locked[0] if locked else boxes[0]
+        centroid = self._box_centroid_px(primary)
+        if centroid is None:
+            return
+        cx, cy = centroid
+        dpx_x, dpx_y, _dpx = pixel_offset_from_center(cx, cy, orig_w, orig_h)
+        cix, ciy = float(orig_w) / 2.0, float(orig_h) / 2.0
+        ix = int(round(cix * scale_x))
+        iy = int(round(ciy * scale_y))
+        ox = int(round(cx * scale_x))
+        oy = int(round(cy * scale_y))
+
+        painter.setBrush(QBrush(QColor(0, 220, 255, 180)))
+        painter.setPen(QPen(QColor(0, 220, 255), 2))
+        painter.drawEllipse(ix - 5, iy - 5, 10, 10)
+        self._draw_cross(painter, ix, iy, 12)
+
+        painter.setBrush(QBrush(QColor(255, 80, 220, 180)))
+        painter.setPen(QPen(QColor(255, 80, 220), 2))
+        painter.drawEllipse(ox - 5, oy - 5, 10, 10)
+        self._draw_cross(painter, ox, oy, 10)
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 180, 40), 2))
+        painter.drawLine(ox, oy, ix, iy)
+
+        dx_um = dy_um = None
+        if self._fov_x_um > 0.0 and self._fov_y_um > 0.0:
+            dx_um, dy_um = pixel_offset_to_stage_um(
+                dpx_x,
+                dpx_y,
+                orig_w,
+                orig_h,
+                self._fov_x_um,
+                self._fov_y_um,
+                sign_x=self._center_sign_x,
+                sign_y=self._center_sign_y,
+            )
+        painter.setFont(QFont("Arial", 11, QFont.Bold))
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        if dx_um is not None:
+            label = (
+                f"Δpx=({dpx_x:+.0f},{dpx_y:+.0f})  "
+                f"Δµm=({dx_um:+.1f},{dy_um:+.1f})"
+            )
+        else:
+            label = f"Δpx=({dpx_x:+.0f},{dpx_y:+.0f})"
+        painter.drawText(12, 98, label)
     
     def _draw_overlay_on_qimage(self, q_image):
         """Dibuja overlay A COLOR sobre QImage usando QPainter.
@@ -549,6 +643,7 @@ class CameraViewWindow(QWidget):
                 result = q_image.copy()
             
             painter = QPainter(result)
+            orig_w = orig_h = scale_x = scale_y = None
             
             # Dibujar overlays de detección solo si hay detection_result
             if self.detection_result is not None:
@@ -586,8 +681,10 @@ class CameraViewWindow(QWidget):
                         x, y = int(x * scale_x), int(y * scale_y)
                         bw, bh = int(bw * scale_x), int(bh * scale_y)
                         
-                        # AZUL si está seleccionado, sino color según filtro
-                        if self.selected_object_index is not None and i == self.selected_object_index:
+                        # Magenta = candidato lockeado del servo; azul = seleccionado.
+                        if box.get("locked"):
+                            pen = QPen(QColor(255, 80, 220), 3)
+                        elif self.selected_object_index is not None and i == self.selected_object_index:
                             pen = QPen(QColor(50, 150, 255), 4)  # AZUL BRILLANTE, grosor 4
                         else:
                             # Color según si está en rango: Verde=en rango, Rojo=fuera
@@ -608,27 +705,32 @@ class CameraViewWindow(QWidget):
                         if in_range:
                             label += " ✓"
                         painter.drawText(x + 2, y - 5, label)
-                
-                # Mostrar info general en esquina
-                n_obj = self.detection_result.get('n_objects', 0)
-                if n_obj > 0:
-                    painter.setPen(QPen(QColor(255, 255, 255)))
-                    painter.drawText(10, 20, f"Objetos: {n_obj}")
             
             # OVERLAY DE SCORE SIEMPRE VISIBLE (esquina superior izquierda, ROJO)
             # Fondo semi-transparente para mejor legibilidad
             painter.setBrush(QColor(0, 0, 0, 200))
             painter.setPen(Qt.NoPen)
-            painter.drawRect(5, 5, 280, 75)
+            painter.drawRect(5, 5, 430, 110)
             
             # Texto en ROJO GRANDE para Z y Score
             font_large = QFont("Arial", 22, QFont.Bold)
             painter.setFont(font_large)
             painter.setPen(QPen(QColor(255, 50, 50)))  # Rojo brillante
             
-            # Z siempre visible; S solo durante autofoco (no se calcula en vivo)
             painter.drawText(12, 35, f"Z: {self.current_z_position:.1f} µm")
-            s_text = f"S: {self.current_focus_score:.1f}" if self.autofocus_active else "S: --"
+            roi_score = None
+            boxes = (self.detection_result or {}).get("boxes") or []
+            if boxes:
+                try:
+                    roi_score = float(boxes[0].get("score"))
+                except (TypeError, ValueError, AttributeError):
+                    roi_score = 0.0
+            if self.autofocus_active or abs(float(self.current_focus_score or 0.0)) > 1e-9:
+                s_text = f"S: {self.current_focus_score:.1f}"
+            elif roi_score is not None:
+                s_text = f"S: {roi_score:.1f}"
+            else:
+                s_text = "S: --"
             painter.drawText(12, 65, s_text)
             
             # Indicador de estado de autofoco (pequeño, a la derecha)
@@ -637,6 +739,14 @@ class CameraViewWindow(QWidget):
                 painter.setFont(font_small)
                 painter.setPen(QPen(QColor(50, 255, 50)))  # Verde
                 painter.drawText(200, 20, "● AF")
+
+            if orig_w and orig_h:
+                self._draw_error_vector(painter, orig_w, orig_h, scale_x, scale_y)
+                n_obj = (self.detection_result or {}).get("n_objects", 0)
+                if n_obj:
+                    painter.setPen(QPen(QColor(255, 255, 255)))
+                    painter.setFont(QFont("Arial", 10, QFont.Bold))
+                    painter.drawText(12, 118, f"Objetos: {n_obj}")
             
             painter.end()
             return result
@@ -726,7 +836,9 @@ class CameraViewWindow(QWidget):
                 'area': obj.area,
                 'score': getattr(obj, 'focus_score', 0),
                 'is_focused': getattr(obj, 'is_focused', False),
-                'in_filter_range': True  # SAM detecta todo, sin filtro
+                'in_filter_range': True,  # SAM detecta todo, sin filtro
+                'centroid': getattr(obj, 'centroid', None),
+                'locked': bool(getattr(obj, "_center_locked", False)),
             })
             
             # Extraer contorno si está disponible
@@ -811,7 +923,8 @@ class CameraViewWindow(QWidget):
                 'area': obj.get('area', 0),
                 'score': obj.get('score', 0),
                 'is_focused': obj.get('is_focused', False),
-                'in_filter_range': True  # Durante autofoco, todos son válidos
+                'in_filter_range': True,  # Durante autofoco, todos son válidos
+                'centroid': obj.get('centroid'),
             })
         
         # Actualizar detection_result para mostrar overlay
@@ -852,9 +965,10 @@ class CameraViewWindow(QWidget):
             boxes.append({
                 'bbox': (x, y, w, h),
                 'area': w * h,
-                'score': 0,
+                'score': float(roi.get('score', 0) or 0) if isinstance(roi, dict) else 0,
                 'is_focused': False,
-                'in_filter_range': True
+                'in_filter_range': True,
+                'centroid': roi.get('centroid') if isinstance(roi, dict) else None,
             })
             contour = roi.get('contour')
             if contour is not None and len(contour) > 1:

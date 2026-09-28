@@ -37,6 +37,23 @@ from core.canvas.capture_position import (
     save_position_sidecar,
 )
 from core.control.step_config import load_step_control_config
+from core.autofocus.center_candidate import (
+    DEFAULT_CENTER_ENABLED,
+    DEFAULT_HYSTERESIS_PX,
+    DEFAULT_HYSTERESIS_UM,
+    DEFAULT_MAX_DELTA_UM,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_SIGN_X,
+    DEFAULT_SIGN_Y,
+    FORCE_CENTER_PX,
+    can_start_zscan,
+    object_bbox,
+    object_centroid_px,
+    pixel_offset_from_center,
+    predict_static_window_clip,
+    roi_frame_margin_px,
+)
+from core.autofocus.center_then_af import CenterContext, CenterResult, CenterThenAf
 from utils.microscopy_filename import (
     build_multifocal_filename,
     build_point_basename,
@@ -120,6 +137,28 @@ class MicroscopyService(QObject):
         self._trajectory_tolerance = 25.0
         self._trajectory_pause = 2.0
         self._point_timeout_s = 6.0
+        self._fov_x_um = 0.0
+        self._fov_y_um = 0.0
+        self._workspace_xy = None  # (x_min, x_max, y_min, y_max)
+        self._point_t0_mono = 0.0
+        self._center_pending = None
+        self._last_center_kpi = {}
+        self._t_detect_s = None
+        self._capture_settle_ms = 500
+        
+        self._center_runner = CenterThenAf(
+            parent=self,
+            test_service=test_service,
+            grab_bgr_frame=self._grab_bgr_frame,
+            filter_objects=self._filter_detected_objects,
+            still_valid=lambda: self._state_manager.is_active,
+            log_prefix="[MicroscopyService]",
+        )
+        self._center_runner.set_scorer(lambda: self._smart_focus_scorer)
+        self._center_runner.completed.connect(self._on_center_runner_completed)
+        self._center_runner.status_message.connect(self.status_changed)
+        self._center_runner.sign_changed.connect(self._on_center_sign_changed)
+        self._center_runner.overlay_update.connect(self._on_center_overlay)
         
         # Estado temporal para aprendizaje asistido
         self._pending_object = None
@@ -144,6 +183,23 @@ class MicroscopyService(QObject):
         except Exception:
             pass
         self._resume_hooks_connected = True
+
+    def _bind_test_service_point_signals(self) -> None:
+        if not self._test_service:
+            return
+        try:
+            self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
+        except Exception:
+            pass
+        self._test_service.trajectory_point_reached.connect(self._on_test_point_reached)
+
+    def _unbind_test_service_point_signals(self) -> None:
+        if not self._test_service:
+            return
+        try:
+            self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
+        except Exception:
+            pass
 
     def _on_trajectory_error_during_microscopy(self, message: str) -> None:
         """Log de error FOV; la reanudación se arma en trajectory_stopped."""
@@ -192,9 +248,7 @@ class MicroscopyService(QObject):
         try:
             if self._test_service is not None:
                 try:
-                    self._test_service.trajectory_point_reached.disconnect(
-                        self._on_test_point_reached
-                    )
+                    self._unbind_test_service_point_signals()
                 except Exception:
                     pass
                 if getattr(self._test_service, "_trajectory_active", False):
@@ -302,6 +356,15 @@ class MicroscopyService(QObject):
         else:
             self._trajectory_tolerance = max(1.0, tol_ui)
 
+        self._fov_x_um = float(fov_x)
+        self._fov_y_um = float(fov_y)
+        try:
+            xs = [float(p[0]) for p in trajectory]
+            ys = [float(p[1]) for p in trajectory]
+            self._workspace_xy = (min(xs), max(xs), min(ys), max(ys))
+        except (TypeError, ValueError, IndexError):
+            self._workspace_xy = None
+
         logger.info(
             "[MicroscopyService] ✓ Tolerancia: %.1fµm (UI=%.1f), Pausa: %.1fs, "
             "FOV=%.0f×%.0fµm",
@@ -349,6 +412,7 @@ class MicroscopyService(QObject):
         self._delay_before_ms = int(config.get('delay_before', 2.0) * 1000)
         self._delay_after_ms = int(config.get('delay_after', 0.2) * 1000)
         step_cfg = load_step_control_config()
+        self._capture_settle_ms = int(getattr(step_cfg, "t_capture_settle_ms", 500) or 500)
         if step_cfg.enabled:
             self._delay_before_ms = max(self._delay_before_ms, int(step_cfg.t_capture_settle_ms))
 
@@ -401,11 +465,7 @@ class MicroscopyService(QObject):
         self._connect_resume_hooks()
 
         # Conectar señal para recibir notificación cuando llegue a cada punto
-        try:
-            self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
-        except Exception:
-            pass
-        self._test_service.trajectory_point_reached.connect(self._on_test_point_reached)
+        self._bind_test_service_point_signals()
         
         # Iniciar trayectoria completa (TestService maneja TODO el control)
         # pause_s reducido a 0.1s porque solo necesita settling, no operaciones
@@ -444,13 +504,11 @@ class MicroscopyService(QObject):
             except Exception as e:
                 logger.warning("[MicroscopyService] cancel autofoco: %s", e)
 
+        if getattr(self, "_center_runner", None) is not None:
+            self._center_runner.cancel()
+
         if self._test_service is not None:
-            try:
-                self._test_service.trajectory_point_reached.disconnect(
-                    self._on_test_point_reached
-                )
-            except Exception:
-                pass
+            self._unbind_test_service_point_signals()
             # Único productor de halt vía TestService (cubre traj + dual + MCU).
             try:
                 self._test_service.halt_motion("stop_microscopy")
@@ -474,6 +532,10 @@ class MicroscopyService(QObject):
     def is_running(self) -> bool:
         """Indica si hay una secuencia de microscopía activa."""
         return self._state_manager.is_active
+
+    def is_centering(self) -> bool:
+        runner = getattr(self, "_center_runner", None)
+        return bool(runner is not None and runner.is_pending())
 
     # ------------------------------------------------------------------
     # Flujo interno de microscopia
@@ -518,12 +580,7 @@ class MicroscopyService(QObject):
             single_point_trajectory = [(x_target, y_target)]
             
             # Conectar señal para saber cuándo llegó
-            try:
-                self._test_service.trajectory_point_reached.disconnect(self._on_test_point_reached)
-            except:
-                pass
-            
-            self._test_service.trajectory_point_reached.connect(self._on_test_point_reached)
+            self._bind_test_service_point_signals()
             
             # Iniciar movimiento con TestService
             # Usamos una pausa mínima aquí (0.1s) porque nosotros manejamos el delay_before después
@@ -563,6 +620,10 @@ class MicroscopyService(QObject):
 
         n = idx + 1
         total = self._state_manager.total_points
+        self._point_t0_mono = time.perf_counter()
+        self._center_pending = None
+        self._last_center_kpi = {}
+        self._t_detect_s = None
         logger.info(f"[MicroscopyService] Punto {n}/{total} alcanzado: ({x:.1f}, {y:.1f}) {status}")
         logger.info(f"[MicroscopyService] TestService PAUSADO - ejecutando detección")
         
@@ -730,6 +791,7 @@ class MicroscopyService(QObject):
                     "[MicroscopyService] No se pudo reaplicar filtros al scorer: %s", e
                 )
 
+        detect_t0 = time.perf_counter()
         self.status_changed.emit("🔍 Detectando objetos...")
         result = self._smart_focus_scorer.assess_image(frame_bgr)
         all_objects = result.objects if result.objects else []
@@ -780,6 +842,7 @@ class MicroscopyService(QObject):
             )
 
         objects = objects_filtered
+        self._t_detect_s = time.perf_counter() - detect_t0
         n_objects = len(objects)
         learning_active = (
             self._state_manager.learning_mode and not self._state_manager.learning_completed
@@ -814,6 +877,7 @@ class MicroscopyService(QObject):
                 self._state_manager.current_point,
                 len(all_objects),
             )
+            self._emit_t_punto(skipped=True)
             self._state_manager.advance_point()
             self._state_manager.reset_position_checks()
             self.progress_changed.emit(
@@ -839,10 +903,12 @@ class MicroscopyService(QObject):
         largest_object = max(objects, key=lambda obj: obj.area)
 
         if learning_active:
+            # v1: no mezclar jog XY con el diálogo de confirmación.
+            self._apply_center_skip_kpi("learning", largest_object, frame_bgr)
             self._request_learning_confirmation(frame_bgr, largest_object)
             return
 
-        self._proceed_with_capture(largest_object)
+        self._maybe_center_then_capture(largest_object, frame_bgr)
 
     @staticmethod
     def _object_circularity(obj) -> float:
@@ -876,6 +942,260 @@ class MicroscopyService(QObject):
             return 1.0
         aspect = float(w) / float(h)
         return aspect if aspect <= 1.0 else 1.0 / aspect
+
+    def _center_config(self) -> dict:
+        cfg = self._microscopy_config or {}
+        enabled = cfg.get("center_candidate_enabled")
+        if enabled is None:
+            enabled = DEFAULT_CENTER_ENABLED
+        return {
+            "enabled": bool(enabled),
+            "hysteresis_um": float(
+                cfg.get("center_hysteresis_um", DEFAULT_HYSTERESIS_UM) or DEFAULT_HYSTERESIS_UM
+            ),
+            "hysteresis_px": float(
+                cfg.get("center_hysteresis_px", DEFAULT_HYSTERESIS_PX) or DEFAULT_HYSTERESIS_PX
+            ),
+            "max_retries": int(cfg.get("center_max_retries", DEFAULT_MAX_RETRIES) or 0),
+            "max_delta_um": float(
+                cfg.get("center_max_delta_um", DEFAULT_MAX_DELTA_UM) or 0.0
+            ),
+            "sign_x": int(cfg.get("center_sign_x", DEFAULT_SIGN_X) or DEFAULT_SIGN_X),
+            "sign_y": int(cfg.get("center_sign_y", DEFAULT_SIGN_Y) or DEFAULT_SIGN_Y),
+        }
+
+    def _on_center_sign_changed(self, sign_x: int, sign_y: int) -> None:
+        sx = 1 if int(sign_x) >= 0 else -1
+        sy = 1 if int(sign_y) >= 0 else -1
+        if self._microscopy_config is None:
+            self._microscopy_config = {}
+        self._microscopy_config["center_sign_x"] = sx
+        self._microscopy_config["center_sign_y"] = sy
+        logger.info(
+            "[MicroscopyService] AF_CENTER sign_flip persistido sign=(%+d,%+d)",
+            sx,
+            sy,
+        )
+
+    def _stage_xy_um(self) -> Tuple[float, float]:
+        idx = int(self._state_manager.current_point)
+        x_nom, y_nom = self._get_point_xy_um(idx)
+        if self._test_service is None:
+            return x_nom, y_nom
+        x_act, y_act, _ex, _ey = self._test_service.read_current_position_um(x_nom, y_nom)
+        return (
+            float(x_act) if x_act is not None else x_nom,
+            float(y_act) if y_act is not None else y_nom,
+        )
+
+    def _roi_pad_px(self) -> int:
+        af = self._autofocus_service
+        if af is not None:
+            return int(getattr(af, "roi_margin", 20) or 0)
+        cfg = self._microscopy_config or {}
+        return int(cfg.get("roi_margin_px", 20) or 0)
+
+    def _frame_wh(self, frame) -> Tuple[int, int]:
+        h, w = int(frame.shape[0]), int(frame.shape[1])
+        return w, h
+
+    def _log_af_center(self, kpi_fields: dict, extra: str = "") -> None:
+        from core.autofocus.af_kpi import AfCycleKpi
+
+        kpi = AfCycleKpi(
+            point_index=int(self._state_manager.current_point),
+            t_detect=self._t_detect_s,
+        )
+        for key, value in kpi_fields.items():
+            if hasattr(kpi, key):
+                setattr(kpi, key, value)
+        line = kpi.format_center_line()
+        if extra:
+            line = f"{line} {extra}"
+        logger.info("[MicroscopyService] %s", line)
+        self.status_changed.emit(line)
+
+    def _center_kpi_from_obj(self, obj, frame, reason: str, **overrides) -> dict:
+        centroid = object_centroid_px(obj) or (0.0, 0.0)
+        bbox = object_bbox(obj) or (0.0, 0.0, 0.0, 0.0)
+        fw, fh = self._frame_wh(frame)
+        _ex, _ey, e_px = pixel_offset_from_center(centroid[0], centroid[1], fw, fh)
+        would_clip, _w = predict_static_window_clip(bbox, fw, fh, self._roi_pad_px())
+        fields = {
+            "xy_offset_pre_px": float(e_px),
+            "center_attempted": False,
+            "center_success": reason == "already_centered",
+            "center_skipped": reason not in ("already_centered", "jog"),
+            "center_skip_reason": reason,
+            "roi_clipped": bool(would_clip),
+            "roi_frame_margin_px": roi_frame_margin_px(bbox, fw, fh),
+            "t_detect": self._t_detect_s,
+        }
+        fields.update(overrides)
+        return fields
+
+    def _apply_center_skip_kpi(self, reason: str, obj, frame) -> None:
+        fields = self._center_kpi_from_obj(obj, frame, reason)
+        self._last_center_kpi = fields
+        self._log_af_center(fields)
+
+    def _skip_point_resume_trajectory(self, reason: str) -> None:
+        """Salta AF y reanuda la malla al siguiente XY_nom. No inventa ROI."""
+        n = int(self._state_manager.current_point) + 1
+        total = int(self._state_manager.total_points)
+        logger.info(
+            "[MicroscopyService] Skip AF punto %d/%d: %s — siguiente es XY_nom de malla",
+            n,
+            total,
+            reason,
+        )
+        self.status_changed.emit(f"[{n}/{total}] ⏭️ Skip AF ({reason})")
+        self._emit_t_punto(skipped=True)
+        self._center_pending = None
+        self._state_manager.advance_point()
+        self.progress_changed.emit(
+            self._state_manager.current_point, self._state_manager.total_points
+        )
+        if self._test_service:
+            if hasattr(self._test_service, "clear_center_jog"):
+                self._test_service.clear_center_jog()
+            self._test_service.resume_trajectory()
+
+    def _resume_test_service(self) -> None:
+        """Alias del skip sin AF (ruta sin frame / abortos)."""
+        self._skip_point_resume_trajectory("resume_alias")
+
+    def _emit_t_punto(self, skipped: bool = False) -> None:
+        if self._point_t0_mono <= 0.0:
+            return
+        t_punto = time.perf_counter() - self._point_t0_mono
+        from core.autofocus.af_kpi import AfCycleKpi
+
+        kpi = AfCycleKpi(
+            point_index=int(self._state_manager.current_point),
+            t_punto=t_punto,
+            t_detect=self._t_detect_s,
+            t_center_xy=(self._last_center_kpi or {}).get("t_center_xy"),
+            center_success=(self._last_center_kpi or {}).get("center_success"),
+        )
+        suffix = " skipped=1" if skipped else ""
+        logger.info("[MicroscopyService] %s%s", kpi.format_point_line(), suffix)
+
+    def _filter_detected_objects(self, all_objects: list) -> list:
+        cfg = self._microscopy_config or {}
+        min_area = int(cfg.get("min_pixels", 0) or 0)
+        max_area = int(cfg.get("max_pixels", 1e9) or 1e9)
+        min_circularity = float(cfg.get("min_circularity", 0.45) or 0.0)
+        min_aspect_ratio = float(cfg.get("min_aspect_ratio", 0.4) or 0.0)
+        kept = []
+        for obj in all_objects or []:
+            if not (min_area <= float(getattr(obj, "area", 0) or 0) <= max_area):
+                continue
+            if self._object_circularity(obj) < min_circularity:
+                continue
+            if self._object_aspect_ratio(obj) < min_aspect_ratio:
+                continue
+            kept.append(obj)
+        return kept
+
+    def _grab_bgr_frame(self):
+        frame = self._get_current_frame() if self._get_current_frame else None
+        if frame is None:
+            return None
+        if frame.dtype == np.uint16:
+            frame_max = frame.max()
+            if frame_max > 0:
+                frame_uint8 = (frame / frame_max * 255).astype(np.uint8)
+            else:
+                frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
+        else:
+            frame_uint8 = frame.astype(np.uint8)
+        if len(frame_uint8.shape) == 2:
+            return cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
+        return frame_uint8
+
+    def _maybe_center_then_capture(self, largest_object, frame_bgr) -> None:
+        """Gancho post-detección / pre-AF: jog XY si el candidato no está centrado.
+
+        pause_xy_for_capture ocurre después, en ``_proceed_with_capture``.
+        Delegado a ``CenterThenAf`` (mismo contrato que el AF manual).
+        """
+        cfg = self._center_config()
+        stage_x, stage_y = self._stage_xy_um()
+        has_stage = bool(
+            self._test_service is not None
+            and (
+                hasattr(self._test_service, "goto_xy_um")
+                or hasattr(self._test_service, "start_center_jog")
+            )
+        )
+        ctx = CenterContext(
+            enabled=bool(cfg["enabled"]),
+            fov_x_um=float(self._fov_x_um),
+            fov_y_um=float(self._fov_y_um),
+            hysteresis_um=float(cfg["hysteresis_um"]),
+            hysteresis_px=float(cfg["hysteresis_px"]),
+            max_retries=int(cfg["max_retries"]),
+            max_delta_um=float(cfg["max_delta_um"]),
+            sign_x=int(cfg["sign_x"]),
+            sign_y=int(cfg["sign_y"]),
+            pad_px=self._roi_pad_px(),
+            stage_x_um=float(stage_x),
+            stage_y_um=float(stage_y),
+            workspace=self._workspace_xy,
+            settle_ms=int(self._capture_settle_ms),
+            point_index=int(self._state_manager.current_point),
+            t_detect_s=self._t_detect_s,
+            log_prefix="[MicroscopyService]",
+            has_stage=has_stage,
+            point_timeout_s=float(self._point_timeout_s),
+        )
+        self._center_runner.bind_test_service(self._test_service)
+        self._center_runner.begin([largest_object], frame_bgr, ctx)
+
+    def _on_center_overlay(self, objects) -> None:
+        objs = list(objects or [])
+        if objs:
+            self.detection_complete.emit(objs)
+
+    def _on_center_runner_completed(self, result: CenterResult) -> None:
+        if not self._state_manager.is_active:
+            return
+        self._last_center_kpi = dict(result.kpi or {})
+        self._center_pending = None
+        primary = result.primary
+        objects = list(result.objects or [])
+        if not objects and primary is not None:
+            objects = [primary]
+        if primary is None and objects:
+            primary = objects[0]
+        residual = (result.kpi or {}).get("xy_offset_post_px")
+        tau = float((result.kpi or {}).get("tau_px") or FORCE_CENTER_PX)
+        if not can_start_zscan(
+            action=result.action,
+            reason=result.reason,
+            center_attempted=bool((result.kpi or {}).get("center_attempted")),
+            residual_px=residual if residual is not None else None,
+            tau_px=tau,
+            objects_found=bool(objects),
+        ):
+            logger.warning(
+                "[MicroscopyService] NO Z-scan: reason=%s objects=%d residual=%s",
+                result.reason,
+                len(objects),
+                residual,
+            )
+            self.status_changed.emit(
+                f"❌ NO Z-scan ({result.reason}): sin objeto o lost_lock"
+            )
+            self._skip_point_resume_trajectory(result.reason or "no_object")
+            return
+        if primary is None:
+            self._skip_point_resume_trajectory("redetect_fail")
+            return
+        self._show_autofocus_masks([primary])
+        self.detection_complete.emit([primary])
+        self._proceed_with_capture(primary)
 
     def _request_learning_confirmation(self, frame_bgr: np.ndarray, largest_object) -> None:
         """Pausa XY y pide confirmación de ROI al usuario (modo aprendizaje)."""
@@ -1119,6 +1439,10 @@ class MicroscopyService(QObject):
         )
 
         self._autofocus_service.microscopy_mode = True
+        self._autofocus_service._pending_point_index = int(
+            self._state_manager.current_point
+        )
+        self._autofocus_service._pending_center_kpi = dict(self._last_center_kpi or {})
         started = self._autofocus_service.start_autofocus([obj])
         if not started:
             self._autofocus_service.microscopy_mode = False
@@ -1215,6 +1539,7 @@ class MicroscopyService(QObject):
             success = False
             n_captures = 0
             point_idx = self._state_manager.current_point
+            save_t0 = time.perf_counter()
 
             if results and len(results) > 0:
                 result = results[0]
@@ -1248,6 +1573,19 @@ class MicroscopyService(QObject):
                 logger.warning(
                     "[MicroscopyService] Sin frames en resultado de autofoco"
                 )
+
+            t_save = time.perf_counter() - save_t0
+            kpi = getattr(self._autofocus_service, "_cycle_kpi", None)
+            if kpi is not None:
+                kpi.t_save = float(t_save)
+                if self._point_t0_mono > 0.0:
+                    kpi.t_punto = time.perf_counter() - self._point_t0_mono
+                if self._t_detect_s is not None:
+                    kpi.t_detect = float(self._t_detect_s)
+                center = self._last_center_kpi or {}
+                if center.get("t_center_xy") is not None:
+                    kpi.t_center_xy = float(center["t_center_xy"])
+                logger.info("[MicroscopyService] %s", kpi.format_point_line())
 
             # Verificación redundante de seguridad: AutofocusService ya volvió
             # al origen después de adquirir el stack y antes de entregar frames.
@@ -1310,7 +1648,7 @@ class MicroscopyService(QObject):
         snapshot,
     ) -> CapturePositionMetadata:
         if snapshot is None:
-            return position
+            return self._apply_center_to_position(position)
         if snapshot.n_steps or snapshot.point_steps:
             position.n_steps = snapshot.n_steps
             position.t_move_ms = snapshot.t_move_ms
@@ -1319,6 +1657,25 @@ class MicroscopyService(QObject):
         position.fov_verify_passed = bool(getattr(snapshot, "fov_verify_passed", False))
         position.t_fov_verify_ms = float(getattr(snapshot, "t_fov_verify_ms", 0.0))
         position.fov_verify_ticks = int(getattr(snapshot, "fov_verify_ticks", 0))
+        return self._apply_center_to_position(position)
+
+    def _apply_center_to_position(
+        self, position: CapturePositionMetadata
+    ) -> CapturePositionMetadata:
+        """XY_efectivo = sensor post-jog; XY_nom sigue siendo la malla."""
+        position.x_effective_um = float(position.x_actual_um)
+        position.y_effective_um = float(position.y_actual_um)
+        center = self._last_center_kpi or {}
+        if center:
+            position.center_attempted = bool(center.get("center_attempted", False))
+            position.center_success = bool(center.get("center_success", False))
+            position.center_skip_reason = str(center.get("center_skip_reason") or "")
+            if center.get("xy_offset_pre_px") is not None:
+                position.xy_offset_pre_px = float(center["xy_offset_pre_px"])
+            if center.get("xy_offset_post_px") is not None:
+                position.xy_offset_post_px = float(center["xy_offset_post_px"])
+            if center.get("xy_offset_post_um") is not None:
+                position.xy_offset_post_um = float(center["xy_offset_post_um"])
         return position
 
     def _build_capture_position(self, image_index: int) -> CapturePositionMetadata:
@@ -1358,7 +1715,9 @@ class MicroscopyService(QObject):
             )
             return self._apply_step_metadata(pos, snapshot)
 
-        return CapturePositionMetadata.from_nominal_only(x_nom, y_nom)
+        return self._apply_center_to_position(
+            CapturePositionMetadata.from_nominal_only(x_nom, y_nom)
+        )
 
     def _persist_capture_position(
         self,
@@ -1614,6 +1973,12 @@ class MicroscopyService(QObject):
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
             }
             meta = merge_position_into_focus_dict(meta, position)
+            meta["x_nominal_um"] = round(float(position.x_nominal_um), 3)
+            meta["y_nominal_um"] = round(float(position.y_nominal_um), 3)
+            if position.x_effective_um is not None:
+                meta["x_effective_um"] = round(float(position.x_effective_um), 3)
+            if position.y_effective_um is not None:
+                meta["y_effective_um"] = round(float(position.y_effective_um), 3)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, ensure_ascii=False)
             logger.info(f"[MicroscopyService] Metadatos de enfoque: {meta_path}")
@@ -1867,12 +2232,7 @@ class MicroscopyService(QObject):
         self._state_manager.complete()
 
         if self._test_service is not None:
-            try:
-                self._test_service.trajectory_point_reached.disconnect(
-                    self._on_test_point_reached
-                )
-            except Exception:
-                pass
+            self._unbind_test_service_point_signals()
             try:
                 if self._test_service.is_trajectory_active():
                     self._test_service.stop_trajectory()

@@ -648,7 +648,37 @@ def create_autofocus_section(widgets: dict, connect_cb, disconnect_cb,
         "El botón 'Enfocar' ejecuta autofoco manual en cualquier momento."
     )
     layout.addWidget(widgets['autofocus_enabled_cb'])
-    
+
+    widgets['center_candidate_cb'] = QCheckBox(
+        "Centrar candidato XY antes del AF"
+    )
+    widgets['center_candidate_cb'].setChecked(True)
+    widgets['center_candidate_cb'].setToolTip(
+        "Tras detectar el objeto más grande, un jog XY lo trae al centro\n"
+        "del FOV (escala fov/frame, no pixel_size_um del sensor) y se\n"
+        "re-detecta antes del barrido Z. Evita S=0 por ROI clampado al borde.\n"
+        "La malla zig-zag no se muta: el siguiente punto sigue siendo XY_nom.\n"
+        "Desmarcar para probar el sistema sin jog."
+    )
+    layout.addWidget(widgets['center_candidate_cb'])
+
+    center_row = QHBoxLayout()
+    center_row.addWidget(QLabel("Histéresis centrado:"))
+    widgets['center_hysteresis_um_spin'] = QDoubleSpinBox()
+    widgets['center_hysteresis_um_spin'].setRange(1.0, 200.0)
+    widgets['center_hysteresis_um_spin'].setValue(12.0)
+    widgets['center_hysteresis_um_spin'].setSuffix(" µm")
+    widgets['center_hysteresis_um_spin'].setDecimals(1)
+    widgets['center_hysteresis_um_spin'].setSingleStep(1.0)
+    widgets['center_hysteresis_um_spin'].setToolTip(
+        "No recentrar si el offset del centroide es menor que este umbral\n"
+        "(y no hay riesgo de clamp del ROI). Referencia: tol. trayectoria ~12 µm."
+    )
+    widgets['center_hysteresis_um_spin'].setFixedWidth(110)
+    center_row.addWidget(widgets['center_hysteresis_um_spin'])
+    center_row.addStretch()
+    layout.addLayout(center_row)
+
     # Botones de conexión C-Focus
     btn_layout = QHBoxLayout()
     widgets['cfocus_connect_btn'] = QPushButton("🔌 Conectar C-Focus")

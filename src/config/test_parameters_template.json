@@ -3,7 +3,7 @@
   "title": "Test Parameters Auto-Fill Template",
   "description": "Formulario de autocompletado para mantener tests homogéneos. Siempre se actualizan con los últimos valores ingresados.",
   "version": "1.0.0",
-  "last_updated": "2026-08-18T12:20:14.220343",
+  "last_updated": "2026-08-18T18:36:40.173059",
   "trajectory": {
     "description": "Parámetros de generación de trayectoria",
     "points": 1344,
@@ -148,7 +148,7 @@
     },
     "microscopy": {
       "class_name": "ERIKA-POBLETE",
-      "xy_only": false,
+      "xy_only": true,
       "img_width": 2590,
       "img_height": 1942,
       "save_folder": "F:\\MICROSCOPIA\\MIELES\\Miel_006_ERIKA-POBLETE\\SAMPLE_002",
@@ -163,10 +163,10 @@
     "autofocus": {
       "enabled": true,
       "full_scan": true,
-      "min_pixels": 35000,
-      "max_pixels": 800000,
-      "min_circularity": 0.55,
-      "min_aspect_ratio": 0.5,
+      "min_pixels": 100,
+      "max_pixels": 5000000,
+      "min_circularity": 0.15,
+      "min_aspect_ratio": 0.15,
       "z_scan_range_um": 22.0,
       "z_step_coarse_um": 3.0,
       "z_step_fine_um": 1.0,
@@ -174,14 +174,22 @@
       "capture_s_drop_percent": 8.5,
       "n_fine_planes": 7,
       "z_arrive_tol_um": 0.5,
-      "roi_margin_px": 5
+      "roi_margin_px": 5,
+      "center_candidate_enabled": true,
+      "center_hysteresis_um": 6.0,
+      "center_hysteresis_px": 40.0,
+      "center_max_retries": 8,
+      "center_max_delta_um": 0.0,
+      "center_sign_x": 1,
+      "center_sign_y": -1,
+      "center_delta_toward_image": true
     },
     "u2net": {
       "detection_mode": "Sensible (Polen)",
       "saliency_threshold": 0.15,
-      "adaptive_k": 0.5,
+      "adaptive_k": 0.3,
       "morph_kernel": "3×3 (Sensible)",
-      "clahe_clip": 2.0,
+      "clahe_clip": 3.5,
       "clahe_tile": "4×4 (Detalle)"
     }
   },

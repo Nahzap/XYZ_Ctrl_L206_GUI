@@ -87,6 +87,30 @@ class AfCycleKpi:
     delta_s_stack: Optional[float] = None
     stack_asymmetry: Optional[float] = None
 
+    # --- Join con trayectoria (0-based = MicroscopyService.current_point) ---
+    # POINT_METRICS idx es 1-based (= point_index + 1). No mezclar.
+    point_index: Optional[int] = None
+
+    # --- ROI espacial (NO es peak_at_edge / borde Z) ---
+    roi_overflow_count: int = 0
+    roi_overflow_max_px: int = 0
+    inner_pixels_min: Optional[int] = None
+    roi_clipped: Optional[bool] = None
+
+    # --- Bring-to-center XY (pre-AF); también en línea hermana AF_CENTER ---
+    t_detect: Optional[float] = None
+    t_center_xy: Optional[float] = None
+    t_punto: Optional[float] = None
+    xy_offset_pre_px: Optional[float] = None
+    xy_offset_post_px: Optional[float] = None
+    xy_offset_post_um: Optional[float] = None
+    center_attempted: Optional[bool] = None
+    center_success: Optional[bool] = None
+    center_skipped: Optional[bool] = None
+    center_skip_reason: Optional[str] = None
+    roi_frame_margin_px: Optional[float] = None
+    sign_flip_suspect: Optional[bool] = None
+
     @property
     def n_s_measurements(self) -> int:
         """Total de mediciones S del ciclo (lo que realmente cuesta tiempo)."""
@@ -155,7 +179,46 @@ class AfCycleKpi:
             f"e_conf={_fmt(self.eps_confirm, 3)} "
             f"e_foto={_fmt(self.eps_photo, 3)} "
             f"dS_stack={_fmt(self.delta_s_stack, 3)} "
-            f"asim={_fmt(self.stack_asymmetry, 2)}"
+            f"asim={_fmt(self.stack_asymmetry, 2)} "
+            f"idx={self.point_index if self.point_index is not None else 'na'} "
+            f"T_save={_fmt(self.t_save, 2)} "
+            f"ovf={self.roi_overflow_count}/{self.roi_overflow_max_px} "
+            f"inner={self.inner_pixels_min if self.inner_pixels_min is not None else 'na'} "
+            f"roi_clip={_fmt_flag(self.roi_clipped)}"
+        )
+
+    def format_center_line(self) -> str:
+        """Línea hermana de centrado XY. No reutiliza ``borde=`` (eso es Z)."""
+        reason = self.center_skip_reason or "na"
+        return (
+            "AF_CENTER "
+            f"idx={self.point_index if self.point_index is not None else 'na'} "
+            f"e_pre_px={_fmt(self.xy_offset_pre_px, 1)} "
+            f"e_post_px={_fmt(self.xy_offset_post_px, 1)} "
+            f"e_post_um={_fmt(self.xy_offset_post_um, 1)} "
+            f"attempted={_fmt_flag(self.center_attempted)} "
+            f"success={_fmt_flag(self.center_success)} "
+            f"skipped={_fmt_flag(self.center_skipped)} "
+            f"reason={reason} "
+            f"T_detect={_fmt(self.t_detect, 2)} "
+            f"T_center={_fmt(self.t_center_xy, 2)} "
+            f"margin_px={_fmt(self.roi_frame_margin_px, 1)} "
+            f"roi_clip={_fmt_flag(self.roi_clipped)} "
+            f"sign_flip={_fmt_flag(self.sign_flip_suspect)}"
+        )
+
+    def format_point_line(self) -> str:
+        """Join de punto: T_save / T_detect / T_punto correlacionables con idx."""
+        return (
+            "AF_POINT "
+            f"idx={self.point_index if self.point_index is not None else 'na'} "
+            f"T_punto={_fmt(self.t_punto, 2)} "
+            f"T_AF={_fmt(self.t_total, 2)} "
+            f"T_detect={_fmt(self.t_detect, 2)} "
+            f"T_center={_fmt(self.t_center_xy, 2)} "
+            f"T_save={_fmt(self.t_save, 2)} "
+            f"center={_fmt_flag(self.center_success)} "
+            f"ovf={self.roi_overflow_count}/{self.roi_overflow_max_px}"
         )
 
 

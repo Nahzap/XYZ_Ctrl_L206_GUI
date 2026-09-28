@@ -31,6 +31,14 @@ class CapturePositionMetadata:
     fov_verify_passed: bool = False
     t_fov_verify_ms: float = 0.0
     fov_verify_ticks: int = 0
+    x_effective_um: Optional[float] = None
+    y_effective_um: Optional[float] = None
+    center_attempted: bool = False
+    center_success: bool = False
+    center_skip_reason: str = ""
+    xy_offset_pre_px: Optional[float] = None
+    xy_offset_post_px: Optional[float] = None
+    xy_offset_post_um: Optional[float] = None
 
     @property
     def has_actual(self) -> bool:
@@ -66,6 +74,34 @@ class CapturePositionMetadata:
             fov_verify_passed=bool(data.get("fov_verify_passed", False)),
             t_fov_verify_ms=float(data.get("t_fov_verify_ms", 0.0)),
             fov_verify_ticks=int(data.get("fov_verify_ticks", 0)),
+            x_effective_um=(
+                float(data["x_effective_um"])
+                if data.get("x_effective_um") is not None
+                else None
+            ),
+            y_effective_um=(
+                float(data["y_effective_um"])
+                if data.get("y_effective_um") is not None
+                else None
+            ),
+            center_attempted=bool(data.get("center_attempted", False)),
+            center_success=bool(data.get("center_success", False)),
+            center_skip_reason=str(data.get("center_skip_reason", "") or ""),
+            xy_offset_pre_px=(
+                float(data["xy_offset_pre_px"])
+                if data.get("xy_offset_pre_px") is not None
+                else None
+            ),
+            xy_offset_post_px=(
+                float(data["xy_offset_post_px"])
+                if data.get("xy_offset_post_px") is not None
+                else None
+            ),
+            xy_offset_post_um=(
+                float(data["xy_offset_post_um"])
+                if data.get("xy_offset_post_um") is not None
+                else None
+            ),
         )
 
     @classmethod

@@ -20,11 +20,9 @@ sustituye. Tres decisiones sostienen la comparabilidad de S entre planos:
    óptica cambiara. Después de ``init_reference`` sólo se traslada.
 3. **Lo que se ve y lo que se mide son dos cosas distintas.** La silueta que
    U2-Net segmenta cambia de extensión con el desenfoque, así que usarla como
-   máscara mezcla "cuánta área" con "cuán nítido". ``current_rois`` (medida)
-   traslada el contorno de referencia sin deformarlo, con área constante;
+   máscara mezcla "cuánta área" con "cuán nítido".    ``current_rois`` (medida) usa el ROI **cuadrado estático** como ventana y
+   la **silueta U2-Net ∩ cuadrado** como máscara de ponderación de S.
    ``display_rois`` publica la detección viva para el overlay.
-   ``adopt_contour=True`` fuerza que la medida también adopte la silueta; sólo
-   tiene sentido para diagnóstico.
 
 Uso típico dentro de AutofocusService::
 
@@ -42,9 +40,10 @@ from __future__ import annotations
 import logging
 from typing import List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
-from core.autofocus.focus_metric import bbox_to_contour
+from core.autofocus.focus_metric import bbox_to_contour, clip_contour_to_bbox
 from core.detection.u2net_detector import U2NetDetector
 
 logger = logging.getLogger("MotorControl_L206")
@@ -252,7 +251,7 @@ class RoiTracker:
         que los valores de distintos planos sean comparables entre sí.
         """
         frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
-        for i, (bbox, _) in enumerate(self._current_rois):
+        for i, (bbox, contour) in enumerate(self._current_rois):
             x, y, w, h = bbox
             side = max(int(w), int(h)) + 2 * self.static_pad_px
             side = min(side, frame_w, frame_h)
@@ -260,17 +259,26 @@ class RoiTracker:
             x0 = int(round(min(max(0.0, cx - side / 2.0), frame_w - side)))
             y0 = int(round(min(max(0.0, cy - side / 2.0), frame_h - side)))
             window: Bbox = (x0, y0, side, side)
+            sil = contour if contour is not None else self._anchor_contours[i]
+            clipped = clip_contour_to_bbox(sil, window)
             self._anchor_bboxes[i] = window
-            self._anchor_contours[i] = bbox_to_contour(window)
-            self._current_rois[i] = (window, bbox_to_contour(window))
+            self._anchor_contours[i] = np.asarray(clipped, dtype=np.int32).copy()
+            self._current_rois[i] = (
+                window,
+                np.asarray(clipped, dtype=np.int32).copy(),
+            )
+            sil_area = float(cv2.contourArea(clipped)) if clipped is not None else 0.0
             logger.info(
                 "[RoiTracker] ROI %d: ventana estática %s (objeto %dx%dpx "
-                "+ %dpx por lado); la segmentación se medirá dentro de ella",
+                "+ %dpx por lado); S pondera silueta∩cuadrado (%.0f px, "
+                "no el rectángulo lleno %.0f px)",
                 i,
                 window,
                 w,
                 h,
                 self.static_pad_px,
+                sil_area,
+                float(side * side),
             )
 
     def update(
@@ -349,6 +357,16 @@ class RoiTracker:
 
             if self.static_window:
                 self._check_containment(i, det)
+                window = self._anchor_bboxes[i]
+                clipped = clip_contour_to_bbox(det.contour, window)
+                sil_area = float(cv2.contourArea(clipped)) if clipped is not None else 0.0
+                sq_area = float(max(1, window[2] * window[3]))
+                # Solo adoptar silueta real ∩ cuadrado; no rellenar el cuadrado.
+                if 25.0 <= sil_area < 0.85 * sq_area:
+                    self._current_rois[i] = (
+                        window,
+                        np.asarray(clipped, dtype=np.int32).copy(),
+                    )
                 continue
 
             # Comparación caja vs segmentación: un trozo suelto del grano no
@@ -749,7 +767,7 @@ class RoiTracker:
 
     @property
     def current_rois(self) -> List[Roi]:
-        """ROI de medida: contorno de referencia trasladado, área constante."""
+        """ROI de medida: ventana cuadrada + silueta U2-Net ∩ cuadrado."""
         return [(bbox, contour) for bbox, contour in self._current_rois]
 
     @property

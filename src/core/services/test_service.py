@@ -25,7 +25,7 @@ import time
 from typing import Callable, Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass, field
 
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, Qt, pyqtSignal
 
 from config.constants import (
     STITION_PWM_MAX,
@@ -109,6 +109,7 @@ class TestService(QObject):
     trajectory_stopped = pyqtSignal(int, int)  # current_point, total_points
     trajectory_completed = pyqtSignal(int)  # total_points
     trajectory_point_reached = pyqtSignal(int, float, float, str)  # index, x, y, status
+    jog_xy_reached = pyqtSignal(float, float, str)  # x, y, status — jog intra-punto, no avanza malla
     trajectory_feedback = pyqtSignal(float, float, float, float, bool, bool, int)  # target_x, target_y, error_x, error_y, lock_x, lock_y, settling
     # Worker→GUI: programar auto-advance (QTimer.singleShot desde QThread no dispara).
     _schedule_auto_advance = pyqtSignal(int)
@@ -175,6 +176,12 @@ class TestService(QObject):
         self._handoff_phase: Optional[str] = None
         self._handoff_deadline_mono = 0.0
         self._xy_capture_paused = False
+        # Goto XY de centrado: overlay de malla o trayectoria 1-pt (mismo FOV).
+        self._center_jog_target: Optional[Tuple[float, float]] = None
+        self._center_jog_active = False
+        self._center_jog_timeout_s = DEFAULT_POINT_TIMEOUT_S
+        # AF manual sin malla: start_trajectory de 1 punto (finish_standalone_jog).
+        self._standalone_center_jog = False
         # Watchdog por punto (approach + cobertura + cierre)
         self._fov_cover_t0_mono = 0.0
         self._fov_cover_last_log_mono = 0.0
@@ -189,7 +196,10 @@ class TestService(QObject):
         self._antecedent_t0 = 0.0
         self._antecedent_timeout_s = 10.0
 
-        self._schedule_auto_advance.connect(self._on_schedule_auto_advance)
+        # Queued: el tick corre en ControlWorker; QTimer solo vive en este hilo.
+        self._schedule_auto_advance.connect(
+            self._on_schedule_auto_advance, Qt.QueuedConnection
+        )
         
         logger.info("TestService inicializado")
     
@@ -468,6 +478,194 @@ class TestService(QObject):
 
         return x_actual, y_actual, error_x, error_y
 
+    def last_xy_pwm(self) -> Tuple[int, int]:
+        """Último PWM A/B enviado (trayectoria FOV o dual)."""
+        pair = getattr(self, "_last_traj_pwm", (0, 0)) or (0, 0)
+        return int(pair[0]), int(pair[1])
+
+    def xy_pwm_umax(self) -> int:
+        umax = 255
+        for ctrl in (self._controller_a, self._controller_b):
+            if ctrl is None:
+                continue
+            try:
+                umax = max(umax, int(getattr(ctrl, "U_max", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+        return max(1, int(umax))
+
+    def _motion_target_xy(self) -> Optional[Tuple[float, float]]:
+        """Objetivo XY de actuación: jog intra-punto si hay, si no malla nominal."""
+        if self._center_jog_target is not None:
+            return self._center_jog_target
+        if not self._trajectory:
+            return None
+        idx = self._trajectory_index
+        if idx < 0 or idx >= len(self._trajectory):
+            return None
+        return self._trajectory[idx]
+
+    def clear_center_jog(self) -> None:
+        """Quita el override de goto. resume_trajectory debe llamarlo para no
+        perseguir el XY efectivo como si fuera el siguiente punto de malla."""
+        self._center_jog_active = False
+        self._center_jog_target = None
+        self._center_jog_timeout_s = DEFAULT_POINT_TIMEOUT_S
+        if not getattr(self, "_standalone_center_jog", False):
+            self._set_center_approach_mode(False)
+
+    def _mesh_in_progress(self) -> bool:
+        """True si hay malla real (no el 1-pt sintético del AF manual)."""
+        return bool(
+            self._trajectory_active
+            and self._trajectory
+            and not getattr(self, "_standalone_center_jog", False)
+        )
+
+    def goto_xy_um(
+        self,
+        x_um: float,
+        y_um: float,
+        reason: str = "center_candidate",
+        point_timeout_s: Optional[float] = None,
+    ) -> bool:
+        """Alcanza (x, y) con el mismo stack FOV que un punto de malla.
+
+        AF manual (sin malla): ``start_trajectory([(x,y)], auto_advance=False)``
+        con la misma tolerancia, ``fov_settle_ms`` y ``point_timeout_s``.
+        Microscopía con malla pausada: overlay del target; no sustituye la
+        malla. Al aceptar emite ``jog_xy_reached`` y no avanza el índice.
+        """
+        if not self._send_command:
+            logger.error("[TestService] goto_xy_um: hardware no configurado")
+            return False
+        if not self._controller_a and not self._controller_b:
+            logger.error("[TestService] goto_xy_um: sin controladores de stage")
+            return False
+        target = (float(x_um), float(y_um))
+        tmo = point_timeout_s
+        if tmo is None:
+            tmo = float(
+                getattr(
+                    self._trajectory_config,
+                    "point_timeout_s",
+                    DEFAULT_POINT_TIMEOUT_S,
+                )
+                or DEFAULT_POINT_TIMEOUT_S
+            )
+        tmo = max(0.5, min(120.0, float(tmo)))
+        if self._mesh_in_progress():
+            return self._goto_xy_mesh_overlay(target, reason)
+        return self._goto_xy_trajectory_1pt(target, reason, point_timeout_s=tmo)
+
+    def start_center_jog(
+        self,
+        x_um: float,
+        y_um: float,
+        reason: str = "center_candidate",
+    ) -> bool:
+        """Alias de ``goto_xy_um`` (trayectoria FOV, no jog PWM simultáneo)."""
+        return self.goto_xy_um(float(x_um), float(y_um), reason=reason)
+
+    def goto_xy_control_jog(
+        self,
+        x_um: float,
+        y_um: float,
+        reason: str = "center_control_jog",
+    ) -> bool:
+        """Mismo setpoint que Control tab: dual PI → PWM (A=X, B=Y).
+
+        La trayectoria 1-pt FOV/MCU a veces no arranca en AF manual. Dual es
+        el comando que el usuario usa a mano y sí mueve.
+        """
+        logger.info(
+            "[TestService] goto_xy_um (%s) → (%.1f, %.1f)µm via=control_dual",
+            reason or "?",
+            float(x_um),
+            float(y_um),
+        )
+        self.log_message.emit(
+            f"   ◎ goto XY (control dual) → ({float(x_um):.0f}, {float(y_um):.0f})µm"
+        )
+        ok = self.start_dual_control(float(x_um), float(y_um))
+        if ok:
+            self._standalone_center_jog = True
+            self._center_jog_active = True
+            self._center_jog_target = (float(x_um), float(y_um))
+            self._set_center_approach_mode(True)
+        return bool(ok)
+
+    def _goto_xy_trajectory_1pt(
+        self,
+        target: Tuple[float, float],
+        reason: str,
+        point_timeout_s: float = DEFAULT_POINT_TIMEOUT_S,
+    ) -> bool:
+        tol = float(self._trajectory_config.tolerance_um or 25.0)
+        tmo = max(0.5, min(120.0, float(point_timeout_s or DEFAULT_POINT_TIMEOUT_S)))
+        logger.info(
+            "[TestService] goto_xy_um (%s) → (%.1f, %.1f)µm via=trajectory_1pt "
+            "tol=%.1fµm timeout=%.1fs",
+            reason or "?",
+            target[0],
+            target[1],
+            tol,
+            tmo,
+        )
+        self.log_message.emit(
+            f"   ◎ goto XY (trayectoria 1-pt) → ({target[0]:.0f}, {target[1]:.0f})µm"
+        )
+        ok = self.start_trajectory(
+            [target],
+            tolerance_um=tol,
+            pause_s=0.1,
+            auto_advance=False,
+            start_index=0,
+            point_timeout_s=tmo,
+            center_1pt=True,
+        )
+        return bool(ok)
+
+    def _goto_xy_mesh_overlay(
+        self, target: Tuple[float, float], reason: str
+    ) -> bool:
+        self._center_jog_target = target
+        self._center_jog_active = True
+        self._set_center_approach_mode(True)
+        self._point_accepted = False
+        self._trajectory_paused = False
+        self._xy_capture_paused = False
+        self._dual_integral_a = 0.0
+        self._dual_integral_b = 0.0
+        self._fov_host_retries = 0
+        self._handoff_phase = None
+        self._step_long_approach_active = False
+        self._motion_halted = False
+        if self.step_control_enabled:
+            self._prepare_step_transition()
+        logger.info(
+            "[TestService] goto_xy_um (%s) → (%.1f, %.1f)µm via=mesh_overlay "
+            "(índice malla %d intacto)",
+            reason or "?",
+            target[0],
+            target[1],
+            self._trajectory_index,
+        )
+        self.log_message.emit(
+            f"   ◎ goto XY (overlay malla) → ({target[0]:.0f}, {target[1]:.0f})µm"
+        )
+        return True
+
+    def finish_standalone_jog(self, reason: str = "") -> None:
+        """Cierra el lazo sintético del AF manual. No-op si hay malla real."""
+        if not getattr(self, "_standalone_center_jog", False):
+            return
+        logger.info(
+            "[TestService] finish_standalone_jog (%s)", reason or "done"
+        )
+        self._standalone_center_jog = False
+        self.halt_motion(reason or "finish_standalone_jog")
+
     def _movement_direction(self, index: int) -> Tuple[int, int]:
         """Dirección de avance nominal (-1, 0, +1) hacia el punto FOV index."""
         if not self._trajectory or index >= len(self._trajectory):
@@ -635,14 +833,37 @@ class TestService(QObject):
         logger.warning("%s (t=%.1f/%.0fs)", log_msg, elapsed, tmo)
         self.log_message.emit(f"{ui_msg} (t={elapsed:.0f}/{tmo:.0f}s)")
 
+    def _is_center_approach(self) -> bool:
+        """True mientras el servo de centroides está cazando (no malla)."""
+        return bool(
+            getattr(self, "_center_jog_active", False)
+            or getattr(self, "_standalone_center_jog", False)
+        )
+
+    def _set_center_approach_mode(self, active: bool) -> None:
+        flag = bool(active)
+        if self._step_controller is not None:
+            # No abortar el ALGORITMO por FOV 25 s; el PASO sí termina por
+            # point_timeout (1–3 s) → accept_center_step_timeout.
+            self._step_controller.center_approach_no_timeout = flag
+
+    def accept_center_step_timeout(self) -> None:
+        """Congela XY y acepta este 1-pt. El lazo de centroides continúa."""
+        self._force_accept_point_timeout("center_step")
+
     def _force_accept_point_timeout(self, phase: str) -> None:
-        """Acepta el punto actual por timeout y avanza (con error en status)."""
+        """Acepta el punto actual por timeout y avanza (con error en status).
+
+        En center approach: termina ESTE paso (freeze), no el algoritmo.
+        """
         if self._point_accepted or not self._trajectory:
             return
         idx = self._trajectory_index
         if idx >= len(self._trajectory):
             return
-        target = self._trajectory[idx]
+        target = self._motion_target_xy()
+        if target is None:
+            return
         tmo = self._point_timeout_s()
         err_x = err_y = 0.0
         try:
@@ -762,7 +983,9 @@ class TestService(QObject):
             return
         if reset_cover_watch:
             self._reset_fov_cover_watch()
-        target = self._trajectory[idx]
+        target = self._motion_target_xy()
+        if target is None:
+            return
         prev_actual = self._step_controller.read_current_xy_um(
             self._controller_a, self._controller_b
         )
@@ -777,6 +1000,7 @@ class TestService(QObject):
         done = float(self._step_config.long_approach_done_um)
 
         # Host sucesivo: PI TF + rampa PWM → handoff → MCU C(z).
+        # El goto de centrado usa este mismo path (no approach PWM "suave" 2.5 s).
         if dist > done:
             engage = float(getattr(self._step_config, "fine_engage_um", 90.0))
             self._arm_soft_approach(done)
@@ -795,7 +1019,13 @@ class TestService(QObject):
             return
 
         self._step_long_approach_active = False
-        move_dir_x, move_dir_y = self._movement_direction(idx)
+        if self._center_jog_target is not None:
+            dx_dir = target[0] - prev_actual[0]
+            dy_dir = target[1] - prev_actual[1]
+            move_dir_x = 0 if abs(dx_dir) < 1.0 else (1 if dx_dir > 0 else -1)
+            move_dir_y = 0 if abs(dy_dir) < 1.0 else (1 if dy_dir > 0 else -1)
+        else:
+            move_dir_x, move_dir_y = self._movement_direction(idx)
         backlash_dx, backlash_dy = 0.0, 0.0
         backlash = getattr(self, "_backlash_correction", None)
         if backlash is not None:
@@ -930,6 +1160,8 @@ class TestService(QObject):
             self._step_long_approach_active = False
             self._handoff_phase = None
             self._xy_capture_paused = False
+            self._standalone_center_jog = False
+            self.clear_center_jog()
             self._dual_position_reached = False
             if getattr(self, "_dual_power", None) is not None:
                 self._dual_power.reset()
@@ -1059,6 +1291,8 @@ class TestService(QObject):
 
             # Potencia 0 por eje en HOLD; comando siempre (ceros parciales OK).
             self._send_command(f"A,{pwm_a},{pwm_b}")
+            self._last_traj_pwm = (int(pwm_a), int(pwm_b))
+            self._last_traj_pwm_mono = now_m
 
             settled = self._dual_power.update_settle(now_m, ("a", "b"))
             if settled and not self._dual_position_reached:
@@ -1070,6 +1304,12 @@ class TestService(QObject):
                     error_a_um,
                     error_b_um,
                 )
+                if getattr(self, "_center_jog_active", False):
+                    self.jog_xy_reached.emit(
+                        float(self._dual_ref_a_um),
+                        float(self._dual_ref_b_um),
+                        "dual_ok",
+                    )
                 self.log_message.emit(
                     f"✅ POSICIÓN ALCANZADA (HOLD {self._dual_power.config.settle_ms:.0f}ms): "
                     f"A={self._dual_ref_a_um:.0f}µm (err={error_a_um:.1f}), "
@@ -1124,6 +1364,7 @@ class TestService(QObject):
         auto_advance: bool = False,
         start_index: int = 0,
         point_timeout_s: float = DEFAULT_POINT_TIMEOUT_S,
+        center_1pt: bool = False,
     ) -> bool:
         """
         Inicia la ejecución de una trayectoria con control PI dual.
@@ -1168,6 +1409,7 @@ class TestService(QObject):
         self._motion_halted = False  # permitir actuación tras halt previo
         self._handoff_phase = None
         self._xy_capture_paused = False
+        self.clear_center_jog()
         
         # Guardar configuración
         self._trajectory = list(trajectory)
@@ -1257,6 +1499,14 @@ class TestService(QObject):
             rate_hz=CONTROL_RATE_HZ,
             name="TrajectoryControlWorker",
         )
+        if center_1pt and self._trajectory:
+            tgt = self._trajectory[0]
+            self._standalone_center_jog = True
+            self._center_jog_active = True
+            self._center_jog_target = (float(tgt[0]), float(tgt[1]))
+            self._set_center_approach_mode(True)
+        else:
+            self._set_center_approach_mode(False)
         self._trajectory_worker.start()
         
         self.trajectory_started.emit(len(trajectory))
@@ -1329,6 +1579,7 @@ class TestService(QObject):
             logger.info(f"[DEBUG-RESUME] ANTES: índice={self._trajectory_index}, _point_accepted={self._point_accepted}, paused={self._trajectory_paused}, advance={advance_to_next}")
             
             # PRIMERO: Actualizar todas las variables de estado
+            self.clear_center_jog()
             self._trajectory_paused = False
             
             if advance_to_next:
@@ -1389,7 +1640,7 @@ class TestService(QObject):
         if self.step_control_enabled:
             self._prepare_step_transition()
     
-    def _arm_soft_approach(self, done_um: float) -> None:
+    def _arm_soft_approach(self, done_um: float, *, gentle: bool = False) -> None:
         """Activa approach sucesivo: PI TF + rampa PWM (sin bang-bang)."""
         self._step_long_approach_active = True
         self._dual_integral_a = 0.0
@@ -1401,6 +1652,10 @@ class TestService(QObject):
         umax_b = int(getattr(cb, "U_max", STITION_PWM_MAX) or STITION_PWM_MAX) if cb else STITION_PWM_MAX
         slew = max(umax_a, umax_b, int(STITION_PWM_MIN))
         slew = min(int(STITION_PWM_MAX), slew)
+        if gentle:
+            cap = int(getattr(self._step_config, "step_pwm_cap", 80) or 80)
+            slew = max(int(STITION_PWM_MIN), min(slew, cap))
+            engage = max(float(done_um) + 8.0, min(engage, 40.0))
         self._host_approach.reset(
             done_um,
             engage,
@@ -1425,7 +1680,7 @@ class TestService(QObject):
         if not self._trajectory:
             return False
 
-        target_x, target_y = self._trajectory[self._trajectory_index]
+        target_x, target_y = self._motion_target_xy() or (0.0, 0.0)
         Ts = max(1e-4, time.time() - self._dual_last_time)
         self._dual_last_time = time.time()
         now_m = time.perf_counter()
@@ -1552,7 +1807,9 @@ class TestService(QObject):
         idx = self._trajectory_index
         if idx >= len(self._trajectory):
             return
-        target = self._trajectory[idx]
+        target = self._motion_target_xy()
+        if target is None:
+            return
         cfg = self._step_config
         done = float(cfg.long_approach_done_um)
         abort_lim = done * float(cfg.handoff_abort_factor)
@@ -1599,7 +1856,10 @@ class TestService(QObject):
 
         cfg = self._step_config
         idx = self._trajectory_index
-        target = self._trajectory[idx]
+        target = self._motion_target_xy()
+        if target is None:
+            self._handoff_phase = None
+            return False
         done = float(cfg.long_approach_done_um)
         abort_lim = done * float(cfg.handoff_abort_factor)
 
@@ -1646,7 +1906,7 @@ class TestService(QObject):
                     idx, prev_actual, target, tol
                 )
                 if not cov_ok:
-                    if self._fov_cover_timed_out():
+                    if self._fov_cover_timed_out() and not self._is_center_approach():
                         tmo = self._point_timeout_s()
                         status = (
                             f"⚠️ cover t/o {tmo:.0f}s "
@@ -1769,8 +2029,11 @@ class TestService(QObject):
         if self._step_controller is None or not self._trajectory:
             return
 
-        # Timeout de punto: aplica también en approach (no solo cobertura FOV)
+        # Timeout de ESTE punto/paso. En center: accept+freeze, el lazo sigue.
         if not self._point_accepted and self._fov_cover_timed_out():
+            if self._is_center_approach():
+                self._force_accept_point_timeout("center_step")
+                return
             if self._step_long_approach_active:
                 self._force_accept_point_timeout("approach")
                 return
@@ -1780,20 +2043,35 @@ class TestService(QObject):
 
         if self._handoff_phase is not None:
             self._tick_handoff()
-            if not self._point_accepted and self._fov_cover_timed_out():
-                self._force_accept_point_timeout("handoff")
+            if (
+                not self._point_accepted
+                and self._fov_cover_timed_out()
+            ):
+                self._force_accept_point_timeout(
+                    "center_step" if self._is_center_approach() else "handoff"
+                )
             return
 
         if self._step_long_approach_active:
             if self._tick_step_long_approach():
                 self._begin_handoff_after_approach()
-            elif not self._point_accepted and self._fov_cover_timed_out():
-                self._force_accept_point_timeout("approach")
+            elif (
+                not self._point_accepted
+                and self._fov_cover_timed_out()
+            ):
+                self._force_accept_point_timeout(
+                    "center_step" if self._is_center_approach() else "approach"
+                )
             return
 
         out = self._step_controller.tick()
-        if not self._point_accepted and self._fov_cover_timed_out():
-            self._force_accept_point_timeout("fov_verify")
+        if (
+            not self._point_accepted
+            and self._fov_cover_timed_out()
+        ):
+            self._force_accept_point_timeout(
+                "center_step" if self._is_center_approach() else "fov_verify"
+            )
             return
         now_m = time.perf_counter()
         # Labels UI ~20 Hz; terminal ~2 Hz. El tick MCU/FOV sigue @ CONTROL_RATE.
@@ -1823,6 +2101,9 @@ class TestService(QObject):
 
         if out.point_failed:
             idx = self._trajectory_index + 1
+            if self._is_center_approach():
+                self._force_accept_point_timeout("fov_fail")
+                return
             # Re-aproximación host (TF/PI) en vez de abortar con mensaje legacy.
             if self._fov_host_retries < 2:
                 self._fov_host_retries += 1
@@ -1837,6 +2118,9 @@ class TestService(QObject):
                     self._fov_host_retries,
                 )
                 return
+            if self._center_jog_active:
+                self._force_accept_point_timeout("fov_fail")
+                return
             self.error_occurred.emit(f"Punto {idx}: FOV no convergió")
             self.log_message.emit(f"❌ Punto {idx}: FOV no convergió tras reintentos")
             self.stop_trajectory()
@@ -1846,7 +2130,9 @@ class TestService(QObject):
             if self._point_accepted:
                 return
             self._fov_host_retries = 0
-            target = self._trajectory[self._trajectory_index]
+            target = self._motion_target_xy()
+            if target is None:
+                return
             result = self._step_controller.last_point_result
             t_move = result.t_move_ms if result else 0.0
             status = f"✅ FOV OK ({t_move:.0f}ms)"
@@ -1981,6 +2267,10 @@ class TestService(QObject):
         Si auto_advance=False (MicroscopyService): Pausa indefinida esperando resume_trajectory().
         force_cover: salta chequeo de malla (timeout / accept con error).
         """
+        # Jog intra-FOV: no exigir cobertura de celda de malla.
+        if self._center_jog_active:
+            force_cover = True
+
         # CRÍTICO: Evitar múltiples aceptaciones del mismo punto
         if self._point_accepted:
             logger.warning(f"[TestService] Punto {self._trajectory_index + 1} ya fue aceptado - ignorando llamada duplicada")
@@ -2002,7 +2292,7 @@ class TestService(QObject):
                     float(getattr(self._step_config, "tol_fov_um", 25.0)),
                 )
                 if not cov_ok:
-                    if self._fov_cover_timed_out():
+                    if self._fov_cover_timed_out() and not self._is_center_approach():
                         tmo = self._point_timeout_s()
                         status = (
                             f"⚠️ cover t/o {tmo:.0f}s "
@@ -2133,6 +2423,30 @@ class TestService(QObject):
 
         # Emitir señales
         total = len(self._trajectory) if self._trajectory else 0
+        if self._center_jog_active:
+            self._center_jog_active = False
+            self._trajectory_paused = True
+            self.log_message.emit(
+                f"   ◎ Trayectoria 1-pt (center) ({target_x:.0f}, {target_y:.0f})µm "
+                f"{status} [Error: X={error_x:.1f}, Y={error_y:.1f}µm]"
+            )
+            logger.info(
+                "[TestService] trajectory_point_reached (center) "
+                "(%.1f, %.1f) %s err=(%+.1f,%+.1f) — índice malla %d intacto",
+                target_x,
+                target_y,
+                status,
+                error_x,
+                error_y,
+                self._trajectory_index,
+            )
+            self.jog_xy_reached.emit(float(target_x), float(target_y), str(status))
+            if getattr(self, "_standalone_center_jog", False):
+                self.trajectory_point_reached.emit(
+                    self._trajectory_index, target_x, target_y, status
+                )
+            return
+
         self.trajectory_point_reached.emit(self._trajectory_index, target_x, target_y, status)
         
         if self._trajectory_auto_advance:

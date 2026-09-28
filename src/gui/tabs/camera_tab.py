@@ -36,6 +36,7 @@ from gui.utils.camera_tab_ui_builder import (
 from core.services import CameraOrchestrator
 from core.models import AutofocusConfig
 from core.autofocus.persisted_params import sanitize_autofocus_form
+from core.autofocus.center_candidate import DEFAULT_SIGN_X, DEFAULT_SIGN_Y
 from core.utils.folder_reveal import reveal_folder
 from hardware.camera.scientific_image import save_scientific_image
 from utils.parameter_manager import get_parameter_manager
@@ -288,6 +289,13 @@ class CameraTab(QWidget):
         
         # Autofoco
         self.autofocus_enabled_cb = self._widgets.get('autofocus_enabled_cb')
+        self.center_candidate_cb = self._widgets.get('center_candidate_cb')
+        self.center_hysteresis_um_spin = self._widgets.get('center_hysteresis_um_spin')
+        self._center_hysteresis_px = 40.0
+        self._center_max_retries = 8
+        self._center_max_delta_um = 0.0
+        self._center_sign_x = int(DEFAULT_SIGN_X)
+        self._center_sign_y = int(DEFAULT_SIGN_Y)
         self.cfocus_connect_btn = self._widgets.get('cfocus_connect_btn')
         self.cfocus_disconnect_btn = self._widgets.get('cfocus_disconnect_btn')
         self.cfocus_calibrate_btn = self._widgets.get('cfocus_calibrate_btn')  # NUEVO
@@ -410,6 +418,31 @@ class CameraTab(QWidget):
             self._set_checked(
                 self.autofocus_enabled_cb, autofocus.get('enabled')
             )
+            self._set_checked(
+                self.center_candidate_cb,
+                autofocus.get('center_candidate_enabled', True),
+            )
+            self._set_value(
+                self.center_hysteresis_um_spin,
+                autofocus.get('center_hysteresis_um', 12.0),
+            )
+            self._center_hysteresis_px = float(
+                autofocus.get('center_hysteresis_px', 40.0) or 40.0
+            )
+            self._center_max_retries = int(
+                autofocus.get('center_max_retries', 8) or 0
+            )
+            self._center_max_delta_um = float(
+                autofocus.get('center_max_delta_um', 0.0) or 0.0
+            )
+            try:
+                self._center_sign_x = 1 if int(autofocus.get('center_sign_x', DEFAULT_SIGN_X) or DEFAULT_SIGN_X) >= 0 else -1
+            except (TypeError, ValueError):
+                self._center_sign_x = int(DEFAULT_SIGN_X)
+            try:
+                self._center_sign_y = 1 if int(autofocus.get('center_sign_y', DEFAULT_SIGN_Y) or DEFAULT_SIGN_Y) >= 0 else -1
+            except (TypeError, ValueError):
+                self._center_sign_y = int(DEFAULT_SIGN_Y)
             self._set_checked(self.full_scan_cb, autofocus.get('full_scan'))
             for widget, key in (
                 (self.min_pixels_spin, 'min_pixels'),
@@ -537,6 +570,7 @@ class CameraTab(QWidget):
             self.channel_g_check,
             self.channel_b_check,
             self.autofocus_enabled_cb,
+            self.center_candidate_cb,
             self.full_scan_cb,
         )
         numeric = (
@@ -553,6 +587,7 @@ class CameraTab(QWidget):
             self.z_arrive_tol_spin,
             self.n_fine_planes_spin,
             self.roi_margin_spin,
+            self.center_hysteresis_um_spin,
             self.saliency_threshold_spin,
             self.adaptive_k_spin,
             self.clahe_clip_spin,
@@ -634,6 +669,20 @@ class CameraTab(QWidget):
             'n_captures': int(self.n_captures_spin.value()),
             'z_arrive_tol_um': float(self.z_arrive_tol_spin.value()),
             'roi_margin_px': int(self.roi_margin_spin.value()),
+            'center_candidate_enabled': bool(
+                self.center_candidate_cb.isChecked()
+                if self.center_candidate_cb else True
+            ),
+            'center_hysteresis_um': float(
+                self.center_hysteresis_um_spin.value()
+                if self.center_hysteresis_um_spin else 12.0
+            ),
+            'center_hysteresis_px': float(getattr(self, '_center_hysteresis_px', 40.0)),
+            'center_max_retries': int(getattr(self, '_center_max_retries', 8)),
+            'center_max_delta_um': float(getattr(self, '_center_max_delta_um', 0.0)),
+            'center_sign_x': int(getattr(self, '_center_sign_x', DEFAULT_SIGN_X)),
+            'center_sign_y': int(getattr(self, '_center_sign_y', DEFAULT_SIGN_Y)),
+            'center_delta_toward_image': True,
         }
 
     def sync_runtime_params_from_ui(self, *, apply_u2net_advanced: bool = True) -> dict:
@@ -823,6 +872,22 @@ class CameraTab(QWidget):
             'z_arrive_tol_um': float(runtime['z_arrive_tol_um']),
             'roi_margin_px': int(runtime['roi_margin_px']),
             'full_scan': bool(runtime['full_scan']),
+            'center_candidate_enabled': bool(
+                runtime.get('center_candidate_enabled', True)
+            ),
+            'center_hysteresis_um': float(
+                runtime.get('center_hysteresis_um', 12.0)
+            ),
+            'center_hysteresis_px': float(
+                runtime.get('center_hysteresis_px', 40.0)
+            ),
+            'center_max_retries': int(runtime.get('center_max_retries', 8)),
+            'center_max_delta_um': float(
+                runtime.get('center_max_delta_um', 0.0)
+            ),
+            'center_sign_x': int(runtime.get('center_sign_x', DEFAULT_SIGN_X)),
+            'center_sign_y': int(runtime.get('center_sign_y', DEFAULT_SIGN_Y)),
+            'center_delta_toward_image': True,
             'start_point_1based': int(
                 self.resume_point_spin.value()
                 if self.resume_point_spin is not None else 1
@@ -910,6 +975,24 @@ class CameraTab(QWidget):
                     if self.z_arrive_tol_spin else 0.5
                 ),
                 'roi_margin_px': self.roi_margin_spin.value(),
+                'center_candidate_enabled': (
+                    self.center_candidate_cb.isChecked()
+                    if self.center_candidate_cb else True
+                ),
+                'center_hysteresis_um': (
+                    self.center_hysteresis_um_spin.value()
+                    if self.center_hysteresis_um_spin else 12.0
+                ),
+                'center_hysteresis_px': float(
+                    getattr(self, '_center_hysteresis_px', 40.0)
+                ),
+                'center_max_retries': int(getattr(self, '_center_max_retries', 8)),
+                'center_max_delta_um': float(
+                    getattr(self, '_center_max_delta_um', 0.0)
+                ),
+                'center_sign_x': int(getattr(self, '_center_sign_x', DEFAULT_SIGN_X)),
+                'center_sign_y': int(getattr(self, '_center_sign_y', DEFAULT_SIGN_Y)),
+                'center_delta_toward_image': True,
             },
             'u2net': {
                 'detection_mode': self.detection_mode_combo.currentText(),
@@ -944,7 +1027,36 @@ class CameraTab(QWidget):
         # Conectar señales de autofoco
         self.orchestrator.autofocus_complete.connect(self._on_orchestrator_autofocus_complete)
         self.orchestrator.detection_complete.connect(self._on_orchestrator_detection_complete)
+        if hasattr(self.orchestrator, "center_sign_changed"):
+            self.orchestrator.center_sign_changed.connect(self._on_center_sign_changed)
     
+    def _on_center_sign_changed(self, sign_x: int, sign_y: int) -> None:
+        self._center_sign_x = 1 if int(sign_x) >= 0 else -1
+        self._center_sign_y = 1 if int(sign_y) >= 0 else -1
+        logger.info(
+            "[CameraTab] AF_CENTER sign_flip persistido sign=(%+d,%+d)",
+            self._center_sign_x,
+            self._center_sign_y,
+        )
+        self.log_message(
+            f"   ↺ Signos XY centrado → ({self._center_sign_x:+d}, {self._center_sign_y:+d})"
+        )
+        win = getattr(self, "camera_view_window", None)
+        if win is not None and hasattr(win, "set_center_geometry"):
+            try:
+                win.set_center_geometry(
+                    float(getattr(win, "_fov_x_um", 0.0) or 0.0),
+                    float(getattr(win, "_fov_y_um", 0.0) or 0.0),
+                    int(self._center_sign_x),
+                    int(self._center_sign_y),
+                )
+            except Exception:
+                pass
+        try:
+            self.save_camera_tab_settings()
+        except Exception:
+            pass
+
     def _on_orchestrator_autofocus_complete(self, results):
         """Handler cuando el orchestrator completa autofoco."""
         # Si hay captura pendiente, ejecutarla
@@ -955,6 +1067,16 @@ class CameraTab(QWidget):
             # Compatibilidad con callback legado en main.py
             self._pending_capture = False
     
+    def _center_loop_active(self) -> bool:
+        orch = getattr(self, "orchestrator", None)
+        if orch is not None and hasattr(orch, "is_centering") and orch.is_centering():
+            return True
+        parent = getattr(self, "parent_gui", None)
+        ms = getattr(parent, "microscopy_service", None) if parent is not None else None
+        if ms is not None and hasattr(ms, "is_centering") and ms.is_centering():
+            return True
+        return False
+
     def _on_orchestrator_detection_complete(self, objects):
         """Handler cuando el orchestrator completa detección."""
         logger.info(f"[CameraTab] ✅ RECIBIDO orchestrator detection_complete: {len(objects)} objetos")
@@ -965,7 +1087,8 @@ class CameraTab(QWidget):
             dummy_saliency = np.zeros((100, 100), dtype=np.float32)
             logger.info(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service (orchestrator)")
             self.camera_view_window.update_detection_from_service(dummy_saliency, objects)
-            self.log_message(f"✅ {len(objects)} objetos detectados")
+            if not self._center_loop_active():
+                self.log_message(f"✅ {len(objects)} objetos detectados")
         else:
             logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible (orchestrator)")
     
@@ -979,7 +1102,8 @@ class CameraTab(QWidget):
             dummy_saliency = np.zeros((100, 100), dtype=np.float32)
             logger.info(f"[CameraTab] Llamando a camera_view_window.update_detection_from_service (microscopy)")
             self.camera_view_window.update_detection_from_service(dummy_saliency, objects)
-            self.log_message(f"✅ {len(objects)} objetos detectados (Microscopía)")
+            if not self._center_loop_active():
+                self.log_message(f"✅ {len(objects)} objetos detectados (Microscopía)")
         else:
             logger.warning(f"[CameraTab] ⚠️ Ventana de cámara NO visible (microscopy)")
     
@@ -1076,6 +1200,7 @@ class CameraTab(QWidget):
         
         logger.info("[CameraTab] Actualizando parámetros de detección antes de mostrar ventana")
         self._update_detection_params()
+        self._sync_camera_center_geometry()
         self.camera_view_window.show()
         self.camera_view_window.raise_()
         self.camera_view_window.activateWindow()
@@ -1464,6 +1589,15 @@ class CameraTab(QWidget):
         self.log_message("=" * 50)
         self.log_message("🎯 INICIANDO RUTINA DE ENFOQUE AUTOMÁTICO")
         self.log_message("   Método: SmartFocusScorer con métrica S")
+        try:
+            af = self.read_autofocus_form_params()
+            center_on = bool(af.get("center_candidate_enabled", True))
+            self.log_message(
+                f"   Centrado XY: {'ON' if center_on else 'OFF'} "
+                f"(logs AF_CENTER idx=na)"
+            )
+        except Exception:
+            pass
         self.log_message("=" * 50)
         logger.info("[CameraTab] Ejecutando autofoco con SmartFocusScorer")
         
@@ -1560,6 +1694,12 @@ class CameraTab(QWidget):
                 f"fine={config['z_step_fine']:.3f} "
                 f"capture_ΔS={config['z_step_capture']:.1f}% "
                 f"margin={config['roi_margin_px']}px"
+            )
+            center_on = bool(config.get('center_candidate_enabled', True))
+            self.log_message(
+                f"   Centrado XY: {'ON' if center_on else 'OFF'} "
+                f"histéresis={float(config.get('center_hysteresis_um', 12.0)):.1f}µm "
+                f"(logs AF_CENTER / AF_POINT)"
             )
         
         channels_str = ''.join([c for c in ['R', 'G', 'B'] if config['channels'][c]])
@@ -1988,6 +2128,17 @@ class CameraTab(QWidget):
         if self.orchestrator and self.orchestrator.autofocus:
             self.orchestrator.autofocus.microscopy_mode = False
 
+        ms = getattr(parent, "microscopy_service", None) if parent else None
+        if ms is not None and hasattr(ms, "is_running") and ms.is_running():
+            self.log_message(
+                "❌ AF manual bloqueado: microscopía en curso (no se mueve XY)"
+            )
+            return
+        af_svc = self.orchestrator.autofocus if self.orchestrator else None
+        if af_svc is not None and getattr(af_svc, "running", False):
+            self.log_message("❌ AF ya en curso")
+            return
+
         # Obtener frame actual
         current_frame = None
         if self.camera_service is not None:
@@ -2039,14 +2190,107 @@ class CameraTab(QWidget):
         # Delegar a orchestrator (usa SmartFocusScorer internamente con métrica S)
         self.log_message("🎯 Ejecutando barrido Z para encontrar mejor plano focal...")
         logger.info("[CameraTab] Delegando autofoco a CameraOrchestrator")
+        self._sync_camera_center_geometry()
         
         self.orchestrator.run_autofocus(
             capture_after=capture_after,
             min_area=min_area,
-            max_area=max_area
+            max_area=max_area,
+            center_ctx=self.build_manual_center_context(),
+            test_service=self._manual_test_service(),
         )
         
         logger.info("[CameraTab] Autofoco delegado correctamente")
+
+    def _manual_test_service(self):
+        tab = getattr(self, "test_tab", None)
+        if tab is None:
+            return None
+        return getattr(tab, "test_service", None)
+
+    def build_manual_center_context(self):
+        """FOV + flag UI + signos JSON para el jog XY del AF manual."""
+        from core.autofocus.center_then_af import CenterContext
+        from core.control.step_config import load_step_control_config
+        from config.constants import DEFAULT_FOV_X_UM, DEFAULT_FOV_Y_UM
+
+        af = self.read_autofocus_form_params()
+        fov_x = 0.0
+        fov_y = 0.0
+        point_timeout_s = 6.0
+        workspace = None
+        tab = getattr(self, "test_tab", None)
+        if tab is not None and hasattr(tab, "get_trajectory_execution_params"):
+            try:
+                params = tab.get_trajectory_execution_params() or {}
+            except Exception:
+                params = {}
+            fov_x = float(params.get("fov_x_um") or 0.0)
+            fov_y = float(params.get("fov_y_um") or 0.0)
+            point_timeout_s = float(params.get("point_timeout_s") or 6.0)
+        # AF manual: xy_tgt = xy_read_ahora + Δpx de ESTE frame. La malla
+        # cargada (p.ej. punto 19920 de la run anterior) no es workspace.
+        fov_from_tab = fov_x > 0.0 and fov_y > 0.0
+        if not fov_from_tab:
+            dx = float(DEFAULT_FOV_X_UM or 0.0)
+            dy = float(DEFAULT_FOV_Y_UM or 0.0)
+            if dx > 0.0 and dy > 0.0:
+                logger.warning(
+                    "[CameraTab] AF_CENTER: FOV TestTab=%.1f×%.1f — "
+                    "usando FOV de sesión DEFAULT %.1f×%.1f µm",
+                    fov_x,
+                    fov_y,
+                    dx,
+                    dy,
+                )
+                self.log_message(
+                    f"⚠️ FOV TestTab ausente; usando FOV de sesión "
+                    f"{dx:.1f}×{dy:.1f} µm"
+                )
+                fov_x, fov_y = dx, dy
+        settle_ms = 500
+        try:
+            settle_ms = int(
+                getattr(load_step_control_config(), "t_capture_settle_ms", 500) or 500
+            )
+        except Exception:
+            settle_ms = 500
+        return CenterContext(
+            enabled=bool(af.get("center_candidate_enabled", True)),
+            fov_x_um=float(fov_x),
+            fov_y_um=float(fov_y),
+            hysteresis_um=float(af.get("center_hysteresis_um", 12.0) or 12.0),
+            hysteresis_px=float(af.get("center_hysteresis_px", 40.0) or 40.0),
+            max_retries=int(af.get("center_max_retries", 8) or 0),
+            max_delta_um=float(af.get("center_max_delta_um", 0.0) or 0.0),
+            sign_x=int(af.get("center_sign_x", DEFAULT_SIGN_X) or DEFAULT_SIGN_X),
+            sign_y=int(af.get("center_sign_y", DEFAULT_SIGN_Y) or DEFAULT_SIGN_Y),
+            pad_px=int(af.get("roi_margin_px", 5) or 0),
+            workspace=workspace,
+            settle_ms=settle_ms,
+            point_index=None,
+            log_prefix="[CameraOrchestrator]",
+            point_timeout_s=float(point_timeout_s),
+        )
+
+    def _sync_camera_center_geometry(self) -> None:
+        win = getattr(self, "camera_view_window", None)
+        if win is None or not hasattr(win, "set_center_geometry"):
+            return
+        ctx = None
+        try:
+            ctx = self.build_manual_center_context()
+        except Exception:
+            ctx = None
+        if ctx is None:
+            return
+        win.set_center_geometry(
+            float(ctx.fov_x_um),
+            float(ctx.fov_y_um),
+            int(ctx.sign_x),
+            int(ctx.sign_y),
+        )
+
     
     # ==================================================================
     # CALLBACKS DE SERVICIO

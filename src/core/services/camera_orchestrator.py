@@ -10,6 +10,7 @@ Fecha: 2025-12-29
 """
 
 import logging
+import time
 import numpy as np
 import cv2
 from typing import Optional, List
@@ -17,6 +18,12 @@ from typing import Optional, List
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.models import DetectedObject, AutofocusConfig
+from core.autofocus.center_then_af import (
+    CenterContext,
+    CenterResult,
+    CenterThenAf,
+)
+from core.autofocus.center_candidate import FORCE_CENTER_PX, can_start_zscan, pick_tracked_primary
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -45,6 +52,7 @@ class CameraOrchestrator(QObject):
     detection_complete = pyqtSignal(list)  # List[DetectedObject]
     validation_error = pyqtSignal(str)
     status_message = pyqtSignal(str)
+    center_sign_changed = pyqtSignal(int, int)
     
     def __init__(self, camera_service, detection_service, 
                  autofocus_service, smart_focus_scorer):
@@ -66,84 +74,205 @@ class CameraOrchestrator(QObject):
         # Estado interno
         self._pending_capture = False
         self._current_frame = None
+        self._af_min_area = 0.0
+        self._af_max_area = float("inf")
+        self._center_runner = CenterThenAf(
+            parent=self,
+            grab_bgr_frame=self._grab_bgr_frame,
+            filter_objects=self._filter_manual_objects,
+            log_prefix="[CameraOrchestrator]",
+        )
+        self._center_runner.set_scorer(lambda: self.scorer)
+        self._center_runner.completed.connect(self._on_center_completed)
+        self._center_runner.status_message.connect(self.status_message)
+        self._center_runner.sign_changed.connect(self.center_sign_changed)
+        self._center_runner.overlay_update.connect(self._on_center_overlay)
+        if autofocus_service is not None and hasattr(autofocus_service, "scan_complete"):
+            autofocus_service.scan_complete.connect(self._on_af_scan_complete)
     
+    def is_centering(self) -> bool:
+        runner = getattr(self, "_center_runner", None)
+        return bool(runner is not None and runner.is_pending())
+
     def set_current_frame(self, frame: np.ndarray):
         """Actualiza el frame actual."""
         self._current_frame = frame
+
+    @staticmethod
+    def _frame_to_bgr(frame) -> Optional[np.ndarray]:
+        if frame is None:
+            return None
+        src = frame.copy()
+        if len(src.shape) == 2:
+            if src.dtype == np.uint16:
+                frame_max = src.max()
+                if frame_max > 0:
+                    gray_uint8 = (src / frame_max * 255).astype(np.uint8)
+                else:
+                    gray_uint8 = np.zeros(src.shape, dtype=np.uint8)
+                return cv2.cvtColor(gray_uint8, cv2.COLOR_GRAY2BGR)
+            return cv2.cvtColor(src, cv2.COLOR_GRAY2BGR)
+        if src.dtype == np.uint16:
+            frame_max = src.max()
+            if frame_max > 0:
+                return (src / frame_max * 255).astype(np.uint8)
+            return np.zeros(src.shape[:2] + (3,), dtype=np.uint8)
+        return src.astype(np.uint8)
+
+    def _grab_bgr_frame(self):
+        if self.camera is not None and hasattr(self.camera, "acquire_scientific_frame"):
+            try:
+                sci = self.camera.acquire_scientific_frame(timeout_s=1.5)
+                return self._frame_to_bgr(sci.image16)
+            except Exception as exc:
+                logger.warning(
+                    "[CameraOrchestrator] acquire_scientific_frame: %s", exc
+                )
+        return self._frame_to_bgr(self._current_frame)
+
+    def _filter_manual_objects(self, objects) -> list:
+        lo, hi = float(self._af_min_area), float(self._af_max_area)
+        return [
+            obj for obj in (objects or [])
+            if lo <= float(getattr(obj, "area", 0) or 0) <= hi
+        ]
+
+    def _finish_standalone_jog(self, reason: str = "") -> None:
+        ts = self._center_runner._test_service
+        if ts is not None and hasattr(ts, "finish_standalone_jog"):
+            ts.finish_standalone_jog(reason)
+
+    def _start_zscan(self, objects: List) -> None:
+        if self.autofocus is None:
+            self.validation_error.emit("AutofocusService no disponible")
+            self._finish_standalone_jog("no_autofocus")
+            if self._pending_capture:
+                self.autofocus_complete.emit([])
+            return
+        ts = self._center_runner._test_service
+        if ts is not None and hasattr(ts, "pause_xy_for_capture"):
+            ts.pause_xy_for_capture("manual_af_zscan")
+        if hasattr(self.autofocus, "_pending_point_index"):
+            self.autofocus._pending_point_index = None
+        self.autofocus._pending_center_kpi = dict(getattr(self, "_last_center_kpi", {}) or {})
+        self.status_message.emit("🎯 Iniciando Z-scan autofoco...")
+        self.autofocus_started.emit()
+        started = self.autofocus.start_autofocus(objects)
+        if not started:
+            self._finish_standalone_jog("af_start_fail")
+            if self._pending_capture:
+                self.autofocus_complete.emit([])
+
+    def _on_af_scan_complete(self, _results) -> None:
+        self._finish_standalone_jog("af_complete")
+
+    def _on_center_overlay(self, objects) -> None:
+        """Actualiza cruces Δpx del overlay durante el lazo de centrado."""
+        objs = list(objects or [])
+        if objs:
+            self.detection_complete.emit(objs)
+
+    def _on_center_completed(self, result: CenterResult) -> None:
+        self._last_center_kpi = dict(result.kpi or {})
+        objects = list(result.objects or [])
+        if not objects and result.primary is not None:
+            objects = [result.primary]
+        residual = (result.kpi or {}).get("xy_offset_post_px")
+        tau = float((result.kpi or {}).get("tau_px") or FORCE_CENTER_PX)
+        if not can_start_zscan(
+            action=result.action,
+            reason=result.reason,
+            center_attempted=bool((result.kpi or {}).get("center_attempted")),
+            residual_px=residual if residual is not None else None,
+            tau_px=tau,
+            objects_found=bool(objects),
+        ):
+            logger.warning(
+                "[CameraOrchestrator] NO Z-scan: reason=%s objects=%d residual=%s",
+                result.reason,
+                len(objects),
+                residual,
+            )
+            self.status_message.emit(
+                f"❌ NO Z-scan ({result.reason}): sin objeto o lost_lock"
+            )
+            self._finish_standalone_jog(result.reason or "no_object")
+            self.autofocus_complete.emit([])
+            return
+        attempted = bool((result.kpi or {}).get("center_attempted"))
+        use_lock = attempted or str(result.reason) in ("already_centered", "centered")
+        if use_lock and result.primary is not None:
+            z_objects = [result.primary]
+        else:
+            z_objects = objects
+        if len(z_objects) > 1:
+            self.status_message.emit(
+                f"🎯 Autofoco superficie: {len(z_objects)} ROI en 1 solo barrido Z "
+                f"(S = Σ S_i por plano)"
+            )
+        self.detection_complete.emit(z_objects)
+        self._start_zscan(z_objects)
     
-    def run_autofocus(self, capture_after: bool = False, 
-                     min_area: float = 0, max_area: float = float('inf')) -> None:
+    def run_autofocus(
+        self,
+        capture_after: bool = False,
+        min_area: float = 0,
+        max_area: float = float("inf"),
+        center_ctx: Optional[CenterContext] = None,
+        test_service=None,
+    ) -> None:
         """
-        Ejecuta detección de objetos + autofoco.
-        
+        Ejecuta detección de objetos + (opcional) jog XY + autofoco.
+
         Flujo:
         1. Obtiene frame actual de cámara
         2. Detecta objetos con SmartFocusScorer
         3. Filtra por rango de área
-        4. Inicia autofoco asíncrono
-        5. Opcionalmente captura después
-        
-        Args:
-            capture_after: Si debe capturar imagen después del autofoco
-            min_area: Área mínima de objetos (px²)
-            max_area: Área máxima de objetos (px²)
+        4. Si el centrado está ON y hay offset/clip: jog XY → settle → re-detectar
+        5. Inicia Z-scan asíncrono
+        6. Opcionalmente captura después
         """
-        # Validar que hay frame disponible
         if self._current_frame is None:
             self.validation_error.emit("No hay frame disponible")
             return
         
         current_frame = self._current_frame
         
-        # Validar que scorer está disponible
         if self.scorer is None:
             self.validation_error.emit("SmartFocusScorer no disponible")
             return
+
+        self._af_min_area = float(min_area)
+        self._af_max_area = float(max_area)
+        self._pending_capture = capture_after
+        self._last_center_kpi = {}
         
         self.status_message.emit("🔍 Detectando objetos...")
         
-        # CRÍTICO: Usar el MISMO frame para detección Y autofoco
-        # NO convertir ni normalizar - usar frame RAW directamente
-        # SmartFocusScorer debe manejar internamente la conversión uint16->uint8
+        frame_bgr = self._frame_to_bgr(current_frame)
+        if frame_bgr is None:
+            self.validation_error.emit("No hay frame disponible")
+            return
         
-        frame = current_frame.copy()
-        
-        # Convertir a BGR si es necesario (pero mantener dimensiones originales)
-        if len(frame.shape) == 2:
-            # Grayscale -> BGR (para SmartFocusScorer)
-            if frame.dtype == np.uint16:
-                # Normalizar uint16 -> uint8 MANTENIENDO dimensiones
-                frame_max = frame.max()
-                if frame_max > 0:
-                    gray_uint8 = (frame / frame_max * 255).astype(np.uint8)
-                else:
-                    gray_uint8 = np.zeros(frame.shape, dtype=np.uint8)
-                frame_bgr = cv2.cvtColor(gray_uint8, cv2.COLOR_GRAY2BGR)
-            else:
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        else:
-            # Ya es color
-            if frame.dtype == np.uint16:
-                frame_max = frame.max()
-                if frame_max > 0:
-                    frame_bgr = (frame / frame_max * 255).astype(np.uint8)
-                else:
-                    frame_bgr = np.zeros(frame.shape[:2] + (3,), dtype=np.uint8)
-            else:
-                frame_bgr = frame.astype(np.uint8)
-        
-        # Detectar objetos en frame con dimensiones RAW
         h_frame, w_frame = frame_bgr.shape[:2]
-        logger.info(f"[CameraOrchestrator] Frame para detección: {w_frame}x{h_frame} (mantiene dimensiones RAW)")
+        logger.info(
+            "[CameraOrchestrator] Frame para detección: %sx%s (mantiene dimensiones RAW)",
+            w_frame,
+            h_frame,
+        )
         
+        detect_t0 = time.perf_counter()
         result = self.scorer.assess_image(frame_bgr)
+        t_detect = time.perf_counter() - detect_t0
         all_objects = result.objects if result.objects else []
         
-        # Las coordenadas de bbox ahora están en las dimensiones correctas del frame RAW
-        logger.info(f"[CameraOrchestrator] ✅ Bounding boxes en escala correcta ({w_frame}x{h_frame})")
+        logger.info(
+            "[CameraOrchestrator] ✅ Bounding boxes en escala correcta (%sx%s)",
+            w_frame,
+            h_frame,
+        )
         
-        # Filtrar por rango de área
-        objects = [obj for obj in all_objects if min_area <= obj.area <= max_area]
+        objects = self._filter_manual_objects(all_objects)
         
         if not objects:
             msg = f"⚠️ No hay objetos en rango [{min_area}-{max_area}] px"
@@ -152,11 +281,9 @@ class CameraOrchestrator(QObject):
             
             if capture_after:
                 self.status_message.emit("   Capturando sin autofoco...")
-                # Emitir señal para que UI maneje captura
                 self.autofocus_complete.emit([])
             return
         
-        # Objetos detectados → un solo barrido Z (superficie multi-ROI)
         self.status_message.emit(
             f"✅ {len(objects)} objeto(s) en rango (de {len(all_objects)} detectados)"
         )
@@ -165,23 +292,58 @@ class CameraOrchestrator(QObject):
                 f"   #{i+1}: área={obj.area:.0f}px, score={obj.focus_score:.1f}"
             )
 
+        primary = pick_tracked_primary(objects)
+        if primary is not None:
+            try:
+                setattr(primary, "_center_locked", True)
+            except Exception:
+                pass
         self.detection_complete.emit(objects)
 
-        if len(objects) > 1:
-            self.status_message.emit(
-                f"🎯 Autofoco superficie: {len(objects)} ROI en 1 solo barrido Z "
-                f"(S = Σ S_i por plano)"
-            )
-
-        if self.autofocus is not None:
-            self.status_message.emit("🎯 Iniciando Z-scan autofoco...")
-            self._pending_capture = capture_after
-            self.autofocus_started.emit()
-            self.autofocus.start_autofocus(objects)
-        else:
+        if self.autofocus is None:
             self.validation_error.emit("AutofocusService no disponible")
             if capture_after:
                 self.autofocus_complete.emit([])
+            return
+
+        ctx = center_ctx
+        if ctx is None:
+            ctx = CenterContext(
+                enabled=False,
+                t_detect_s=t_detect,
+                log_prefix="[CameraOrchestrator]",
+            )
+        else:
+            ctx.t_detect_s = t_detect
+            ctx.log_prefix = ctx.log_prefix or "[CameraOrchestrator]"
+
+        if test_service is not None:
+            self._center_runner.bind_test_service(test_service)
+            ctx.has_stage = bool(
+                (
+                    hasattr(test_service, "goto_xy_um")
+                    or hasattr(test_service, "start_center_jog")
+                )
+                and (
+                    getattr(test_service, "_controller_a", None) is not None
+                    or getattr(test_service, "_controller_b", None) is not None
+                )
+            )
+            if ctx.has_stage:
+                sx, sy, _ex, _ey = test_service.read_current_position_um(
+                    ctx.stage_x_um, ctx.stage_y_um
+                )
+                if sx is not None:
+                    ctx.stage_x_um = float(sx)
+                if sy is not None:
+                    ctx.stage_y_um = float(sy)
+            else:
+                logger.error(
+                    "[CameraOrchestrator] AF_CENTER: stage no listo "
+                    "(controladores / TestService)"
+                )
+
+        self._center_runner.begin(objects, frame_bgr, ctx)
     
     def validate_autofocus_params(self, config: AutofocusConfig, 
                                   cfocus_limits: Optional[dict] = None) -> tuple:

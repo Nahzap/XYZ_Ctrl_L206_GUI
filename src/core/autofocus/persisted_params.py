@@ -88,4 +88,83 @@ def sanitize_autofocus_form(
                 f"en la misma Z real"
             )
 
+    hyst_um = _as_float(fixed.get("center_hysteresis_um"))
+    if hyst_um is not None:
+        clamped = max(1.0, min(200.0, hyst_um))
+        if clamped != hyst_um:
+            fixed["center_hysteresis_um"] = clamped
+            notes.append(
+                f"center_hysteresis_um {hyst_um:.1f}→{clamped:.1f}µm"
+            )
+
+    hyst_px = _as_float(fixed.get("center_hysteresis_px"))
+    if hyst_px is not None:
+        clamped_px = max(1.0, min(2000.0, hyst_px))
+        if clamped_px != hyst_px:
+            fixed["center_hysteresis_px"] = clamped_px
+            notes.append(
+                f"center_hysteresis_px {hyst_px:.1f}→{clamped_px:.1f}px"
+            )
+
+    retries = fixed.get("center_max_retries")
+    if retries is not None:
+        try:
+            n_ret = int(retries)
+        except (TypeError, ValueError):
+            n_ret = 8
+        if n_ret < 6:
+            notes.append(
+                f"center_max_retries {n_ret}→8 (pasos del lazo XY, no reintentos de signo)"
+            )
+            n_ret = 8
+        n_ret = max(6, min(8, n_ret))
+        if n_ret != retries:
+            fixed["center_max_retries"] = n_ret
+
+    max_d = _as_float(fixed.get("center_max_delta_um"))
+    if max_d is not None:
+        # 0 = sin cap (interpolación completa al centro). >0 = techo explícito.
+        if max_d <= 0.0:
+            clamped_d = 0.0
+        else:
+            clamped_d = max(5.0, min(2000.0, max_d))
+        if clamped_d != max_d:
+            fixed["center_max_delta_um"] = clamped_d
+
+    for sign_key in ("center_sign_x", "center_sign_y"):
+        raw_sign = fixed.get(sign_key)
+        if raw_sign is None:
+            continue
+        try:
+            sign = 1 if int(raw_sign) >= 0 else -1
+        except (TypeError, ValueError):
+            sign = 1
+        if sign != raw_sign:
+            fixed[sign_key] = sign
+
+    # Δpx = centro_imagen − centroide. JSON viejo usaba e=cx−W/2 con sign=−1;
+    # invertir signos una vez para no flip-flop el comando de stage.
+    if not fixed.get("center_delta_toward_image"):
+        flipped = []
+        for sign_key in ("center_sign_x", "center_sign_y"):
+            if sign_key not in fixed:
+                continue
+            try:
+                old = 1 if int(fixed[sign_key]) >= 0 else -1
+            except (TypeError, ValueError):
+                old = -1
+            fixed[sign_key] = -old
+            flipped.append(f"{sign_key} {old:+d}→{-old:+d}")
+        hyst = _as_float(fixed.get("center_hysteresis_um"))
+        if hyst is not None and hyst >= 40.0:
+            fixed["center_hysteresis_um"] = 12.0
+            notes.append(
+                f"center_hysteresis_um {hyst:.1f}→12.0µm (default; 50µm saltaba el goto)"
+            )
+        fixed["center_delta_toward_image"] = True
+        if flipped:
+            notes.append(
+                "Δpx hacia centro de imagen: " + ", ".join(flipped)
+            )
+
     return fixed, notes

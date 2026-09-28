@@ -76,6 +76,8 @@ class StepController:
         self._get_controller_a = get_controller_a
         self._get_controller_b = get_controller_b
         self._send_command = send_command
+        self.center_approach_no_timeout = False
+        self._center_fov_tmo_logged = False
 
         self.phase = StepControllerPhase.IDLE
         self.metrics = StepSessionMetrics()
@@ -219,6 +221,7 @@ class StepController:
         }
         self._pwm_crit.reset()
         self._last_control_telemetry_epoch = 0
+        self._center_fov_tmo_logged = False
 
     def _new_fov_pulse_state(self) -> dict:
         """Estado por eje: magnitud, signo aprendido, ganancia y reposo."""
@@ -1516,6 +1519,19 @@ class StepController:
         out.settle_ms = float(getattr(self, "_fov_active_ms", 0.0) or 0.0)
         # Timeout único sobre tiempo con telemetría fresca.
         if float(self._fov_active_ms) >= float(self.config.fov_verify_timeout_ms):
+            if bool(getattr(self, "center_approach_no_timeout", False)):
+                if not getattr(self, "_center_fov_tmo_logged", False):
+                    self._center_fov_tmo_logged = True
+                    logger.info(
+                        "[StepController] Punto %d FOV_TIMEOUT ignorado "
+                        "(center approach — caza hasta SETTLED/centroides) "
+                        "residual=(%.1f,%.1f)µm t_active=%.0fms",
+                        self._point_index + 1,
+                        err_traj_x,
+                        err_traj_y,
+                        float(self._fov_active_ms),
+                    )
+                return out
             self._cz_soft_off()
             logger.warning(
                 "[StepController] Punto %d FOV_TIMEOUT residual=(%.1f,%.1f)µm "
@@ -1621,9 +1637,22 @@ class StepController:
             out.settling = 0
             out.settle_ms = float(self._fov_active_ms)
 
-        # Arduino no corrige en FOV: fallar pronto → re-approach host (no 25 s).
-        host_timeout = min(float(self.config.fov_verify_timeout_ms), 2500.0)
+        # Arduino: residual≤tol. En center approach NO hay cap de tiempo.
+        host_timeout = float(self.config.fov_verify_timeout_ms)
         if float(self._fov_active_ms) >= host_timeout:
+            if bool(getattr(self, "center_approach_no_timeout", False)):
+                if not getattr(self, "_center_fov_tmo_logged", False):
+                    self._center_fov_tmo_logged = True
+                    logger.info(
+                        "[StepController] Punto %d FOV_HOST_ONLY_TIMEOUT ignorado "
+                        "(center approach — sigue cazando) residual=(%.1f,%.1f)µm "
+                        "t_active=%.0fms",
+                        self._point_index + 1,
+                        err_traj_x,
+                        err_traj_y,
+                        float(self._fov_active_ms),
+                    )
+                return out
             if cur <= tol:
                 return _accept("FOV_HOST_ONLY_TIMEOUT_IN_BAND")
             logger.warning(
@@ -1919,7 +1948,8 @@ class StepController:
 
         elapsed_ms = (time.perf_counter() - self._step_started_mono) * 1000.0
         step_timeout = self._step_timeout_ms(step)
-        if elapsed_ms > step_timeout and not self._hinf_native:
+        center_open = bool(getattr(self, "center_approach_no_timeout", False))
+        if elapsed_ms > step_timeout and not self._hinf_native and not center_open:
             exit_tol = self._effective_tol_um() * self.config.tol_hysteresis_factor
             if abs(err) <= exit_tol and self._sensor_has_reading(step):
                 logger.info(
