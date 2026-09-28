@@ -46,7 +46,7 @@ class SerialHandler(QThread):
         """Parsea telemetría y actualiza el buffer en el hilo RX (tasa completa)."""
         if self.sensor_buffer is None:
             return
-        if not line or line[0] not in '-0123456789':
+        if not line or line[0] not in '+-0123456789':
             return
         try:
             parts = line.split(',')
@@ -59,6 +59,8 @@ class SerialHandler(QThread):
                     pot_a=parsed['pot_a'], pot_b=parsed['pot_b'],
                     settled=bool(parsed.get('settled', False)),
                     state=str(parsed.get('state', '')),
+                    target_x=parsed.get('target_x'),
+                    target_y=parsed.get('target_y'),
                 )
             elif len(parts) == 4:
                 pot_a, pot_b, sens_1, sens_2 = map(int, parts)

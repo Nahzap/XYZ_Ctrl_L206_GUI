@@ -1,13 +1,26 @@
-"""Protocolo de comunicación con controlador XY (STM32F767ZI).
+"""Protocolo de comunicación con controlador XY (STM32F767ZI / Arduino / FPGA).
 
 Comandos vivos:
   M | B | A,<a>,<b> | P,<axis>,<sign>,<idx> | F,<rx>,<ry>[,gate] | I,<ix>,<iy> | N
 Estados telemetría: MANUAL|AUTO|BRAKE|PULSE|FINE|HOLD|SETTLED
+FPGA Motor_CTRL: RESET|MANUAL|AUTO|BRAKE|PULSE|PC
 """
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+FPGA_STATES = ("RESET", "MANUAL", "AUTO", "BRAKE", "PULSE", "PC")
+
+
+def _is_fpga_frame(parts) -> bool:
+    """FPGA: 8 campos, cuentas en 5 y 6, estado en 7 (Lab 206 lleva el estado en 5)."""
+    return (
+        len(parts) >= 8
+        and parts[4].strip().isdigit()
+        and parts[5].strip().isdigit()
+        and parts[6].strip().isalpha()
+    )
 
 
 class MotorProtocol:
@@ -59,10 +72,17 @@ class MotorProtocol:
 
     @staticmethod
     def full_halt_commands():
-        """Secuencia única de parada dura: N → B → A,0,0 → M.
+        """Secuencia única de parada dura: N → B → A,0,0 → M (FPGA: solo B).
 
+        En la FPGA, M le devuelve el mando a los potes y la platina iría a
+        donde estén; B frena desde cualquier modo.
         Un solo productor debe emitirla; duplicarla provoca carrera en RX MCU.
         """
+        from config import constants
+        from config.mcu_profiles import MCU_FPGA
+
+        if constants.MCU_TYPE == MCU_FPGA:
+            return (MotorProtocol.format_brake_command(),)
         return (
             MotorProtocol.format_cz_off(),
             MotorProtocol.format_brake_command(),
@@ -88,9 +108,28 @@ class MotorProtocol:
 
     @staticmethod
     def parse_sensor_data_with_status(line):
-        """Telemetría: pot_a,pot_b,sens_1,sens_2,estado,settled."""
+        """Telemetría Lab 206 o FPGA Motor_CTRL.
+
+        Lab 206: pot_a,pot_b,sens_1,sens_2,estado,settled
+        FPGA:    PotenciaA,PotenciaB,PotA,PotB,Sensor1,Sensor2,Estado,Settled
+                 Sensor1 = X y Sensor2 = Y; se devuelven como sens_2 = X y
+                 sens_1 = Y, la convención del resto del programa.
+                 PotA/PotB = pedido que sigue la FPGA (cuentas).
+        """
         try:
             parts = line.split(",")
+            if _is_fpga_frame(parts):
+                return {
+                    "pot_a": int(parts[0]),
+                    "pot_b": int(parts[1]),
+                    "sens_1": int(parts[5]),
+                    "sens_2": int(parts[4]),
+                    "state": parts[6].strip(),
+                    "settled": parts[7].strip() == "1",
+                    "target_x": int(parts[2]),
+                    "target_y": int(parts[3]),
+                    "frame": "FPGA",
+                }
             if len(parts) >= 6:
                 state = parts[4].strip()
                 if state not in (

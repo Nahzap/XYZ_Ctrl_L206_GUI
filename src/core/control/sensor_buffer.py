@@ -25,6 +25,8 @@ class TelemetryFrame:
     state: str = ""
     settled: bool = False
     t_monotonic: float = 0.0
+    target_x: Optional[int] = None
+    target_y: Optional[int] = None
 
 
 class SensorBuffer:
@@ -47,6 +49,8 @@ class SensorBuffer:
         pot_b: int = 0,
         settled: bool = False,
         state: str = "",
+        target_x: Optional[int] = None,
+        target_y: Optional[int] = None,
     ) -> None:
         now = time.perf_counter()
         s1 = SensorSample(int(sensor_1), now)
@@ -64,6 +68,8 @@ class SensorBuffer:
                 state=str(state),
                 settled=bool(settled),
                 t_monotonic=now,
+                target_x=None if target_x is None else int(target_x),
+                target_y=None if target_y is None else int(target_y),
             )
             self._update_count += 1
 

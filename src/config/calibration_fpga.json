@@ -1,0 +1,26 @@
+{
+    "_comment": "Calibración con encoders (perfil FPGA, Motor_CTRL). SIN MEDIR: pendiente supuesta de 1,8 µm por flanco / 84 cuentas por flanco = 0,021429 µm por cuenta. Cuenta 0 = tope inferior de cada eje. Reemplazar con la medición del paso 0.",
+    "_updated": "2026-09-28 17:40:00",
+    "calibration": {
+        "x_axis": {
+            "description": "Motor A, Sensor 2 (Sensor1 de la FPGA) - Eje X",
+            "intercept_um": 0.0,
+            "slope_um_per_adc": 0.021429
+        },
+        "y_axis": {
+            "description": "Motor B, Sensor 1 (Sensor2 de la FPGA) - Eje Y",
+            "intercept_um": 0.0,
+            "slope_um_per_adc": 0.021429
+        }
+    },
+    "control": {
+        "deadzone_adc": 84,
+        "position_tolerance_um": 25.0,
+        "settling_cycles": 4,
+        "default_trajectory_pause_s": 2.0
+    },
+    "system": {
+        "adc_max": 999999.0,
+        "recorrido_um": 69000.0
+    }
+}

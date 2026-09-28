@@ -11,9 +11,55 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
 from PyQt5.QtCore import pyqtSignal
 
 from config.constants import BAUD_RATE, FACTORY_UI, MCU_TYPE
-from config.mcu_profiles import MCU_PROFILES, list_mcu_ids
+from config.mcu_profiles import MCU_FPGA, MCU_PROFILES, list_mcu_ids
 
 logger = logging.getLogger('MotorControl_L206')
+
+_DEFAULT_TEXTS = "default"
+# (título del grupo, sensor 1, sensor 2)
+_SENSOR_TEXTS = {
+    _DEFAULT_TEXTS: (
+        "Lectura de Sensores Análogos",
+        "Valor Sensor 1 (Y / PC3):",
+        "Valor Sensor 2 (X / PA3):",
+    ),
+    MCU_FPGA: (
+        "Cuenta de Encoders (FPGA)",
+        "Cuenta Y (Sensor2 FPGA):",
+        "Cuenta X (Sensor1 FPGA):",
+    ),
+}
+# (valor inicial, placeholder, tooltip)
+_POWER_TEXTS = {
+    _DEFAULT_TEXTS: (
+        "128,0",
+        "Ej: 128,-128 (Arduino ≥110)",
+        "Potencia Motor A y B (-255..255). Arranque útil: |pwm|≥110 (Arduino) / ≥95 (STM32).",
+    ),
+    MCU_FPGA: (
+        "40,0",
+        "Ej: 40,-40 (%)",
+        "Potencia X y Y en % (-80..80). La FPGA recorta a ±80 %.",
+    ),
+}
+_COMMAND_TEXTS = {
+    _DEFAULT_TEXTS: (
+        "Comandos: M | A,<pwm_a>,<pwm_b> | B | N. "
+        "STM32: +F/I/P. Arduino: PWM≥110; F/I/P ignorados."
+    ),
+    MCU_FPGA: (
+        "FPGA: M = los potes mandan la posición | A,<%x>,<%y> hasta ±80 | "
+        "B freno | N motores sueltos. F/I no se usan."
+    ),
+}
+_MANUAL_TIPS = {
+    _DEFAULT_TEXTS: "",
+    MCU_FPGA: "En la FPGA, M hace que los potes manden la posición: la platina va a donde estén.",
+}
+
+
+def _texts_for(table: dict, mcu_id: str):
+    return table.get(mcu_id, table[_DEFAULT_TEXTS])
 
 
 class ControlTab(QWidget):
@@ -30,7 +76,7 @@ class ControlTab(QWidget):
     auto_mode_requested = pyqtSignal()
     power_command_requested = pyqtSignal(int, int)  # power_a, power_b
     serial_reconnect_requested = pyqtSignal(str, int)  # puerto, baudrate
-    mcu_profile_changed = pyqtSignal(str)  # STM32 | ARDUINO
+    mcu_profile_changed = pyqtSignal(str)  # STM32 | ARDUINO | FPGA
     
     # --- NUEVAS SEÑALES PARA POSITION HOLD ---
     position_hold_requested = pyqtSignal(int, int)  # sensor1_target, sensor2_target
@@ -49,7 +95,10 @@ class ControlTab(QWidget):
         self.parent_gui = parent
         self.serial_handler = serial_handler
         self.value_labels = {}
+        self._power_max = 255
+        self._last_settled = None
         self._setup_ui()
+        self._apply_profile_ui(self.get_selected_mcu())
         logger.debug("ControlTab inicializado")
     
     def _setup_ui(self):
@@ -94,7 +143,8 @@ class ControlTab(QWidget):
         self.mcu_combo.setCurrentIndex(max(0, idx))
         self.mcu_combo.setToolTip(
             "STM32F767ZI = MycoViT (C(z) F/I/P). "
-            "Arduino UNO = emergencia DRV8871 (host-only; PWM≥110)."
+            "Arduino UNO = emergencia DRV8871 (host-only; PWM≥110). "
+            "FPGA Tang Nano 9K = Motor_CTRL (encoders, 115200, potencia en %)."
         )
         self.mcu_combo.currentIndexChanged.connect(self._on_mcu_changed)
         layout.addWidget(self.mcu_combo, 0, 1, 1, 2)
@@ -120,7 +170,8 @@ class ControlTab(QWidget):
         self.baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200', '230400', '1000000'])
         self.baudrate_combo.setCurrentText(str(BAUD_RATE))
         self.baudrate_combo.setToolTip(
-            "Velocidad serial. Firmware STM32/Arduino emergencia: 1000000 bps."
+            "Velocidad serial. Firmware STM32/Arduino emergencia: 1000000 bps. "
+            "FPGA Motor_CTRL: 115200 bps. Se ajusta al elegir el MCU."
         )
         if FACTORY_UI:
             self.baudrate_combo.setVisible(False)
@@ -156,6 +207,28 @@ class ControlTab(QWidget):
             return
         logger.info("ControlTab: perfil MCU -> %s", mcu_id)
         self.mcu_profile_changed.emit(str(mcu_id))
+        self._apply_profile_ui(str(mcu_id))
+
+    def _apply_profile_ui(self, mcu_id: str):
+        """Baudios, rango de potencia y textos del perfil elegido."""
+        prof = MCU_PROFILES.get(mcu_id)
+        if prof is None:
+            return
+        self._power_max = int(prof["power_max"])
+        self.baudrate_combo.setCurrentText(str(prof["baud"]))
+
+        title, s1_text, s2_text = _texts_for(_SENSOR_TEXTS, mcu_id)
+        self.sensors_group.setTitle(title)
+        self.sensor1_name_label.setText(s1_text)
+        self.sensor2_name_label.setText(s2_text)
+
+        value, placeholder, tip = _texts_for(_POWER_TEXTS, mcu_id)
+        self.power_input.setText(value)
+        self.power_input.setPlaceholderText(placeholder)
+        self.power_input.setToolTip(tip)
+
+        self.commands_info_label.setText(_texts_for(_COMMAND_TEXTS, mcu_id))
+        self.manual_btn.setToolTip(_texts_for(_MANUAL_TIPS, mcu_id))
 
     def get_selected_mcu(self) -> str:
         return str(self.mcu_combo.currentData() or MCU_TYPE)
@@ -172,13 +245,13 @@ class ControlTab(QWidget):
         layout.addWidget(self.value_labels['mode'], 0, 1)
         
         # Botón modo manual
-        manual_btn = QPushButton("🔧 Activar MODO MANUAL")
-        manual_btn.setStyleSheet("""
+        self.manual_btn = QPushButton("🔧 Activar MODO MANUAL")
+        self.manual_btn.setStyleSheet("""
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #E67E22; }
             QPushButton:hover { background-color: #F39C12; }
         """)
-        manual_btn.clicked.connect(self._request_manual_mode)
-        layout.addWidget(manual_btn, 1, 0, 1, 2)
+        self.manual_btn.clicked.connect(self._request_manual_mode)
+        layout.addWidget(self.manual_btn, 1, 0, 1, 2)
         
         # Botón modo auto
         auto_btn = QPushButton("🤖 Activar MODO AUTO")
@@ -191,11 +264,7 @@ class ControlTab(QWidget):
         
         # Entrada de potencia
         layout.addWidget(QLabel("Potencia (A, B):"), 3, 0)
-        self.power_input = QLineEdit("128,0")
-        self.power_input.setPlaceholderText("Ej: 128,-128 (Arduino ≥110)")
-        self.power_input.setToolTip(
-            "Potencia Motor A y B (-255..255). Arranque útil: |pwm|≥110 (Arduino) / ≥95 (STM32)."
-        )
+        self.power_input = QLineEdit()
         layout.addWidget(self.power_input, 3, 1)
         
         # Botón enviar potencia
@@ -231,16 +300,19 @@ class ControlTab(QWidget):
     
     def _create_sensors_group(self):
         """Crea el panel de lectura de sensores."""
-        group_box = QGroupBox("Lectura de Sensores Análogos")
+        group_box = QGroupBox()
+        self.sensors_group = group_box
         layout = QGridLayout()
         value_style = "font-size: 18px; color: #58D68D;"
         
-        layout.addWidget(QLabel("Valor Sensor 1 (Y / PC3):"), 0, 0)
+        self.sensor1_name_label = QLabel()
+        layout.addWidget(self.sensor1_name_label, 0, 0)
         self.value_labels['sensor_1'] = QLabel("---")
         self.value_labels['sensor_1'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_1'], 0, 1)
         
-        layout.addWidget(QLabel("Valor Sensor 2 (X / PA3):"), 1, 0)
+        self.sensor2_name_label = QLabel()
+        layout.addWidget(self.sensor2_name_label, 1, 0)
         self.value_labels['sensor_2'] = QLabel("---")
         self.value_labels['sensor_2'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_2'], 1, 1)
@@ -323,9 +395,10 @@ class ControlTab(QWidget):
             power_a = int(parts[0].strip())
             power_b = int(parts[1].strip())
             
-            # Validar rango
-            power_a = max(-255, min(255, power_a))
-            power_b = max(-255, min(255, power_b))
+            # Validar rango del perfil: ±255 PWM o ±80 % (FPGA)
+            lim = self._power_max
+            power_a = max(-lim, min(lim, power_a))
+            power_b = max(-lim, min(lim, power_b))
             
             # ENVIAR DIRECTAMENTE AL ARDUINO (formato: A,potA,potB)
             self.send_power(power_a, power_b)
@@ -480,12 +553,9 @@ class ControlTab(QWidget):
         self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
         layout.addWidget(self.settled_status_label, 2, 3)
         
-        info_label = QLabel(
-            "Comandos: M | A,<pwm_a>,<pwm_b> | B | N. "
-            "STM32: +F/I/P. Arduino: PWM≥110; F/I/P ignorados."
-        )
-        info_label.setStyleSheet("color: #7F8C8D; font-size: 10px;")
-        layout.addWidget(info_label, 3, 0, 1, 5)
+        self.commands_info_label = QLabel()
+        self.commands_info_label.setStyleSheet("color: #7F8C8D; font-size: 10px;")
+        layout.addWidget(self.commands_info_label, 3, 0, 1, 5)
         
         self.firmware_status_label = QLabel("Firmware: Esperando telemetría...")
         self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")
@@ -510,8 +580,11 @@ class ControlTab(QWidget):
     def update_arduino_status(self, state: str, settled: bool):
         """Actualiza el estado del MCU y flag settled (informativo)."""
         current_state = self.arduino_state_label.text()
-        if current_state == state.upper():
+        state_changed = current_state != state.upper()
+        # La FPGA cambia Settled sin cambiar de estado.
+        if not state_changed and settled == self._last_settled:
             return
+        self._last_settled = settled
         
         self.arduino_state_label.setText(state.upper())
         
@@ -522,7 +595,10 @@ class ControlTab(QWidget):
             'BRAKE': '#E74C3C',
             'SETTLING': '#F39C12',
             'UNKNOWN': '#95A5A6',
-            'LEGACY': '#F39C12'
+            'LEGACY': '#F39C12',
+            'RESET': '#E67E22',
+            'PULSE': '#1ABC9C',
+            'PC': '#27AE60',
         }
         color = state_colors.get(state.upper(), '#95A5A6')
         self.arduino_state_label.setStyleSheet(f"font-weight: bold; color: {color};")
@@ -534,14 +610,22 @@ class ControlTab(QWidget):
             self.settled_status_label.setText("NO")
             self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
         
+        if not state_changed:
+            return
         logger.info(f"ControlTab: Estado MCU cambiado a {state}, Settled={settled}")
         
         if hasattr(self, 'firmware_status_label'):
+            profile_label = MCU_PROFILES.get(self.get_selected_mcu(), {}).get("label", "MCU")
             if state.upper() == 'LEGACY':
                 self.firmware_status_label.setText("Firmware LEGACY 4 campos - preferir STM32 6 campos")
                 self.firmware_status_label.setStyleSheet("color: #E74C3C; font-size: 10px; font-weight: bold;")
-            elif state.upper() in ['MANUAL', 'AUTO', 'BRAKE']:
-                self.firmware_status_label.setText("STM32F767ZI - M/A/B OK (Hold/S N/A)")
+            elif state.upper() == 'RESET':
+                self.firmware_status_label.setText(
+                    f"{profile_label} - RESET: sin calibrar; los potes no mueven X ni Y"
+                )
+                self.firmware_status_label.setStyleSheet("color: #E67E22; font-size: 10px; font-weight: bold;")
+            elif state.upper() in ['MANUAL', 'AUTO', 'BRAKE', 'PULSE', 'PC']:
+                self.firmware_status_label.setText(f"{profile_label} - estado {state.upper()} OK")
                 self.firmware_status_label.setStyleSheet("color: #27AE60; font-size: 10px; font-weight: bold;")
             else:
                 self.firmware_status_label.setText(f"Firmware: estado {state}")

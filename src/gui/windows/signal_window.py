@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox
 from PyQt5.QtCore import Qt
 import pyqtgraph as pg
 import config.constants as constants
+from config.mcu_profiles import MCU_FPGA
 from gui.styles.dark_theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,8 @@ class SignalWindow(QWidget):
         self.data = {
             'power_a': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),  # int16 más rápido que float32
             'power_b': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
-            'sensor_1': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
-            'sensor_2': np.zeros(constants.PLOT_LENGTH, dtype=np.int16),
+            'sensor_1': np.zeros(constants.PLOT_LENGTH, dtype=np.int32),  # cuentas FPGA hasta 999999
+            'sensor_2': np.zeros(constants.PLOT_LENGTH, dtype=np.int32),
         }
         
         # LÍNEAS ULTRA-RÁPIDAS - configuración mínima
@@ -107,10 +108,18 @@ class SignalWindow(QWidget):
         logger.debug("SignalWindow creada exitosamente")
 
     def refresh_adc_range(self):
-        """Ajusta el eje Y al ADC_MAX del perfil MCU activo (10-bit / 12-bit)."""
+        """Eje Y: 0..ADC_MAX del perfil (10/12-bit); con la FPGA, autoescala sobre las cuentas."""
+        mcu = getattr(constants, "MCU_TYPE", "?")
+        if mcu == MCU_FPGA:
+            # 999999 es solo el tope sin calibrar; fijo, las cuentas quedarían pegadas al fondo
+            self.plot_widget.enableAutoRange(axis='y')
+            self.plot_widget.setLabel('left', 'Cuenta (encoder)', color='#CCCCCC', size='12pt')
+            logger.debug("SignalWindow YRange -> auto (MCU=%s)", mcu)
+            return
         adc_hi = float(constants.ADC_MAX)
         self.plot_widget.setYRange(0, adc_hi, padding=0)
-        logger.debug("SignalWindow YRange -> 0..%s (MCU=%s)", adc_hi, getattr(constants, "MCU_TYPE", "?"))
+        self.plot_widget.setLabel('left', 'Valor (ADC)', color='#CCCCCC', size='12pt')
+        logger.debug("SignalWindow YRange -> 0..%s (MCU=%s)", adc_hi, mcu)
     
     def update_plot_visibility(self):
         """Muestra u oculta las líneas del gráfico según los checkboxes."""

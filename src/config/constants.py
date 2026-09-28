@@ -22,11 +22,13 @@ PLOT_LENGTH = 100
 # True ocultaba el selector y dejaba solo "Enlace: 1000 kbps (fijo)".
 FACTORY_UI = False
 
-# --- PERFIL MCU (STM32 MycoViT | Arduino UNO emergencia) ---
+# --- PERFIL MCU (STM32 MycoViT | Arduino UNO emergencia | FPGA Motor_CTRL) ---
 # Se sobrescribe al arrancar / al cambiar el selector vía mcu_profiles.apply_mcu_profile.
 MCU_TYPE = 'ARDUINO'
 MCU_SUPPORTS_CZ = False
 MCU_USE_CZ_DEFAULT = False
+# Tope de |potencia| del comando A: PWM ±255 (STM32/Arduino) o % ±80 (FPGA).
+POWER_MAX = 255
 
 # --- SEPARACIÓN DE PLANOS (Fase 1: lazo máquina-rápido + UI ~30 Hz) ---
 # La UI (labels/plots) se refresca a esta tasa; la medida (SensorBuffer) y el
@@ -143,27 +145,37 @@ def save_calibration(calibration_x: dict, calibration_y: dict, control: dict = N
         return False
 
 
+def set_calibration_file(file_name: str) -> None:
+    """Elige el JSON de calibración (en config/) del perfil activo y lo recarga."""
+    global _CALIBRATION_FILE
+    _CALIBRATION_FILE = os.path.join(_CONFIG_DIR, file_name)
+    reload_calibration()
+
+
 def reload_calibration():
     """Recarga la calibración desde el archivo JSON."""
-    global CALIBRATION_X, CALIBRATION_Y, DEADZONE_ADC, POSITION_TOLERANCE_UM
+    global DEADZONE_ADC, POSITION_TOLERANCE_UM
     global SETTLING_CYCLES, DEFAULT_TRAJECTORY_PAUSE, ADC_MAX, RECORRIDO_UM, FACTOR_ESCALA
     global MAX_ATTEMPTS_PER_POINT, FALLBACK_TOLERANCE_MULTIPLIER
     
     data = _load_calibration()
     
-    # Calibración de ejes
+    # Calibración de ejes. Se actualiza el mismo dict: hay módulos que lo
+    # importaron por nombre y deben ver el cambio de perfil.
     cal = data.get('calibration', _DEFAULT_CALIBRATION)
     x_cal = cal.get('x_axis', _DEFAULT_CALIBRATION['x_axis'])
     y_cal = cal.get('y_axis', _DEFAULT_CALIBRATION['y_axis'])
     
-    CALIBRATION_X = {
+    CALIBRATION_X.clear()
+    CALIBRATION_X.update({
         'intercept': x_cal.get('intercept_um', 21601.0),
         'slope': x_cal.get('slope_um_per_adc', 12.22)
-    }
-    CALIBRATION_Y = {
+    })
+    CALIBRATION_Y.clear()
+    CALIBRATION_Y.update({
         'intercept': y_cal.get('intercept_um', 21601.0),
         'slope': y_cal.get('slope_um_per_adc', 12.22)
-    }
+    })
     
     # Parámetros de control
     ctrl = data.get('control', _DEFAULT_CONTROL)

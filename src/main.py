@@ -59,9 +59,9 @@ import numpy as np
 # Fase 1: Configuración
 from config.constants import *
 from config.settings import setup_logging
-from config.mcu_profiles import apply_mcu_profile, load_saved_mcu
+from config.mcu_profiles import apply_mcu_profile, get_profile, load_saved_mcu
 
-# Perfil MCU activo (STM32 o Arduino). Persistido en config/mcu_prefs.json.
+# Perfil MCU activo (STM32, Arduino o FPGA). Persistido en config/mcu_prefs.json.
 apply_mcu_profile(load_saved_mcu())
 
 # Fase 2: Estilos
@@ -135,11 +135,11 @@ from config.hardware_availability import THORLABS_AVAILABLE
 # --- Interfaz Principal con Pestañas ---
 # =========================================================================
 class CTRL_GUI(QMainWindow):
-    """Ventana principal del sistema de control (STM32F767ZI + host Python)."""
+    """Ventana principal del sistema de control (STM32 / Arduino / FPGA + host Python)."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('CTRL_GUI — MycoViT XY / STM32F767ZI')
+        self.setWindowTitle(self._window_title())
         self.setGeometry(100, 100, 800, 700)
         self.setStyleSheet(DARK_STYLESHEET)
 
@@ -186,7 +186,8 @@ class CTRL_GUI(QMainWindow):
         # Iniciar comunicación serial ANTES de crear tabs (necesario para ControlTab)
         # Detectar puerto automáticamente o usar el configurado
         initial_port = self._detect_arduino_port() or SERIAL_PORT
-        self.serial_thread = SerialHandler(initial_port, BAUD_RATE)
+        from config.constants import BAUD_RATE as profile_baud
+        self.serial_thread = SerialHandler(initial_port, profile_baud)
         self.sensor_buffer = SensorBuffer()
         # Plano MÁQUINA: el hilo RX llena el buffer a tasa completa (Fase 1),
         # así el control lee medida fresca sin depender del repintado de la UI.
@@ -503,9 +504,15 @@ class CTRL_GUI(QMainWindow):
     # ============================================================================
     # ============================================================================
     
+    @staticmethod
+    def _window_title() -> str:
+        from config.constants import MCU_TYPE as active_mcu
+        return f"CTRL_GUI — XY / {get_profile(active_mcu)['label']}"
+
     def _on_mcu_profile_changed(self, mcu_id: str):
-        """Aplica perfil STM32/Arduino y sincroniza flags de control FOV."""
+        """Aplica perfil STM32/Arduino/FPGA y sincroniza flags de control FOV."""
         profile = apply_mcu_profile(mcu_id)
+        self.setWindowTitle(self._window_title())
         logger.info(
             "Perfil MCU aplicado: %s (cz=%s, stiction=[%s,%s])",
             mcu_id,
@@ -647,6 +654,7 @@ class CTRL_GUI(QMainWindow):
         PROCESAMIENTO de telemetría STM32/Arduino con VALIDACIÓN.
         Formato LEGACY: pot_a,pot_b,sens_1,sens_2 (4 enteros CSV)
         Formato STM32: pot_a,pot_b,sens_1,sens_2,estado,settled (6 campos)
+        Formato FPGA: 8 campos (MotorProtocol.parse_sensor_data_with_status)
         Descarta líneas corruptas; sensores 12-bit en ruta de 6 campos.
 
         Nota (Fase 1): el SensorBuffer ya se llena en el hilo RX
@@ -1260,9 +1268,10 @@ class CTRL_GUI(QMainWindow):
 
 def main():
     """Función principal de la aplicación."""
+    from config.constants import MCU_TYPE as active_mcu, BAUD_RATE as profile_baud
     logger.info("="*70)
-    logger.info("INICIANDO CTRL_GUI — MycoViT XY (STM32F767ZI)")
-    logger.info(f"Versión: 2.3 | Puerto: {SERIAL_PORT} | Baudrate: {BAUD_RATE}")
+    logger.info(f"INICIANDO CTRL_GUI — MycoViT XY ({get_profile(active_mcu)['label']})")
+    logger.info(f"Versión: 2.3 | Puerto: autodetección | Baudrate: {profile_baud}")
     logger.info("="*70)
     
     try:
