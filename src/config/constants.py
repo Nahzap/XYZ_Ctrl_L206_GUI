@@ -26,6 +26,8 @@ FACTORY_UI = False
 # Se sobrescribe al arrancar / al cambiar el selector vía mcu_profiles.apply_mcu_profile.
 MCU_TYPE = 'ARDUINO'
 MCU_SUPPORTS_CZ = False
+# FPGA v3.0: orden T (el PC pide la posición en cuentas; la FPGA cierra el lazo).
+MCU_SUPPORTS_TARGET = False
 MCU_USE_CZ_DEFAULT = False
 # Tope de |potencia| del comando A: PWM ±255 (STM32/Arduino) o % ±80 (FPGA).
 POWER_MAX = 255
@@ -108,6 +110,14 @@ def save_calibration(calibration_x: dict, calibration_y: dict, control: dict = N
         True si se guardó correctamente
     """
     try:
+        # Las claves de control que no se pasan (p. ej. travel_margin_counts) se conservan.
+        ctrl_out = dict(_load_calibration().get('control', {}))
+        ctrl_out.update(control or {
+            "deadzone_adc": DEADZONE_ADC,
+            "position_tolerance_um": POSITION_TOLERANCE_UM,
+            "settling_cycles": SETTLING_CYCLES,
+            "default_trajectory_pause_s": DEFAULT_TRAJECTORY_PAUSE
+        })
         data = {
             "_comment": "Archivo de calibración del sistema XYZ. Editar según mediciones reales.",
             "_updated": __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -123,12 +133,7 @@ def save_calibration(calibration_x: dict, calibration_y: dict, control: dict = N
                     "slope_um_per_adc": calibration_y.get('slope', calibration_y.get('slope_um_per_adc', 12.22))
                 }
             },
-            "control": control or {
-                "deadzone_adc": DEADZONE_ADC,
-                "position_tolerance_um": POSITION_TOLERANCE_UM,
-                "settling_cycles": SETTLING_CYCLES,
-                "default_trajectory_pause_s": DEFAULT_TRAJECTORY_PAUSE
-            },
+            "control": ctrl_out,
             "system": {
                 "adc_max": ADC_MAX,
                 "recorrido_um": RECORRIDO_UM
@@ -158,7 +163,7 @@ def reload_calibration():
     """Recarga la calibración desde el archivo JSON."""
     global DEADZONE_ADC, POSITION_TOLERANCE_UM
     global SETTLING_CYCLES, DEFAULT_TRAJECTORY_PAUSE, ADC_MAX, RECORRIDO_UM, FACTOR_ESCALA
-    global MAX_ATTEMPTS_PER_POINT, FALLBACK_TOLERANCE_MULTIPLIER
+    global MAX_ATTEMPTS_PER_POINT, FALLBACK_TOLERANCE_MULTIPLIER, TRAVEL_MARGIN_COUNTS
     
     data = _load_calibration()
     
@@ -187,6 +192,7 @@ def reload_calibration():
     MAX_ATTEMPTS_PER_POINT = ctrl.get('max_attempts_per_point', 500)
     FALLBACK_TOLERANCE_MULTIPLIER = ctrl.get('fallback_tolerance_multiplier', 2.0)
     DEFAULT_TRAJECTORY_PAUSE = ctrl.get('default_trajectory_pause_s', 2.0)
+    TRAVEL_MARGIN_COUNTS = int(ctrl.get('travel_margin_counts', 0))
     
     # Sistema
     sys_cfg = data.get('system', _DEFAULT_SYSTEM)
@@ -208,6 +214,8 @@ SETTLING_CYCLES = 4
 MAX_ATTEMPTS_PER_POINT = 500
 FALLBACK_TOLERANCE_MULTIPLIER = 2.0
 DEFAULT_TRAJECTORY_PAUSE = 2.0
+# FPGA AUTO: cuentas que un pedido T se aleja del cero y del máximo de cada eje.
+TRAVEL_MARGIN_COUNTS = 0
 ADC_MAX = 4095.0
 # Span estimado (metadato). La escala real de control es slope_um_per_adc por eje.
 RECORRIDO_UM = 20000.0
@@ -286,6 +294,11 @@ STITION_PWM_MAX = 255
 def mcu_supports_cz() -> bool:
     """True solo en perfil STM32 (C(z) F/I/P + Settled)."""
     return bool(MCU_SUPPORTS_CZ)
+
+
+def mcu_supports_target() -> bool:
+    """True solo en perfil FPGA: orden T,cx,cy,px,py (AUTO en cuentas)."""
+    return bool(MCU_SUPPORTS_TARGET)
 
 
 def host_pwm_sign(error_um: float, host_invert: bool = False) -> int:

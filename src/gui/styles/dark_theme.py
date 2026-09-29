@@ -45,6 +45,41 @@ QCheckBox::indicator {
     width: 13px;
     height: 13px;
 }
+QScrollArea {
+    border: none;
+}
+QScrollBar:vertical {
+    background-color: #2E2E2E;
+    width: 12px;
+    margin: 0;
+}
+QScrollBar:horizontal {
+    background-color: #2E2E2E;
+    height: 12px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background-color: #606060;
+    border-radius: 5px;
+    min-height: 30px;
+    margin: 1px;
+}
+QScrollBar::handle:horizontal {
+    background-color: #606060;
+    border-radius: 5px;
+    min-width: 30px;
+    margin: 1px;
+}
+QScrollBar::handle:hover {
+    background-color: #7A7A7A;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
 """
 
 

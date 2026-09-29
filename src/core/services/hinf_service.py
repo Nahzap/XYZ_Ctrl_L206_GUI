@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog
 from PyQt5.QtCore import QTimer
 
 from gui.windows import MatplotlibWindow
+from core.communication.protocol import MotorProtocol
 from core.controllers.hinf_controller import (
     HInfController, SynthesisConfig, SynthesisResult
 )
@@ -740,13 +741,14 @@ def stop_hinf_control(tab):
     if getattr(tab, 'control_timer', None):
         tab.control_timer.stop()
 
-    tab.send_command_callback('A,0,0')
-    time.sleep(0.05)
-    tab.send_command_callback('M')
+    # FPGA: solo B (M le daría el mando a los potes); STM32/Arduino: N, B, A,0,0, M.
+    halt = MotorProtocol.full_halt_commands()
+    for command in halt:
+        tab.send_command_callback(command)
 
     mode_label = tab.get_mode_label_callback()
     if mode_label:
-        mode_label.setText("MANUAL")
+        mode_label.setText("MANUAL" if halt[-1] == "M" else "FRENO")
         mode_label.setStyleSheet("font-weight: bold; color: #E67E22;")
 
     tab.control_active = False

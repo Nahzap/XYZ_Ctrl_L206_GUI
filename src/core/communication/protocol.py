@@ -3,7 +3,8 @@
 Comandos vivos:
   M | B | A,<a>,<b> | P,<axis>,<sign>,<idx> | F,<rx>,<ry>[,gate] | I,<ix>,<iy> | N
 Estados telemetría: MANUAL|AUTO|BRAKE|PULSE|FINE|HOLD|SETTLED
-FPGA Motor_CTRL: RESET|MANUAL|AUTO|BRAKE|PULSE|PC
+FPGA Motor_CTRL v3.0: RESET|MANUAL|AUTO|BRAKE|PULSE|PWM_X|PWM_Y|PWM_XY|PWM_0
+FPGA: T,<cx>,<cy>,<px>,<py> = AUTO, posición en cuentas y potencia por eje
 FPGA marcas: x_zero | y_zero | x_final | y_final | reset
 """
 import logging
@@ -11,11 +12,18 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-FPGA_STATES = ("RESET", "MANUAL", "AUTO", "BRAKE", "PULSE", "PC")
+# Potencia libre (A, N), nombrada por los ejes que tienen potencia.
+FPGA_PWM_STATES = ("PWM_X", "PWM_Y", "PWM_XY", "PWM_0")
+FPGA_STATES = ("RESET", "MANUAL", "AUTO", "BRAKE", "PULSE") + FPGA_PWM_STATES
 # Marcas de calibración de la FPGA, una línea cada una, en el orden del COM.
 FPGA_ZERO = ("x_zero", "y_zero")
 FPGA_FINAL = ("x_final", "y_final")
 FPGA_RESET = ("reset",)
+
+
+def _is_state_word(text: str) -> bool:
+    """Nombre de estado: empieza con letra; letras, dígitos y '_' (PWM_0)."""
+    return text[:1].isalpha() and text.replace("_", "").isalnum()
 
 
 def _is_fpga_frame(parts) -> bool:
@@ -24,7 +32,7 @@ def _is_fpga_frame(parts) -> bool:
         len(parts) >= 8
         and parts[4].strip().isdigit()
         and parts[5].strip().isdigit()
-        and parts[6].strip().isalpha()
+        and _is_state_word(parts[6].strip())
     )
 
 
@@ -42,6 +50,11 @@ class MotorProtocol:
     @staticmethod
     def format_brake_command():
         return "B"
+
+    @staticmethod
+    def format_target_command(cx: int, cy: int, px: int, py: int) -> str:
+        """FPGA AUTO: X a la cuenta cx e Y a cy, con px y py % (0 frena ese eje)."""
+        return f"T,{int(cx)},{int(cy)},{int(px)},{int(py)}"
 
     @staticmethod
     def format_atom_pulse(axis: str, sign: int, idx: int) -> str:

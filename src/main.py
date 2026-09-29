@@ -737,8 +737,11 @@ class CTRL_GUI(QMainWindow):
                 if self.data_recorder.is_recording:
                     self.data_recorder.write_data_point(pot_a, pot_b, sens_1, sens_2)
                 is_fpga_frame = parsed_data.get('frame') == "FPGA"
-                if is_fpga_frame and self.frame_log.active:
-                    self.frame_log.write(parsed_data)
+                if is_fpga_frame:
+                    if self.frame_log.active:
+                        self.frame_log.write(parsed_data)
+                    # Posición (AUTO): llegada y fallas se juzgan con cada trama.
+                    self.control_tab.on_fpga_frame(parsed_data)
 
                 # UI ~30 Hz: labels + plots (no interfiere en medida/control)
                 if self._ui_refresh_due():

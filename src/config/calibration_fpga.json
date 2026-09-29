@@ -17,7 +17,9 @@
         "deadzone_adc": 84,
         "position_tolerance_um": 25.0,
         "settling_cycles": 4,
-        "default_trajectory_pause_s": 2.0
+        "default_trajectory_pause_s": 2.0,
+        "_travel_margin_comment": "SIN MEDIR: 5 flancos (420 cuentas) que un pedido T se aleja del cero y del máximo. Reemplazar con la repetibilidad del máximo (medición M3).",
+        "travel_margin_counts": 420
     },
     "system": {
         "adc_max": 999999.0,

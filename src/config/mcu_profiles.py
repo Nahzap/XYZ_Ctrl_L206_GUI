@@ -3,8 +3,9 @@
 STM32 y Arduino comparten baud 1e6 y comandos M / A,a,b / B / N.
 STM32: C(z) F/I/P, telemetría nativa 12-bit, stiction banco [95,150].
 Arduino: sin C(z); sensores 10-bit escalados ×4 en firmware; arranque ≥110.
-FPGA (Tang Nano 9K, Motor_CTRL): 115200; cuenta de encoders 0..999999;
-A en % (±80); lazo de posición propio; M = los potes mandan la posición.
+FPGA (Tang Nano 9K, Motor_CTRL v3.0): 115200; cuenta de encoders 0..999999;
+A en % (±80); lazo de posición propio; M = los potes mandan la posición;
+T,cx,cy,px,py = el PC pide la posición en cuentas (AUTO).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "stiction_pwm_max": 150,
         "use_mcu_cz_loop": True,
         "supports_cz": True,
+        "supports_target": False,
         "baud": 1000000,
         "power_max": 255,
         "calibration_file": "calibration.json",
@@ -45,6 +47,7 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "stiction_pwm_max": 255,
         "use_mcu_cz_loop": False,
         "supports_cz": False,
+        "supports_target": False,
         "baud": 1000000,
         "power_max": 255,
         "calibration_file": "calibration.json",
@@ -59,13 +62,14 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "stiction_pwm_max": 80,  # CFG_POWER: la FPGA recorta A a ±80 %
         "use_mcu_cz_loop": False,
         "supports_cz": False,
+        "supports_target": True,  # orden T: posición en cuentas y potencia por eje
         "baud": 115200,
         "power_max": 80,
         "calibration_file": "calibration_fpga.json",
         "telemetry": "8 campos: PotA/PotB = pedido; Sensor1 = X, Sensor2 = Y",
         "firmware_hint": "Motor_CTRL (Tang Nano 9K)",
         "counts_per_edge": 84,  # STEP de motion.v: 1 flanco del Hall; CFG_GATE = 1 flanco
-        # Al cerrar la FPGA sigue como estaba: A,0,0 la dejaría en AUTO y los potes no mandarían.
+        # Al cerrar la FPGA sigue como estaba: A,0,0 la dejaría en PWM_0 y los potes no mandarían.
         "close_commands": [],
     },
 }
@@ -134,6 +138,7 @@ def apply_mcu_profile(mcu_id: str) -> dict[str, Any]:
     constants.STITION_PWM_MIN = int(profile["stiction_pwm_min"])
     constants.STITION_PWM_MAX = int(profile["stiction_pwm_max"])
     constants.MCU_SUPPORTS_CZ = bool(profile["supports_cz"])
+    constants.MCU_SUPPORTS_TARGET = bool(profile["supports_target"])
     constants.MCU_USE_CZ_DEFAULT = bool(profile["use_mcu_cz_loop"])
     constants.BAUD_RATE = int(profile["baud"])
     constants.POWER_MAX = int(profile["power_max"])

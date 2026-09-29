@@ -8,12 +8,18 @@ import logging
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
-                             QCheckBox)
-from PyQt5.QtCore import pyqtSignal
+                             QCheckBox, QScrollArea)
+from PyQt5.QtCore import Qt, pyqtSignal
 
+import config.constants as constants
 from config.constants import BAUD_RATE, FACTORY_UI, MCU_TYPE
 from config.mcu_profiles import MCU_FPGA, MCU_PROFILES, list_mcu_ids
-from core.communication.protocol import FPGA_FINAL, FPGA_RESET, FPGA_ZERO, MotorProtocol
+from core.communication.protocol import (
+    FPGA_FINAL, FPGA_PWM_STATES, FPGA_RESET, FPGA_STATES, FPGA_ZERO, MotorProtocol,
+)
+from core.control.fpga_target import BRAKE_OUTCOMES, FpgaTarget, Outcome, TargetSettings
+from core.control.step_config import load_step_control_config
+from core.services.test_service import DEFAULT_POINT_TIMEOUT_S
 
 logger = logging.getLogger('MotorControl_L206')
 
@@ -33,8 +39,13 @@ _POWER_TEXTS = {
     MCU_FPGA: (
         "40,0",
         "Ej: 40,-40 (%)",
-        "Potencia X y Y en % (-80..80). La FPGA recorta a ±80 %.",
+        "Potencia X y Y en % (-80..80). La FPGA recorta a ±80 %. "
+        "Enviar Potencia la manda libre (PWM_*); Ir y Mantener aquí usan su magnitud.",
     ),
+}
+_SEND_POWER_TEXTS = {
+    _DEFAULT_TEXTS: "⚡ Enviar Potencia (en modo AUTO)",
+    MCU_FPGA: "⚡ Enviar Potencia libre (PWM_*)",
 }
 _COMMAND_TEXTS = {
     _DEFAULT_TEXTS: (
@@ -43,12 +54,17 @@ _COMMAND_TEXTS = {
     ),
     MCU_FPGA: (
         "FPGA: calibrar 1 · Zero, 2 · Máximo, 3 · Manual (M: los potes mandan) | "
-        "A,<%x>,<%y> hasta ±80 | B freno | N motores sueltos. F/I no se usan."
+        "T,<cx>,<cy>,<%x>,<%y> AUTO en cuentas | A,<%x>,<%y> libre hasta ±80 | "
+        "B freno | N motores sueltos. F/I no se usan."
     ),
 }
 _MANUAL_TIPS = {
     _DEFAULT_TEXTS: "",
     MCU_FPGA: "En la FPGA, M hace que los potes manden la posición: la platina va a donde estén.",
+}
+_AUTO_TIPS = {
+    _DEFAULT_TEXTS: "A,0,0: modo AUTO con potencia 0.",
+    MCU_FPGA: "AUTO de la FPGA = Mantener aquí: pide la cuenta actual con la potencia del campo.",
 }
 _MOTOR_TEXTS = {
     _DEFAULT_TEXTS: ("Potencia Motor A:", "Potencia Motor B:"),
@@ -65,8 +81,21 @@ _STATE_COLORS = {
     'LEGACY': '#F39C12',
     'RESET': '#E67E22',
     'PULSE': '#1ABC9C',
-    'PC': '#27AE60',
+    'PWM': '#F1C40F',
 }
+# Estados de la FPGA en que lleva la cuenta al pedido (PotA/PotB).
+_POSITIONING_STATES = ("MANUAL", "AUTO")
+_TARGET_COLORS = {"idle": "#95A5A6", "busy": "#5DADE2", "ok": "#27AE60",
+                  "warn": "#E67E22", "bad": "#E74C3C"}
+
+
+def _state_color(state: str) -> str:
+    key = 'PWM' if state in FPGA_PWM_STATES else state
+    return _STATE_COLORS.get(key, _STATE_COLORS['UNKNOWN'])
+
+
+def _comma(value: float, fmt: str) -> str:
+    return format(value, fmt).replace(".", ",")
 
 # Calibración FPGA, igual que por COM: lo que hace cada grupo de marcas.
 _CALIB_TIPS = {
@@ -105,13 +134,22 @@ class ControlTab(QWidget):
         self._last_settled = None
         self._last_xy = (0, 0)
         self._error_colors = {}
+        self.fpga_target = FpgaTarget(self.send_command, self._target_settings())
         self._setup_ui()
         self._apply_profile_ui(self.get_selected_mcu())
         logger.debug("ControlTab inicializado")
     
     def _setup_ui(self):
-        """Configura la interfaz de usuario."""
-        layout = QVBoxLayout(self)
+        """Configura la interfaz; con scroll vertical para que ningún grupo se aplaste."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_content = QWidget()
+        layout = QVBoxLayout(self.scroll_content)
+        scroll.setWidget(self.scroll_content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         
         # Configuración Serial
         serial_group = self._create_serial_config_group()
@@ -232,6 +270,8 @@ class ControlTab(QWidget):
 
         self.commands_info_label.setText(_texts_for(_COMMAND_TEXTS, mcu_id))
         self.manual_btn.setToolTip(_texts_for(_MANUAL_TIPS, mcu_id))
+        self.auto_btn.setToolTip(_texts_for(_AUTO_TIPS, mcu_id))
+        self.send_power_btn.setText(_texts_for(_SEND_POWER_TEXTS, mcu_id))
 
         power_a_text, power_b_text = _texts_for(_MOTOR_TEXTS, mcu_id)
         self.power_a_name_label.setText(power_a_text)
@@ -240,12 +280,27 @@ class ControlTab(QWidget):
         is_fpga = mcu_id == MCU_FPGA
         self.calib_box.setVisible(is_fpga)
         self.arrival_box.setVisible(is_fpga)
+        self.target_box.setVisible(bool(prof["supports_target"]))
         for widget in (self.sensor1_name_label, self.value_labels['sensor_1'],
                        self.sensor2_name_label, self.value_labels['sensor_2']):
             widget.setVisible(not is_fpga)
         if not is_fpga:
             self._show_mode("MANUAL", "#E67E22")
+        self._end_target(self.fpga_target.cancel(Outcome.DISCONNECTED))
+        self.fpga_target.clear_max()
+        self.fpga_target.settings = self._target_settings()
         self._forget_state()
+
+    def _target_settings(self) -> TargetSettings:
+        """Del perfil activo: roce, tope de potencia, margen al recorrido y espera de llegada."""
+        return TargetSettings(
+            settle_s=load_step_control_config().fov_settle_ms / 1000.0,
+            timeout_s=DEFAULT_POINT_TIMEOUT_S,
+            power_min=int(constants.STITION_PWM_MIN),
+            power_max=int(constants.POWER_MAX),
+            margin=int(constants.TRAVEL_MARGIN_COUNTS),
+            counts_per_edge=_FPGA_COUNTS_PER_EDGE,
+        )
 
     def _forget_state(self):
         """Sin trama todavía: con la FPGA, Modo Actual espera el Estado de la próxima."""
@@ -253,6 +308,7 @@ class ControlTab(QWidget):
         self._last_settled = None
         if self.get_selected_mcu() == MCU_FPGA:
             self._show_mode("SIN TRAMA", _STATE_COLORS['UNKNOWN'])
+        self._refresh_target_box()
 
     def get_selected_mcu(self) -> str:
         return str(self.mcu_combo.currentData() or MCU_TYPE)
@@ -278,13 +334,13 @@ class ControlTab(QWidget):
         layout.addWidget(self.manual_btn, 1, 0, 1, 2)
         
         # Botón modo auto
-        auto_btn = QPushButton("🤖 Activar MODO AUTO")
-        auto_btn.setStyleSheet("""
+        self.auto_btn = QPushButton("🤖 Activar MODO AUTO")
+        self.auto_btn.setStyleSheet("""
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #27AE60; }
             QPushButton:hover { background-color: #2ECC71; }
         """)
-        auto_btn.clicked.connect(self.set_auto_mode)
-        layout.addWidget(auto_btn, 2, 0, 1, 2)
+        self.auto_btn.clicked.connect(self.set_auto_mode)
+        layout.addWidget(self.auto_btn, 2, 0, 1, 2)
         
         # Entrada de potencia
         layout.addWidget(QLabel("Potencia (A, B):"), 3, 0)
@@ -302,15 +358,61 @@ class ControlTab(QWidget):
 
         self.calib_box = self._create_calib_box()
         layout.addWidget(self.calib_box, 5, 0, 1, 2)
+
+        self.target_box = self._create_target_box()
+        layout.addWidget(self.target_box, 6, 0, 1, 2)
         
         group_box.setLayout(layout)
         return group_box
 
+    def _create_target_box(self):
+        """FPGA AUTO: X e Y en cuentas; Ir manda T y la FPGA lleva cada eje."""
+        box = QGroupBox("🎯 Posición (AUTO)")
+        grid = QGridLayout(box)
+        self.target_x_input = QLineEdit()
+        self.target_y_input = QLineEdit()
+        grid.addWidget(QLabel("X (cuentas):"), 0, 0)
+        grid.addWidget(self.target_x_input, 0, 1)
+        grid.addWidget(QLabel("Y (cuentas):"), 0, 2)
+        grid.addWidget(self.target_y_input, 0, 3)
+
+        self.target_range_label = QLabel()
+        self.target_range_label.setStyleSheet("color: #95A5A6;")
+        self.target_range_label.setWordWrap(True)
+        grid.addWidget(self.target_range_label, 1, 0, 1, 4)
+
+        button_style = """
+            QPushButton { font-size: 11px; font-weight: bold; padding: 6px; background-color: %s; }
+            QPushButton:hover { background-color: %s; }
+            QPushButton:disabled { background-color: #555555; color: #AAAAAA; }
+        """
+        self.target_go_btn = QPushButton("▶ Ir")
+        self.target_go_btn.setStyleSheet(button_style % ("#8E44AD", "#9B59B6"))
+        self.target_go_btn.setToolTip(
+            "Manda T,cx,cy,px,py: la FPGA lleva X a cx e Y a cy y frena al llegar. "
+            "Potencia = magnitud de «Potencia (A, B)»; 0 deja ese eje frenado donde está."
+        )
+        self.target_go_btn.clicked.connect(self._go_target)
+        self.target_hold_btn = QPushButton("⏸ Mantener aquí")
+        self.target_hold_btn.setStyleSheet(button_style % ("#6C3483", "#7D3C98"))
+        self.target_hold_btn.setToolTip(
+            "Pide la cuenta actual de los dos ejes: si algo empuja la platina "
+            "más de 2 flancos, la FPGA la devuelve."
+        )
+        self.target_hold_btn.clicked.connect(self._hold_here)
+        grid.addWidget(self.target_go_btn, 2, 0, 1, 2)
+        grid.addWidget(self.target_hold_btn, 2, 2, 1, 2)
+
+        self.target_status_label = QLabel()
+        self.target_status_label.setWordWrap(True)
+        grid.addWidget(self.target_status_label, 3, 0, 1, 4)
+        self._show_target_status("Sin movimiento", "idle")
+        return box
+
     def _create_calib_box(self):
         """FPGA: 1 · Zero, 2 · Máximo, 3 · Manual y Reset mandan lo mismo que se escribe por COM."""
-        box = QWidget()
+        box = QGroupBox("📍 Calibración del recorrido")
         col = QVBoxLayout(box)
-        col.setContentsMargins(0, 4, 0, 0)
 
         self.edit_points_check = QCheckBox("Editar puntos del recorrido")
         self.edit_points_check.setToolTip("Habilita Zero, Máximo y Reset.")
@@ -405,9 +507,9 @@ class ControlTab(QWidget):
 
         self.arrival_labels = {}
         error_tip = (
-            f"En MANUAL la FPGA lleva la cuenta al pedido: verde = a 1 paso o menos "
+            f"En MANUAL y AUTO la FPGA lleva la cuenta al pedido: verde = a 1 paso o menos "
             f"({_FPGA_COUNTS_PER_EDGE} cuentas). En gris la FPGA no está posicionando "
-            f"(RESET, AUTO, BRAKE)."
+            f"(RESET, PWM_*, BRAKE, PULSE)."
         )
         for row, axis in enumerate(("x", "y"), start=1):
             name = QLabel(axis.upper())
@@ -440,16 +542,16 @@ class ControlTab(QWidget):
 
     def update_targets(self, target_x: int, target_y: int):
         """Pedido de la FPGA contra la cuenta medida, por eje."""
-        in_manual = self._mcu_state == "MANUAL"
+        positioning = self._mcu_state in _POSITIONING_STATES
         for axis, target, count in (("x", target_x, self._last_xy[0]),
                                     ("y", target_y, self._last_xy[1])):
             err = target - count
-            steps = f"{err / _FPGA_COUNTS_PER_EDGE:+.1f}".replace(".", ",")
+            steps = _comma(err / _FPGA_COUNTS_PER_EDGE, "+.1f")
             self.arrival_labels[axis, "pedido"].setText(str(target))
             self.arrival_labels[axis, "cuenta"].setText(str(count))
             error_label = self.arrival_labels[axis, "error"]
             error_label.setText(f"{err:+d} ({steps} pasos)")
-            if not in_manual:
+            if not positioning:
                 color = "#95A5A6"
             elif abs(err) <= _FPGA_COUNTS_PER_EDGE:
                 color = "#27AE60"
@@ -527,26 +629,27 @@ class ControlTab(QWidget):
         
         self.serial_reconnect_requested.emit(port, baudrate)
     
+    def _parse_power(self):
+        """«Potencia (A, B)» como (a, b), o None si el texto no es a,b."""
+        parts = self.power_input.text().split(',')
+        try:
+            if len(parts) == 2:
+                return int(parts[0].strip()), int(parts[1].strip())
+        except ValueError:
+            pass
+        logger.error("Formato inválido. Use: potencia_a,potencia_b")
+        return None
+
     def _send_power_command(self):
         """Envía comando de potencia DIRECTAMENTE al Arduino."""
-        try:
-            power_text = self.power_input.text()
-            parts = power_text.split(',')
-            if len(parts) != 2:
-                logger.error("Formato inválido. Use: potencia_a,potencia_b")
-                return
-            
-            power_a = int(parts[0].strip())
-            power_b = int(parts[1].strip())
-            
-            # Validar rango del perfil: ±255 PWM o ±80 % (FPGA)
-            lim = self._power_max
-            power_a = max(-lim, min(lim, power_a))
-            power_b = max(-lim, min(lim, power_b))
-            
-            self.send_power(power_a, power_b)
-        except ValueError as e:
-            logger.error(f"Error al parsear potencia: {e}")
+        power = self._parse_power()
+        if power is None:
+            return
+        # Validar rango del perfil: ±255 PWM o ±80 % (FPGA)
+        lim = self._power_max
+        power_a = max(-lim, min(lim, power[0]))
+        power_b = max(-lim, min(lim, power[1]))
+        self.send_power(power_a, power_b)
     
     # === Métodos para actualizar estado desde el padre ===
     
@@ -587,6 +690,7 @@ class ControlTab(QWidget):
             self.connection_status.setText("❌ Desconectado")
             self.connection_status.setStyleSheet("font-weight: bold; color: #E74C3C;")
             logger.info("Estado serial actualizado: Desconectado")
+            self._end_target(self.fpga_target.cancel(Outcome.DISCONNECTED))
         self._forget_state()
     
     # ================================================================
@@ -601,11 +705,20 @@ class ControlTab(QWidget):
         self.serial_handler.send_command(command)
 
     def _send_calib(self, button: QPushButton, commands):
-        """Una línea por orden, igual que escribirlas por COM."""
+        """Una línea por orden, igual que escribirlas por COM.
+
+        2 · Máximo guarda la cuenta de cada eje como máximo de la sesión;
+        Reset lo borra. Sin ese máximo, Posición (AUTO) queda deshabilitada.
+        """
         x, y = self._last_xy
         logger.info("Calib: %s (X=%d, Y=%d)", button.text(), x, y)
         for command in commands:
             self.send_command(command)
+        if commands == FPGA_FINAL:
+            self.fpga_target.set_max(x, y)
+        elif commands == FPGA_RESET:
+            self.fpga_target.clear_max()
+        self._refresh_target_box()
 
     def set_manual_mode(self):
         """M: modo MANUAL (con la FPGA, los potes mandan la posición)."""
@@ -614,10 +727,117 @@ class ControlTab(QWidget):
         self.set_mode("MANUAL")
 
     def set_auto_mode(self):
-        """A,0,0: modo AUTO con potencia 0."""
+        """A,0,0: modo AUTO con potencia 0. Con la FPGA: Mantener aquí."""
         logger.info("ControlTab: Activar MODO AUTO")
+        if MCU_PROFILES[self.get_selected_mcu()]["supports_target"]:
+            self._hold_here()
+            return
         self.send_command(MotorProtocol.format_power_command(0, 0))
         self.set_mode("AUTOMÁTICO")
+
+    # ---- Posición (AUTO) de la FPGA ----
+    def on_fpga_frame(self, frame: dict):
+        """Cada trama FPGA, a tasa completa (no la del refresco de UI)."""
+        self._last_xy = (frame["sens_2"], frame["sens_1"])    # X = Sensor1 = sens_2
+        self._end_target(self.fpga_target.on_frame(frame))
+
+    def _target_power(self):
+        power = self._parse_power()
+        if power is None:
+            self._show_target_status("Potencia (A, B) inválida: use a,b en %", "warn")
+        return power
+
+    def _target_blocked(self) -> str:
+        """Por qué Posición (AUTO) no puede mandar; vacío si puede."""
+        if self._mcu_state is None:
+            return "Sin trama de la FPGA"
+        if self._mcu_state == "RESET":
+            return "FPGA en RESET: calibrar con 1 · Zero y 2 · Máximo"
+        if not self.fpga_target.has_max:
+            return "Falta 2 · Máximo en esta sesión"
+        return ""
+
+    def _go_target(self):
+        why = self._target_blocked()
+        if why:
+            self._show_target_status(why, "warn")
+            return
+        power = self._target_power()
+        if power is None:
+            return
+        try:
+            target = (int(self.target_x_input.text().strip()),
+                      int(self.target_y_input.text().strip()))
+        except ValueError:
+            self._show_target_status("X e Y deben ser cuentas enteras", "warn")
+            return
+        self._start_target(self.fpga_target.go(target, power, self._last_xy))
+
+    def _hold_here(self):
+        why = self._target_blocked()
+        if why:
+            self._show_target_status(why, "warn")
+            return
+        power = self._target_power()
+        if power is None:
+            return
+        self._start_target(self.fpga_target.hold(power, self._last_xy))
+
+    def _start_target(self, error):
+        if error:
+            logger.warning("AUTO T no enviado: %s", error)
+            self._show_target_status(error, "warn")
+            return
+        (cx, cy), (px, py) = self.fpga_target.target, self.fpga_target.power
+        self._show_target_status(f"Yendo a X {cx}, Y {cy} ({px} %, {py} %)…", "busy")
+
+    def _end_target(self, result):
+        if result is None:
+            return
+        cpe = self.fpga_target.settings.counts_per_edge
+        rx, ry = result.residual
+        residual = (f"residual X {rx:+d} ({_comma(rx / cpe, '+.1f')} fl), "
+                    f"Y {ry:+d} ({_comma(ry / cpe, '+.1f')} fl)")
+        secs = _comma(result.elapsed_s, ".2f")
+        if result.outcome is Outcome.ARRIVED:
+            text = f"Llegó en {secs} s, {residual}; pedido tomado en {result.take_frames} tramas"
+            kind = "ok"
+        elif result.outcome in BRAKE_OUTCOMES:
+            text = f"{result.outcome.value.capitalize()} tras {secs} s: B enviado; {residual}"
+            kind = "bad"
+        elif result.outcome is Outcome.TAKEN_OVER:
+            text = f"Otro tomó el mando (Estado {result.state}): no se mandó nada"
+            kind = "warn"
+        elif result.outcome is Outcome.NOT_TAKEN:
+            text = (f"La FPGA no tomó el pedido (Estado {result.state or 'sin trama'}): "
+                    f"revisar el rango y 2 · Máximo")
+            kind = "bad"
+        else:
+            text = "Se cortó la conexión: la FPGA sigue sosteniendo el último pedido"
+            kind = "warn"
+        self._show_target_status(text, kind)
+
+    def _show_target_status(self, text: str, kind: str):
+        self.target_status_label.setText(text)
+        self.target_status_label.setStyleSheet(
+            f"font-weight: bold; color: {_TARGET_COLORS[kind]};")
+
+    def _refresh_target_box(self):
+        """Habilitado solo con trama, fuera de RESET y con el máximo de la sesión."""
+        ranges = self.fpga_target.ranges()
+        why = self._target_blocked()
+        if ranges is None:
+            text = why
+        else:
+            (rx, ry), m = ranges, self.fpga_target.settings.margin
+            text = f"Rango X {rx.lo} … {rx.hi} · Y {ry.lo} … {ry.hi} (margen {m} cuentas)"
+            if why:
+                text = f"{why}. {text}"
+        self.target_range_label.setText(text)
+        enabled = not why
+        for widget in (self.target_x_input, self.target_y_input,
+                       self.target_go_btn, self.target_hold_btn):
+            widget.setEnabled(enabled)
     
     def send_power(self, power_a: int, power_b: int):
         """
@@ -679,8 +899,13 @@ class ControlTab(QWidget):
             return
         self._mcu_state = state
         self._last_settled = settled
+        if state_changed and state == "RESET":
+            # Entró a RESET: la FPGA perdió cero y máximo; el de la sesión ya no vale.
+            self.fpga_target.clear_max()
+        if state_changed:
+            self._refresh_target_box()
 
-        color = _STATE_COLORS.get(state, _STATE_COLORS['UNKNOWN'])
+        color = _state_color(state)
         self.arduino_state_label.setText(state)
         self.arduino_state_label.setStyleSheet(f"font-weight: bold; color: {color};")
         if settled:
@@ -706,7 +931,7 @@ class ControlTab(QWidget):
                 f"(1 · Zero, 2 · Máximo, 3 · Manual)"
             )
             self.firmware_status_label.setStyleSheet("color: #E67E22; font-size: 10px; font-weight: bold;")
-        elif state in ('MANUAL', 'AUTO', 'BRAKE', 'PULSE', 'PC'):
+        elif state in FPGA_STATES:
             self.firmware_status_label.setText(f"{profile_label} - estado {state} OK")
             self.firmware_status_label.setStyleSheet("color: #27AE60; font-size: 10px; font-weight: bold;")
         else:
