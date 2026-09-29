@@ -47,6 +47,8 @@ CONTROL_RATE_HZ = 400
 
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 _CALIBRATION_FILE = os.path.join(_CONFIG_DIR, 'calibration.json')
+# CSV de tramas de la FPGA (botón «Grabar tramas»), en <repo>/CSVs/tramas_fpga.
+FRAME_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(_CONFIG_DIR)), 'CSVs', 'tramas_fpga')
 
 # Valores por defecto (solo si no existe el archivo JSON)
 _DEFAULT_CALIBRATION = {

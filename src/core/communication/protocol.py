@@ -4,6 +4,7 @@ Comandos vivos:
   M | B | A,<a>,<b> | P,<axis>,<sign>,<idx> | F,<rx>,<ry>[,gate] | I,<ix>,<iy> | N
 Estados telemetría: MANUAL|AUTO|BRAKE|PULSE|FINE|HOLD|SETTLED
 FPGA Motor_CTRL: RESET|MANUAL|AUTO|BRAKE|PULSE|PC
+FPGA marcas: x_zero | y_zero | x_final | y_final | reset
 """
 import logging
 from typing import Optional
@@ -11,6 +12,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 FPGA_STATES = ("RESET", "MANUAL", "AUTO", "BRAKE", "PULSE", "PC")
+# Marcas de calibración de la FPGA, una línea cada una, en el orden del COM.
+FPGA_ZERO = ("x_zero", "y_zero")
+FPGA_FINAL = ("x_final", "y_final")
+FPGA_RESET = ("reset",)
 
 
 def _is_fpga_frame(parts) -> bool:

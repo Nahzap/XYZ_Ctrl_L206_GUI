@@ -59,7 +59,7 @@ import numpy as np
 # Fase 1: Configuración
 from config.constants import *
 from config.settings import setup_logging
-from config.mcu_profiles import apply_mcu_profile, get_profile, load_saved_mcu
+from config.mcu_profiles import MCU_FPGA, apply_mcu_profile, get_profile, load_saved_mcu
 
 # Perfil MCU activo (STM32, Arduino o FPGA). Persistido en config/mcu_prefs.json.
 apply_mcu_profile(load_saved_mcu())
@@ -70,6 +70,7 @@ from gui.styles.dark_theme import DARK_STYLESHEET
 # Fase 3: Comunicación Serial
 from core.communication.serial_handler import SerialHandler
 from core.communication.protocol import MotorProtocol
+from core.communication.frame_log import FrameLog
 from core.control import SensorBuffer
 
 # Fase 4: Ventanas Auxiliares
@@ -106,6 +107,9 @@ from core.services.microscopy_service import MicroscopyService
 # --- INICIALIZAR SISTEMA DE LOGGING ---
 # =========================================================================
 logger = setup_logging()
+
+# Período del log «Trama FPGA: líneas/s, descartadas, órdenes perdidas».
+RX_STATS_PERIOD_S = 10.0
 
 # =========================================================================
 # --- Procesamiento de Datos en Tiempo Real (Sin Buffers Intermedios) ---
@@ -194,6 +198,10 @@ class CTRL_GUI(QMainWindow):
         self.serial_thread.set_sensor_buffer(self.sensor_buffer)
         # Compuerta de refresco de UI (~30 Hz) — no afecta medida ni control.
         self._last_ui_update_mono = 0.0
+        self._rx_ok = 0
+        self._rx_bad = 0
+        self._rx_stats_t0 = time.perf_counter()
+        self.frame_log = FrameLog(FRAME_LOG_DIR)
         
         # Widget central con pestañas
         central_widget = QWidget()
@@ -237,10 +245,8 @@ class CTRL_GUI(QMainWindow):
         # Conectar señal de reconexión serial
         self.control_tab.serial_reconnect_requested.connect(self._on_serial_reconnect)
         self.control_tab.mcu_profile_changed.connect(self._on_mcu_profile_changed)
-        # --- NUEVAS CONEXIONES PARA POSITION HOLD ---
-        self.control_tab.position_hold_requested.connect(self._on_position_hold)
+        self.control_tab.frame_log_requested.connect(self._on_frame_log_requested)
         self.control_tab.brake_requested.connect(self._on_brake)
-        self.control_tab.settling_config_requested.connect(self._on_settling_config)
         self.tabs.addTab(self.control_tab, "🎮 Control")
         
         # Pestaña 2: Grabación (usando RecordingTab modular - Fase 12)
@@ -509,6 +515,22 @@ class CTRL_GUI(QMainWindow):
         from config.constants import MCU_TYPE as active_mcu
         return f"CTRL_GUI — XY / {get_profile(active_mcu)['label']}"
 
+    def _on_frame_log_requested(self, start: bool):
+        """Inicia o detiene el CSV de tramas FPGA (tasa completa)."""
+        if start and not self.frame_log.active:
+            try:
+                path = self.frame_log.start()
+            except OSError as e:
+                logger.error(f"No se pudo abrir el CSV de tramas: {e}")
+                self.control_tab.show_frame_log(False, "", 0)
+                return
+            logger.info(f"Tramas FPGA: grabando en {path}")
+            self.control_tab.show_frame_log(True, path, 0)
+        elif not start and self.frame_log.active:
+            path, lines = self.frame_log.stop()
+            logger.info(f"Tramas FPGA guardadas: {path} ({lines} tramas)")
+            self.control_tab.show_frame_log(False, path, lines)
+
     def _on_mcu_profile_changed(self, mcu_id: str):
         """Aplica perfil STM32/Arduino/FPGA y sincroniza flags de control FOV."""
         profile = apply_mcu_profile(mcu_id)
@@ -650,6 +672,30 @@ class CTRL_GUI(QMainWindow):
         return False
 
     def update_data(self, line):
+        """Procesa una línea de telemetría y cuenta las aceptadas y descartadas."""
+        accepted = self._handle_line(line)
+        if accepted is True:
+            self._rx_ok += 1
+        elif accepted is False:
+            self._rx_bad += 1
+        self._log_rx_stats()
+
+    def _log_rx_stats(self):
+        """Cada RX_STATS_PERIOD_S, con el perfil FPGA: líneas/s, descartadas y órdenes TX perdidas."""
+        now = time.perf_counter()
+        elapsed = now - self._rx_stats_t0
+        if elapsed < RX_STATS_PERIOD_S:
+            return
+        from config.constants import MCU_TYPE as active_mcu
+        if active_mcu == MCU_FPGA:
+            rate = f"{self._rx_ok / elapsed:.1f}".replace(".", ",")
+            lost = self.serial_thread.tx_queue_stats()["dropped_ctrl"]
+            logger.info(f"Trama FPGA: {rate} líneas/s, {self._rx_bad} descartadas; "
+                        f"TX: {lost} órdenes perdidas")
+        self._rx_ok = self._rx_bad = 0
+        self._rx_stats_t0 = now
+
+    def _handle_line(self, line):
         """
         PROCESAMIENTO de telemetría STM32/Arduino con VALIDACIÓN.
         Formato LEGACY: pot_a,pot_b,sens_1,sens_2 (4 enteros CSV)
@@ -675,7 +721,7 @@ class CTRL_GUI(QMainWindow):
                 parsed_data = MotorProtocol.parse_sensor_data_with_status(line)
                 if not parsed_data:
                     logger.debug(f"Línea telemetría no parseable: {line}")
-                    return
+                    return False
 
                 pot_a = parsed_data['pot_a']
                 pot_b = parsed_data['pot_b']
@@ -685,19 +731,25 @@ class CTRL_GUI(QMainWindow):
                 if not (-255 <= pot_a <= 255 and -255 <= pot_b <= 255 and
                         0 <= sens_1 <= adc_hi and 0 <= sens_2 <= adc_hi):
                     logger.debug(f"Datos fuera de rango (descartados): {line}")
-                    return
+                    return False
 
                 # Grabación: tasa COMPLETA (dato crudo, no UI)
                 if self.data_recorder.is_recording:
                     self.data_recorder.write_data_point(pot_a, pot_b, sens_1, sens_2)
+                is_fpga_frame = parsed_data.get('frame') == "FPGA"
+                if is_fpga_frame and self.frame_log.active:
+                    self.frame_log.write(parsed_data)
 
                 # UI ~30 Hz: labels + plots (no interfiere en medida/control)
                 if self._ui_refresh_due():
                     self.control_tab.update_motor_values(pot_a, pot_b)
                     self.control_tab.update_sensor_values(sens_1, sens_2)
                     self.control_tab.update_arduino_status(parsed_data['state'], parsed_data['settled'])
+                    if is_fpga_frame:
+                        self.control_tab.update_targets(parsed_data['target_x'], parsed_data['target_y'])
                     if self.signal_window and self.signal_window.isVisible():
                         self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
+                return True
 
             elif len(parts) == 4:
                 pot_a, pot_b, sens_1, sens_2 = map(int, parts)
@@ -705,7 +757,7 @@ class CTRL_GUI(QMainWindow):
                 if not (-255 <= pot_a <= 255 and -255 <= pot_b <= 255 and
                        0 <= sens_1 <= adc_hi and 0 <= sens_2 <= adc_hi):
                     logger.debug(f"Datos LEGACY fuera de rango: {line}")
-                    return
+                    return False
 
                 # Grabación: tasa COMPLETA (dato crudo, no UI)
                 if self.data_recorder.is_recording:
@@ -718,14 +770,15 @@ class CTRL_GUI(QMainWindow):
                     self.control_tab.update_arduino_status("LEGACY", False)
                     if self.signal_window and self.signal_window.isVisible():
                         self.signal_window.update_data(pot_a, pot_b, sens_1, sens_2)
+                return True
 
             else:
                 logger.debug(f"Formato inválido ({len(parts)} campos), descartado: {line}")
-                return
+                return False
 
         except (ValueError, IndexError) as e:
             logger.debug(f"Error parseando datos (descartado): '{line}' - {e}")
-            return
+            return False
     
     # --- Lógica de Control y Comandos ---
     # Toda la lógica de grabación está ahora en RecordingTab
@@ -911,28 +964,10 @@ class CTRL_GUI(QMainWindow):
 
     # --- NUEVOS HANDLERS PARA POSITION HOLD ---
     
-    def _on_position_hold(self, sensor1_target: int, sensor2_target: int):
-        """Position Hold no está implementado en firmware STM32 (H,s1,s2)."""
-        logger.warning(
-            "Position Hold ignorado: firmware STM32 no soporta H,<s1>,<s2> "
-            f"(pedido S1={sensor1_target}, S2={sensor2_target}). Usar control PC vía A,<pwm>."
-        )
-    
     def _on_brake(self):
         """Maneja solicitud de freno activo desde ControlTab."""
         logger.info("=== FRENO ACTIVO SOLICITADO ===")
-        command = MotorProtocol.format_brake_command()
-        self.send_command(command)
-    
-    def _on_settling_config(self, threshold: int):
-        """Settling config no está implementado en firmware STM32 (S,threshold)."""
-        logger.warning(
-            f"Configuración S,{threshold} ignorada: firmware STM32 no soporta comando S. "
-            "Settling se gestiona en PC (use_arduino_settled=false)."
-        )
-
-    # NOTA: set_manual_mode(), set_auto_mode(), send_power_command() 
-    # ELIMINADOS - Ahora están en ControlTab
+        self.send_command(MotorProtocol.format_brake_command())
     
     
     # --- Control H∞ en Tiempo Real ---
@@ -1248,8 +1283,16 @@ class CTRL_GUI(QMainWindow):
             self.camera_tab.save_camera_tab_settings()
         except Exception as e:
             logger.error(f"No se pudieron guardar opciones de cámara al cerrar: {e}")
-        logger.debug("Enviando comando de apagado de motores (A,0,0)")
-        self.send_command('A,0,0')
+        from config.constants import MCU_TYPE as active_mcu
+        close_commands = get_profile(active_mcu)["close_commands"]
+        if close_commands:
+            logger.debug(f"Enviando al cerrar: {', '.join(close_commands)}")
+            for command in close_commands:
+                self.send_command(command)
+        else:
+            logger.info("Cierre sin órdenes al MCU: la FPGA sigue en "
+                        f"{self.control_tab.arduino_state_label.text()}")
+        self._on_frame_log_requested(False)
         
         # Detener grabación si está activa
         if self.data_recorder.is_recording:

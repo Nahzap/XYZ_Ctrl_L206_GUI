@@ -7,27 +7,21 @@ Encapsula la UI para control manual/automático de motores y visualización de s
 import logging
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox)
+                             QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
+                             QCheckBox)
 from PyQt5.QtCore import pyqtSignal
 
 from config.constants import BAUD_RATE, FACTORY_UI, MCU_TYPE
 from config.mcu_profiles import MCU_FPGA, MCU_PROFILES, list_mcu_ids
+from core.communication.protocol import FPGA_FINAL, FPGA_RESET, FPGA_ZERO, MotorProtocol
 
 logger = logging.getLogger('MotorControl_L206')
 
 _DEFAULT_TEXTS = "default"
-# (título del grupo, sensor 1, sensor 2)
-_SENSOR_TEXTS = {
-    _DEFAULT_TEXTS: (
-        "Lectura de Sensores Análogos",
-        "Valor Sensor 1 (Y / PC3):",
-        "Valor Sensor 2 (X / PA3):",
-    ),
-    MCU_FPGA: (
-        "Cuenta de Encoders (FPGA)",
-        "Cuenta Y (Sensor2 FPGA):",
-        "Cuenta X (Sensor1 FPGA):",
-    ),
+# Con la FPGA las filas de sensores se ocultan: la tabla Pedido/Cuenta/Error las reemplaza.
+_SENSOR_TITLES = {
+    _DEFAULT_TEXTS: "Lectura de Sensores Análogos",
+    MCU_FPGA: "Cuenta de Encoders (FPGA)",
 }
 # (valor inicial, placeholder, tooltip)
 _POWER_TEXTS = {
@@ -48,14 +42,39 @@ _COMMAND_TEXTS = {
         "STM32: +F/I/P. Arduino: PWM≥110; F/I/P ignorados."
     ),
     MCU_FPGA: (
-        "FPGA: M = los potes mandan la posición | A,<%x>,<%y> hasta ±80 | "
-        "B freno | N motores sueltos. F/I no se usan."
+        "FPGA: calibrar 1 · Zero, 2 · Máximo, 3 · Manual (M: los potes mandan) | "
+        "A,<%x>,<%y> hasta ±80 | B freno | N motores sueltos. F/I no se usan."
     ),
 }
 _MANUAL_TIPS = {
     _DEFAULT_TEXTS: "",
     MCU_FPGA: "En la FPGA, M hace que los potes manden la posición: la platina va a donde estén.",
 }
+_MOTOR_TEXTS = {
+    _DEFAULT_TEXTS: ("Potencia Motor A:", "Potencia Motor B:"),
+    MCU_FPGA: ("Potencia FPGA X (%):", "Potencia FPGA Y (%):"),
+}
+
+_STATE_COLORS = {
+    'MANUAL': '#3498DB',
+    'AUTO': '#9B59B6',
+    'HOLD': '#27AE60',
+    'BRAKE': '#E74C3C',
+    'SETTLING': '#F39C12',
+    'UNKNOWN': '#95A5A6',
+    'LEGACY': '#F39C12',
+    'RESET': '#E67E22',
+    'PULSE': '#1ABC9C',
+    'PC': '#27AE60',
+}
+
+# Calibración FPGA, igual que por COM: lo que hace cada grupo de marcas.
+_CALIB_TIPS = {
+    FPGA_ZERO: "la cuenta de X y de Y pasa a 0 donde está la platina.",
+    FPGA_FINAL: "el máximo de cada eje queda en su cuenta actual; con los dos, la FPGA sale de RESET.",
+    FPGA_RESET: "borra cero, máximo y cuentas; la FPGA vuelve a RESET.",
+}
+_FPGA_COUNTS_PER_EDGE = MCU_PROFILES[MCU_FPGA]["counts_per_edge"]
 
 
 def _texts_for(table: dict, mcu_id: str):
@@ -63,25 +82,12 @@ def _texts_for(table: dict, mcu_id: str):
 
 
 class ControlTab(QWidget):
-    """
-    Pestaña para control de motores y visualización de sensores.
-    
-    Signals:
-        manual_mode_requested: Solicita cambio a modo manual
-        auto_mode_requested: Solicita cambio a modo automático
-        power_command_requested: Solicita envío de potencia (power_a, power_b)
-    """
-    
-    manual_mode_requested = pyqtSignal()
-    auto_mode_requested = pyqtSignal()
-    power_command_requested = pyqtSignal(int, int)  # power_a, power_b
+    """Pestaña para control de motores y visualización de sensores."""
+
     serial_reconnect_requested = pyqtSignal(str, int)  # puerto, baudrate
     mcu_profile_changed = pyqtSignal(str)  # STM32 | ARDUINO | FPGA
-    
-    # --- NUEVAS SEÑALES PARA POSITION HOLD ---
-    position_hold_requested = pyqtSignal(int, int)  # sensor1_target, sensor2_target
+    frame_log_requested = pyqtSignal(bool)  # grabar tramas FPGA a CSV: iniciar / detener
     brake_requested = pyqtSignal()
-    settling_config_requested = pyqtSignal(int)  # threshold
     
     def __init__(self, serial_handler=None, parent=None):
         """
@@ -92,11 +98,13 @@ class ControlTab(QWidget):
             parent: Widget padre (CTRL_GUI)
         """
         super().__init__(parent)
-        self.parent_gui = parent
         self.serial_handler = serial_handler
         self.value_labels = {}
         self._power_max = 255
+        self._mcu_state = None          # Estado de la última trama; None = sin trama
         self._last_settled = None
+        self._last_xy = (0, 0)
+        self._error_colors = {}
         self._setup_ui()
         self._apply_profile_ui(self.get_selected_mcu())
         logger.debug("ControlTab inicializado")
@@ -121,9 +129,7 @@ class ControlTab(QWidget):
         sensors_group = self._create_sensors_group()
         layout.addWidget(sensors_group)
         
-        # --- NUEVO: Position Hold para Testing ---
-        position_hold_group = self._create_position_hold_group()
-        layout.addWidget(position_hold_group)
+        layout.addWidget(self._create_mcu_status_group())
         
         layout.addStretch()
     
@@ -217,10 +223,7 @@ class ControlTab(QWidget):
         self._power_max = int(prof["power_max"])
         self.baudrate_combo.setCurrentText(str(prof["baud"]))
 
-        title, s1_text, s2_text = _texts_for(_SENSOR_TEXTS, mcu_id)
-        self.sensors_group.setTitle(title)
-        self.sensor1_name_label.setText(s1_text)
-        self.sensor2_name_label.setText(s2_text)
+        self.sensors_group.setTitle(_texts_for(_SENSOR_TITLES, mcu_id))
 
         value, placeholder, tip = _texts_for(_POWER_TEXTS, mcu_id)
         self.power_input.setText(value)
@@ -229,6 +232,27 @@ class ControlTab(QWidget):
 
         self.commands_info_label.setText(_texts_for(_COMMAND_TEXTS, mcu_id))
         self.manual_btn.setToolTip(_texts_for(_MANUAL_TIPS, mcu_id))
+
+        power_a_text, power_b_text = _texts_for(_MOTOR_TEXTS, mcu_id)
+        self.power_a_name_label.setText(power_a_text)
+        self.power_b_name_label.setText(power_b_text)
+
+        is_fpga = mcu_id == MCU_FPGA
+        self.calib_box.setVisible(is_fpga)
+        self.arrival_box.setVisible(is_fpga)
+        for widget in (self.sensor1_name_label, self.value_labels['sensor_1'],
+                       self.sensor2_name_label, self.value_labels['sensor_2']):
+            widget.setVisible(not is_fpga)
+        if not is_fpga:
+            self._show_mode("MANUAL", "#E67E22")
+        self._forget_state()
+
+    def _forget_state(self):
+        """Sin trama todavía: con la FPGA, Modo Actual espera el Estado de la próxima."""
+        self._mcu_state = None
+        self._last_settled = None
+        if self.get_selected_mcu() == MCU_FPGA:
+            self._show_mode("SIN TRAMA", _STATE_COLORS['UNKNOWN'])
 
     def get_selected_mcu(self) -> str:
         return str(self.mcu_combo.currentData() or MCU_TYPE)
@@ -250,7 +274,7 @@ class ControlTab(QWidget):
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #E67E22; }
             QPushButton:hover { background-color: #F39C12; }
         """)
-        self.manual_btn.clicked.connect(self._request_manual_mode)
+        self.manual_btn.clicked.connect(self.set_manual_mode)
         layout.addWidget(self.manual_btn, 1, 0, 1, 2)
         
         # Botón modo auto
@@ -259,7 +283,7 @@ class ControlTab(QWidget):
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #27AE60; }
             QPushButton:hover { background-color: #2ECC71; }
         """)
-        auto_btn.clicked.connect(self._request_auto_mode)
+        auto_btn.clicked.connect(self.set_auto_mode)
         layout.addWidget(auto_btn, 2, 0, 1, 2)
         
         # Entrada de potencia
@@ -268,16 +292,59 @@ class ControlTab(QWidget):
         layout.addWidget(self.power_input, 3, 1)
         
         # Botón enviar potencia
-        send_power_btn = QPushButton("⚡ Enviar Potencia (en modo AUTO)")
-        send_power_btn.setStyleSheet("""
+        self.send_power_btn = QPushButton("⚡ Enviar Potencia (en modo AUTO)")
+        self.send_power_btn.setStyleSheet("""
             QPushButton { font-size: 11px; font-weight: bold; padding: 6px; background-color: #3498DB; }
             QPushButton:hover { background-color: #5DADE2; }
         """)
-        send_power_btn.clicked.connect(self._send_power_command)
-        layout.addWidget(send_power_btn, 4, 0, 1, 2)
+        self.send_power_btn.clicked.connect(self._send_power_command)
+        layout.addWidget(self.send_power_btn, 4, 0, 1, 2)
+
+        self.calib_box = self._create_calib_box()
+        layout.addWidget(self.calib_box, 5, 0, 1, 2)
         
         group_box.setLayout(layout)
         return group_box
+
+    def _create_calib_box(self):
+        """FPGA: 1 · Zero, 2 · Máximo, 3 · Manual y Reset mandan lo mismo que se escribe por COM."""
+        box = QWidget()
+        col = QVBoxLayout(box)
+        col.setContentsMargins(0, 4, 0, 0)
+
+        self.edit_points_check = QCheckBox("Editar puntos del recorrido")
+        self.edit_points_check.setToolTip("Habilita Zero, Máximo y Reset.")
+        col.addWidget(self.edit_points_check)
+
+        button_style = """
+            QPushButton { font-size: 11px; font-weight: bold; padding: 6px; background-color: %s; }
+            QPushButton:hover { background-color: %s; }
+            QPushButton:disabled { background-color: #555555; color: #AAAAAA; }
+        """
+        calib_colors = ("#16A085", "#1ABC9C")
+        self.zero_btn = QPushButton("1 · Zero")
+        self.final_btn = QPushButton("2 · Máximo")
+        self.calib_manual_btn = QPushButton("3 · Manual")
+        self.reset_btn = QPushButton("⟲ Reset")
+        for btn, commands, colors in (
+            (self.zero_btn, FPGA_ZERO, calib_colors),
+            (self.final_btn, FPGA_FINAL, calib_colors),
+            (self.reset_btn, FPGA_RESET, ("#C0392B", "#E74C3C")),
+        ):
+            btn.setStyleSheet(button_style % colors)
+            btn.setToolTip(f"{', '.join(commands)}: {_CALIB_TIPS[commands]}")
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda _checked=False, b=btn, c=commands: self._send_calib(b, c))
+            self.edit_points_check.toggled.connect(btn.setEnabled)
+        self.calib_manual_btn.setStyleSheet(button_style % calib_colors)
+        self.calib_manual_btn.setToolTip(_MANUAL_TIPS[MCU_FPGA])
+        self.calib_manual_btn.clicked.connect(self.set_manual_mode)
+
+        row = QHBoxLayout()
+        for btn in (self.zero_btn, self.final_btn, self.calib_manual_btn, self.reset_btn):
+            row.addWidget(btn)
+        col.addLayout(row)
+        return box
     
     def _create_motors_group(self):
         """Crea el panel de estado de motores."""
@@ -285,12 +352,14 @@ class ControlTab(QWidget):
         layout = QGridLayout()
         value_style = "font-size: 18px; font-weight: bold; color: #5DADE2;"
         
-        layout.addWidget(QLabel("Potencia Motor A:"), 0, 0)
+        self.power_a_name_label = QLabel()
+        layout.addWidget(self.power_a_name_label, 0, 0)
         self.value_labels['power_a'] = QLabel("0")
         self.value_labels['power_a'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['power_a'], 0, 1)
         
-        layout.addWidget(QLabel("Potencia Motor B:"), 1, 0)
+        self.power_b_name_label = QLabel()
+        layout.addWidget(self.power_b_name_label, 1, 0)
         self.value_labels['power_b'] = QLabel("0")
         self.value_labels['power_b'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['power_b'], 1, 1)
@@ -305,20 +374,103 @@ class ControlTab(QWidget):
         layout = QGridLayout()
         value_style = "font-size: 18px; color: #58D68D;"
         
-        self.sensor1_name_label = QLabel()
+        self.sensor1_name_label = QLabel("Valor Sensor 1 (Y / PC3):")
         layout.addWidget(self.sensor1_name_label, 0, 0)
         self.value_labels['sensor_1'] = QLabel("---")
         self.value_labels['sensor_1'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_1'], 0, 1)
         
-        self.sensor2_name_label = QLabel()
+        self.sensor2_name_label = QLabel("Valor Sensor 2 (X / PA3):")
         layout.addWidget(self.sensor2_name_label, 1, 0)
         self.value_labels['sensor_2'] = QLabel("---")
         self.value_labels['sensor_2'].setStyleSheet(value_style)
         layout.addWidget(self.value_labels['sensor_2'], 1, 1)
+
+        self.arrival_box = self._create_arrival_box()
+        layout.addWidget(self.arrival_box, 2, 0, 1, 2)
         
         group_box.setLayout(layout)
         return group_box
+
+    def _create_arrival_box(self):
+        """FPGA: pedido (PotA/PotB), cuenta y error por eje, y grabación de tramas a CSV."""
+        box = QWidget()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(0, 0, 0, 0)
+        head_style = "color: #95A5A6; font-weight: bold;"
+        for col, text in enumerate(("Eje", "Pedido", "Cuenta", "Error (pedido − cuenta)")):
+            head = QLabel(text)
+            head.setStyleSheet(head_style)
+            grid.addWidget(head, 0, col)
+
+        self.arrival_labels = {}
+        error_tip = (
+            f"En MANUAL la FPGA lleva la cuenta al pedido: verde = a 1 paso o menos "
+            f"({_FPGA_COUNTS_PER_EDGE} cuentas). En gris la FPGA no está posicionando "
+            f"(RESET, AUTO, BRAKE)."
+        )
+        for row, axis in enumerate(("x", "y"), start=1):
+            name = QLabel(axis.upper())
+            name.setStyleSheet("font-size: 16px; font-weight: bold;")
+            grid.addWidget(name, row, 0)
+            for col, (field, style) in enumerate((
+                ("pedido", "font-size: 16px; color: #5DADE2;"),
+                ("cuenta", "font-size: 16px; color: #58D68D;"),
+                ("error", "font-size: 16px; font-weight: bold; color: #95A5A6;"),
+            ), start=1):
+                lab = QLabel("---")
+                lab.setStyleSheet(style)
+                grid.addWidget(lab, row, col)
+                self.arrival_labels[axis, field] = lab
+            self.arrival_labels[axis, "error"].setToolTip(error_tip)
+
+        self.frame_log_btn = QPushButton("⏺ Grabar tramas (CSV)")
+        self.frame_log_btn.setCheckable(True)
+        self.frame_log_btn.setToolTip(
+            "Guarda cada trama de la FPGA (~41 por segundo) en CSVs/tramas_fpga: "
+            "estado, potencia, pedido y cuenta de X e Y."
+        )
+        self.frame_log_btn.clicked.connect(self.frame_log_requested.emit)
+        grid.addWidget(self.frame_log_btn, 3, 0, 1, 2)
+        self.frame_log_label = QLabel("Sin grabar")
+        self.frame_log_label.setStyleSheet("color: #95A5A6;")
+        self.frame_log_label.setWordWrap(True)
+        grid.addWidget(self.frame_log_label, 3, 2, 1, 2)
+        return box
+
+    def update_targets(self, target_x: int, target_y: int):
+        """Pedido de la FPGA contra la cuenta medida, por eje."""
+        in_manual = self._mcu_state == "MANUAL"
+        for axis, target, count in (("x", target_x, self._last_xy[0]),
+                                    ("y", target_y, self._last_xy[1])):
+            err = target - count
+            steps = f"{err / _FPGA_COUNTS_PER_EDGE:+.1f}".replace(".", ",")
+            self.arrival_labels[axis, "pedido"].setText(str(target))
+            self.arrival_labels[axis, "cuenta"].setText(str(count))
+            error_label = self.arrival_labels[axis, "error"]
+            error_label.setText(f"{err:+d} ({steps} pasos)")
+            if not in_manual:
+                color = "#95A5A6"
+            elif abs(err) <= _FPGA_COUNTS_PER_EDGE:
+                color = "#27AE60"
+            else:
+                color = "#E67E22"
+            if self._error_colors.get(axis) != color:
+                self._error_colors[axis] = color
+                error_label.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {color};")
+
+    def show_frame_log(self, active: bool, path: str, lines: int):
+        self.frame_log_btn.setChecked(active)
+        if active:
+            self.frame_log_btn.setText("⏹ Detener grabación")
+            self.frame_log_label.setText(f"Grabando: {path}")
+            self.frame_log_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
+        else:
+            self.frame_log_btn.setText("⏺ Grabar tramas (CSV)")
+            self.frame_log_label.setText(
+                f"Guardado: {path} ({lines} tramas)" if path else "Sin grabar"
+            )
+            self.frame_log_label.setStyleSheet("color: #95A5A6;")
     
     def _scan_ports(self):
         """Escanea puertos seriales disponibles y actualiza el combo."""
@@ -364,14 +516,6 @@ class ControlTab(QWidget):
             return text.split(" - ")[0]
         return text
     
-    def _request_manual_mode(self):
-        """Cambia a modo manual."""
-        self.set_manual_mode()
-    
-    def _request_auto_mode(self):
-        """Cambia a modo automático."""
-        self.set_auto_mode()
-    
     def _request_reconnect(self):
         """Solicita reconexión serial con los parámetros seleccionados."""
         port = self._get_selected_port()
@@ -400,21 +544,21 @@ class ControlTab(QWidget):
             power_a = max(-lim, min(lim, power_a))
             power_b = max(-lim, min(lim, power_b))
             
-            # ENVIAR DIRECTAMENTE AL ARDUINO (formato: A,potA,potB)
             self.send_power(power_a, power_b)
-            logger.debug(f"Comando de potencia ENVIADO: A={power_a}, B={power_b}")
         except ValueError as e:
             logger.error(f"Error al parsear potencia: {e}")
     
     # === Métodos para actualizar estado desde el padre ===
     
     def set_mode(self, mode: str):
-        """Actualiza el modo mostrado."""
-        self.value_labels['mode'].setText(mode)
-        if mode == "MANUAL":
-            self.value_labels['mode'].setStyleSheet("font-weight: bold; color: #E67E22; font-size: 14px;")
-        else:
-            self.value_labels['mode'].setStyleSheet("font-weight: bold; color: #27AE60; font-size: 14px;")
+        """Actualiza el modo mostrado. Con la FPGA lo pone la trama."""
+        if self.get_selected_mcu() == MCU_FPGA:
+            return
+        self._show_mode(mode, "#E67E22" if mode == "MANUAL" else "#27AE60")
+
+    def _show_mode(self, text: str, color: str):
+        self.value_labels['mode'].setText(text)
+        self.value_labels['mode'].setStyleSheet(f"font-weight: bold; color: {color}; font-size: 14px;")
     
     def update_motor_values(self, power_a: int, power_b: int):
         """Actualiza los valores de potencia de motores."""
@@ -425,10 +569,7 @@ class ControlTab(QWidget):
         """Actualiza los valores de sensores."""
         self.value_labels['sensor_1'].setText(str(sensor_1))
         self.value_labels['sensor_2'].setText(str(sensor_2))
-    
-    def get_value_labels(self):
-        """Retorna el diccionario de labels para compatibilidad."""
-        return self.value_labels
+        self._last_xy = (sensor_2, sensor_1)    # X = Sensor1 de la FPGA = sensor_2
     
     def set_connection_status(self, connected: bool, port: str = ""):
         """
@@ -446,42 +587,37 @@ class ControlTab(QWidget):
             self.connection_status.setText("❌ Desconectado")
             self.connection_status.setStyleSheet("font-weight: bold; color: #E74C3C;")
             logger.info("Estado serial actualizado: Desconectado")
+        self._forget_state()
     
     # ================================================================
     # LÓGICA DE CONTROL (movida desde main.py)
     # ================================================================
     
     def send_command(self, command: str):
-        """
-        Envía comando al Arduino vía serial.
-        
-        Args:
-            command: Comando a enviar
-        """
-        if self.serial_handler and self.serial_handler.ser and self.serial_handler.ser.is_open:
-            try:
-                self.serial_handler.send_command(command)
-                logger.info(f"Comando enviado: {command}")
-            except Exception as e:
-                logger.error(f"Error al enviar comando: {e}")
-        else:
-            logger.error("Puerto serial no está abierto. Comando no enviado.")
-    
+        """Manda una orden al MCU. El SerialHandler la registra (TX) o avisa si el puerto está cerrado."""
+        if self.serial_handler is None:
+            logger.error("Sin SerialHandler: orden no enviada: %s", command)
+            return
+        self.serial_handler.send_command(command)
+
+    def _send_calib(self, button: QPushButton, commands):
+        """Una línea por orden, igual que escribirlas por COM."""
+        x, y = self._last_xy
+        logger.info("Calib: %s (X=%d, Y=%d)", button.text(), x, y)
+        for command in commands:
+            self.send_command(command)
+
     def set_manual_mode(self):
-        """Activa modo MANUAL en el Arduino."""
+        """M: modo MANUAL (con la FPGA, los potes mandan la posición)."""
         logger.info("ControlTab: Activar MODO MANUAL")
-        self.send_command('M')
+        self.send_command(MotorProtocol.format_manual_mode())
         self.set_mode("MANUAL")
-        logger.debug("Modo MANUAL activado")
-    
+
     def set_auto_mode(self):
-        """Activa modo AUTOMÁTICO en el Arduino con potencia inicial 0,0."""
+        """A,0,0: modo AUTO con potencia 0."""
         logger.info("ControlTab: Activar MODO AUTO")
-        # Arduino espera formato: A,potA,potB
-        # Enviamos A,0,0 para activar modo AUTO con potencia 0
-        self.send_command('A,0,0')
+        self.send_command(MotorProtocol.format_power_command(0, 0))
         self.set_mode("AUTOMÁTICO")
-        logger.debug("Modo AUTOMÁTICO activado")
     
     def send_power(self, power_a: int, power_b: int):
         """
@@ -492,141 +628,87 @@ class ControlTab(QWidget):
             power_b: Potencia motor B (-255 a 255)
         """
         logger.info(f"ControlTab: Enviar Potencia - A={power_a}, B={power_b}")
-        command_string = f"A,{power_a},{power_b}"
-        self.send_command(command_string)
+        self.send_command(MotorProtocol.format_power_command(power_a, power_b))
         self.update_motor_values(power_a, power_b)
-    
-    def _create_position_hold_group(self):
-        """Panel de estado MCU + freno. Hold/S deshabilitados (STM32 no implementa H/S)."""
+
+    def _create_mcu_status_group(self):
+        """Estado del MCU según la trama, Settled y freno activo."""
         group_box = QGroupBox("Estado MCU / Freno")
         layout = QGridLayout()
-        
-        layout.addWidget(QLabel("Target Sensor 1 (ADC):"), 0, 0)
-        self.sensor1_target_input = QLineEdit("2048")
-        self.sensor1_target_input.setEnabled(False)
-        self.sensor1_target_input.setToolTip("Hold no disponible (usar control PC vía A,<pwm>)")
-        layout.addWidget(self.sensor1_target_input, 0, 1)
-        
-        layout.addWidget(QLabel("Target Sensor 2 (ADC):"), 0, 2)
-        self.sensor2_target_input = QLineEdit("2048")
-        self.sensor2_target_input.setEnabled(False)
-        self.sensor2_target_input.setToolTip("Hold no disponible (usar control PC vía A,<pwm>)")
-        layout.addWidget(self.sensor2_target_input, 0, 3)
-        
-        hold_btn = QPushButton("Position Hold (N/A)")
-        hold_btn.setEnabled(False)
-        hold_btn.setToolTip("Ni STM32 ni Arduino implementan H,<s1>,<s2>.")
-        hold_btn.setStyleSheet("""
-            QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #555555; color: #AAAAAA; }
-        """)
-        layout.addWidget(hold_btn, 1, 0)
-        
+
         brake_btn = QPushButton("Freno Activo")
         brake_btn.setStyleSheet("""
             QPushButton { font-size: 12px; font-weight: bold; padding: 8px; background-color: #E74C3C; }
             QPushButton:hover { background-color: #C0392B; }
         """)
         brake_btn.clicked.connect(self._request_brake)
-        layout.addWidget(brake_btn, 1, 1)
-        
-        layout.addWidget(QLabel("Umbral Asentamiento:"), 1, 2)
-        self.settling_threshold_input = QLineEdit("32")
-        self.settling_threshold_input.setEnabled(False)
-        self.settling_threshold_input.setToolTip("Comando S no soportado; settling en PC")
-        layout.addWidget(self.settling_threshold_input, 1, 3)
-        
-        config_btn = QPushButton("Configurar (N/A)")
-        config_btn.setEnabled(False)
-        config_btn.setToolTip("Comando S no soportado en STM32/Arduino")
-        config_btn.setStyleSheet("""
-            QPushButton { font-size: 11px; padding: 6px; background-color: #555555; color: #AAAAAA; }
-        """)
-        layout.addWidget(config_btn, 1, 4)
-        
-        layout.addWidget(QLabel("Estado MCU:"), 2, 0)
+        layout.addWidget(brake_btn, 0, 0, 1, 4)
+
+        layout.addWidget(QLabel("Estado MCU:"), 1, 0)
         self.arduino_state_label = QLabel("DESCONOCIDO")
         self.arduino_state_label.setStyleSheet("font-weight: bold; color: #95A5A6;")
-        layout.addWidget(self.arduino_state_label, 2, 1)
-        
-        layout.addWidget(QLabel("Settled (info):"), 2, 2)
+        layout.addWidget(self.arduino_state_label, 1, 1)
+
+        layout.addWidget(QLabel("Settled (info):"), 1, 2)
         self.settled_status_label = QLabel("NO")
         self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
-        layout.addWidget(self.settled_status_label, 2, 3)
-        
+        layout.addWidget(self.settled_status_label, 1, 3)
+
         self.commands_info_label = QLabel()
         self.commands_info_label.setStyleSheet("color: #7F8C8D; font-size: 10px;")
-        layout.addWidget(self.commands_info_label, 3, 0, 1, 5)
-        
+        layout.addWidget(self.commands_info_label, 2, 0, 1, 4)
+
         self.firmware_status_label = QLabel("Firmware: Esperando telemetría...")
         self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")
-        layout.addWidget(self.firmware_status_label, 4, 0, 1, 5)
-        
+        layout.addWidget(self.firmware_status_label, 3, 0, 1, 4)
+
         group_box.setLayout(layout)
         return group_box
-    
-    def _request_position_hold(self):
-        """No-op: Hold no soportado en STM32."""
-        logger.warning("Position Hold solicitado pero deshabilitado (STM32 sin comando H)")
-    
+
     def _request_brake(self):
         """Solicita freno activo."""
         logger.info("ControlTab: Solicitar Freno Activo")
         self.brake_requested.emit()
-    
-    def _request_settling_config(self):
-        """No-op: S no soportado en STM32."""
-        logger.warning("Settling config solicitado pero deshabilitado (STM32 sin comando S)")
-    
+
     def update_arduino_status(self, state: str, settled: bool):
-        """Actualiza el estado del MCU y flag settled (informativo)."""
-        current_state = self.arduino_state_label.text()
-        state_changed = current_state != state.upper()
+        """Estado del MCU y Settled. Con la FPGA, Modo Actual es el Estado de la trama."""
+        state = state.upper()
+        state_changed = state != self._mcu_state
         # La FPGA cambia Settled sin cambiar de estado.
         if not state_changed and settled == self._last_settled:
             return
+        self._mcu_state = state
         self._last_settled = settled
-        
-        self.arduino_state_label.setText(state.upper())
-        
-        state_colors = {
-            'MANUAL': '#3498DB',
-            'AUTO': '#9B59B6', 
-            'HOLD': '#27AE60',
-            'BRAKE': '#E74C3C',
-            'SETTLING': '#F39C12',
-            'UNKNOWN': '#95A5A6',
-            'LEGACY': '#F39C12',
-            'RESET': '#E67E22',
-            'PULSE': '#1ABC9C',
-            'PC': '#27AE60',
-        }
-        color = state_colors.get(state.upper(), '#95A5A6')
+
+        color = _STATE_COLORS.get(state, _STATE_COLORS['UNKNOWN'])
+        self.arduino_state_label.setText(state)
         self.arduino_state_label.setStyleSheet(f"font-weight: bold; color: {color};")
-        
         if settled:
             self.settled_status_label.setText("SI")
             self.settled_status_label.setStyleSheet("font-weight: bold; color: #27AE60;")
         else:
             self.settled_status_label.setText("NO")
             self.settled_status_label.setStyleSheet("font-weight: bold; color: #E74C3C;")
-        
+
         if not state_changed:
             return
         logger.info(f"ControlTab: Estado MCU cambiado a {state}, Settled={settled}")
-        
-        if hasattr(self, 'firmware_status_label'):
-            profile_label = MCU_PROFILES.get(self.get_selected_mcu(), {}).get("label", "MCU")
-            if state.upper() == 'LEGACY':
-                self.firmware_status_label.setText("Firmware LEGACY 4 campos - preferir STM32 6 campos")
-                self.firmware_status_label.setStyleSheet("color: #E74C3C; font-size: 10px; font-weight: bold;")
-            elif state.upper() == 'RESET':
-                self.firmware_status_label.setText(
-                    f"{profile_label} - RESET: sin calibrar; los potes no mueven X ni Y"
-                )
-                self.firmware_status_label.setStyleSheet("color: #E67E22; font-size: 10px; font-weight: bold;")
-            elif state.upper() in ['MANUAL', 'AUTO', 'BRAKE', 'PULSE', 'PC']:
-                self.firmware_status_label.setText(f"{profile_label} - estado {state.upper()} OK")
-                self.firmware_status_label.setStyleSheet("color: #27AE60; font-size: 10px; font-weight: bold;")
-            else:
-                self.firmware_status_label.setText(f"Firmware: estado {state}")
-                self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")
+        if self.get_selected_mcu() == MCU_FPGA:
+            self._show_mode(state, color)
+
+        profile_label = MCU_PROFILES.get(self.get_selected_mcu(), {}).get("label", "MCU")
+        if state == 'LEGACY':
+            self.firmware_status_label.setText("Firmware LEGACY 4 campos - preferir STM32 6 campos")
+            self.firmware_status_label.setStyleSheet("color: #E74C3C; font-size: 10px; font-weight: bold;")
+        elif state == 'RESET':
+            self.firmware_status_label.setText(
+                f"{profile_label} - RESET: sin calibrar; los potes no mueven X ni Y "
+                f"(1 · Zero, 2 · Máximo, 3 · Manual)"
+            )
+            self.firmware_status_label.setStyleSheet("color: #E67E22; font-size: 10px; font-weight: bold;")
+        elif state in ('MANUAL', 'AUTO', 'BRAKE', 'PULSE', 'PC'):
+            self.firmware_status_label.setText(f"{profile_label} - estado {state} OK")
+            self.firmware_status_label.setStyleSheet("color: #27AE60; font-size: 10px; font-weight: bold;")
+        else:
+            self.firmware_status_label.setText(f"Firmware: estado {state}")
+            self.firmware_status_label.setStyleSheet("color: #F39C12; font-size: 10px; font-weight: bold;")

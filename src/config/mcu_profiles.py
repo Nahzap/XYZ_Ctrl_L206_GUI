@@ -36,6 +36,7 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "calibration_file": "calibration.json",
         "telemetry": "6-field Estado/Settled",
         "firmware_hint": "MycoViT_XY_Controller",
+        "close_commands": ["A,0,0"],
     },
     MCU_ARDUINO: {
         "label": "Arduino UNO (DRV8871)",
@@ -49,6 +50,7 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "calibration_file": "calibration.json",
         "telemetry": "6-field 10-bit (Settled=0; F/I/P ignorados)",
         "firmware_hint": "XYZ_Ctrl_L206_v0.1",
+        "close_commands": ["A,0,0"],
     },
     MCU_FPGA: {
         "label": "Tang Nano 9K FPGA (Motor_CTRL)",
@@ -62,6 +64,9 @@ MCU_PROFILES: dict[str, dict[str, Any]] = {
         "calibration_file": "calibration_fpga.json",
         "telemetry": "8 campos: PotA/PotB = pedido; Sensor1 = X, Sensor2 = Y",
         "firmware_hint": "Motor_CTRL (Tang Nano 9K)",
+        "counts_per_edge": 84,  # STEP de motion.v: 1 flanco del Hall; CFG_GATE = 1 flanco
+        # Al cerrar la FPGA sigue como estaba: A,0,0 la dejaría en AUTO y los potes no mandarían.
+        "close_commands": [],
     },
 }
 

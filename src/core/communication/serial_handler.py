@@ -188,18 +188,6 @@ class SerialHandler(QThread):
             logger.info("Puerto serial cerrado en stop()")
         self.wait()
 
-    def write(self, data):
-        """Envía bytes crudos (bypass cola). Preferir send_command()."""
-        if self.ser and self.ser.is_open:
-            try:
-                with self._tx_lock:
-                    self.ser.write(data)
-                return True
-            except Exception as e:
-                logger.error(f"Error escribiendo al serial: {e}")
-                return False
-        return False
-
     def send_command(self, command):
         """
         Encola comando (A,* coalesce; F/I/N/B prioritarios) y drena ya.
